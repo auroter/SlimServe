@@ -26,6 +26,8 @@ import numpy as np
 
 F = mx.float16
 G = mx.float32
+SPLIT_K_MIN = 16384
+SPLIT_K_CHUNK = 2048
 
 
 @dataclass(frozen=True)
@@ -140,15 +142,34 @@ class LTX25DiT:
         self.w = weights
         self.cfg = config
         self.eval_every = eval_every
+        # MLX's fp16 GEMM drops from ~19 to 10 TF/s (6 at 24k rows) once K
+        # reaches 16384 (the video FFN's second linear). Summing K-chunks keeps
+        # every GEMM in the fast regime: 79 -> 45 ms at 6,144 rows, 526 -> 172
+        # ms at 24,576. The chunks replace the original, so memory is unchanged.
+        self.split_k: dict[str, list[mx.array]] = {}
+        for name in [n for n, a in weights.items() if n.endswith(".weight") and a.ndim == 2 and a.shape[1] >= SPLIT_K_MIN]:
+            a = weights.pop(name)
+            parts = [mx.contiguous(a[:, i : i + SPLIT_K_CHUNK]) for i in range(0, a.shape[1], SPLIT_K_CHUNK)]
+            mx.eval(parts)
+            self.split_k[name[: -len(".weight")]] = parts
         # name -> [(A, B, scale)]: runtime low-rank terms, y += scale * (x A^T) B^T.
         self.lora: dict[str, list[tuple[mx.array, mx.array, float]]] = {}
 
     # ---- primitives -------------------------------------------------------
     def lin(self, name: str, x: mx.array) -> mx.array:
         """fp16 GEMM. `x` must already be fp16 (cast once by the caller)."""
-        w = self.w[name + ".weight"]
-        b = self.w.get(name + ".bias")
-        y = x @ w.T if b is None else mx.addmm(b, x, w.T)
+        parts = self.split_k.get(name)
+        if parts is not None:
+            y = x[..., :SPLIT_K_CHUNK] @ parts[0].T
+            for i, part in enumerate(parts[1:], 1):
+                y = y + x[..., i * SPLIT_K_CHUNK : (i + 1) * SPLIT_K_CHUNK] @ part.T
+            b = self.w.get(name + ".bias")
+            if b is not None:
+                y = y + b
+        else:
+            w = self.w[name + ".weight"]
+            b = self.w.get(name + ".bias")
+            y = x @ w.T if b is None else mx.addmm(b, x, w.T)
         for a_mat, b_mat, scale in self.lora.get(name, ()):
             y = y + ((x @ a_mat.T) @ b_mat.T) * scale
         return y
