@@ -149,6 +149,7 @@ class LTX25Engine:
         self.upscaler = None
         self.audio = None
         self.distilled_lora = None
+        self.detail_lora = None
 
     # ---- components -------------------------------------------------------
     def load_text(self):
@@ -283,6 +284,97 @@ class LTX25Engine:
                 denoise, video, audio, sampling.STAGE_2_DISTILLED_SIGMAS, on_step=stepper("stage2"))
 
         return Result(sampling.unpatchify(v2, (f, h2, w2)), a2, num_frames, height, width, fps, tm)
+
+    # ---- DFR --------------------------------------------------------------
+    def load_detail_lora(self):
+        if self.detail_lora is None:
+            from slimserve.video.ltx25.lora import Lora
+
+            self.detail_lora = Lora("detail-lora", self.root).load()
+        return self.detail_lora
+
+    def dfr(
+        self,
+        prompt: str,
+        height: int = 1024,
+        width: int = 1536,
+        num_frames: int = 121,
+        fps: float = 24.0,
+        seed: int = 42,
+        detail_strength: float = 0.5,
+        text_embeds: tuple[mx.array, mx.array] | None = None,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+    ) -> Result:
+        """Lightricks' DFRPipeline, default configuration: the distilled flow
+        with one generated keyframe slot per 24/32-frame segment in stage 1,
+        then a stage 2 that runs under the detailing IC-LoRA with the upscaled
+        slots and the half-resolution stage-1 latent as reference tokens.
+        Temporal rounds and the second spatial epilogue are not implemented."""
+        if self.variant != "distilled":
+            raise ValueError("the DFR pipeline runs on the distilled transformer")
+        tm = Timings()
+        if text_embeds is None:
+            with tm.span("text"):
+                video_text, audio_text = self.load_text().encode(prompt)[:2]
+                mx.eval(video_text, audio_text)
+                if not keep_text:
+                    self.unload_text()
+        else:
+            video_text, audio_text = text_embeds
+        with tm.span("load"):
+            dit = self.load_dit()
+            vae = self.load_vae()
+            upscaler = self.load_upscaler()
+            lora = self.load_detail_lora()
+        denoise = Denoiser(dit, video_text, audio_text)
+        stepper = self._stepper(tm, on_step)
+
+        height, width = sampling.snap_dimensions(height, width, two_stage=True)
+        canvas, _segment, slot_frames = sampling.dfr_canvas(num_frames)
+        cfps = sampling.conditioning_fps(fps)
+        f, h1, w1 = sampling.video_latent_shape(canvas, height // 2, width // 2)
+        audio_t = sampling.audio_token_count(canvas, fps)
+        apos = sampling.audio_positions(audio_t)
+        k = len(slot_frames)
+
+        with tm.span("stage1"):
+            video = sampling.noised_state(
+                (1, f * h1 * w1, 128), sampling.video_positions(f, h1, w1, cfps), seed,
+                tokens_per_frame=h1 * w1, bf16_noise=self.bf16_noise)
+            video, slots = sampling.append_slots(video, slot_frames, h1, w1, cfps, None, 1.0, seed)
+            audio = sampling.noised_state((1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise)
+            v1, a1 = sampling.euler_ancestral_loop(
+                denoise, video, audio, sampling.DISTILLED_SIGMAS,
+                noise_seed=seed + sampling.ANCESTRAL_NOISE_SEED_OFFSET, on_step=stepper("stage1"))
+
+        with tm.span("upscale"):
+            half = sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1))
+            up = vae.normalize(upscaler(vae.denormalize(half)))
+            slots_up = vae.normalize(upscaler(vae.denormalize(sampling.slots_to_latent(v1, slots, k, h1, w1))))
+            mx.eval(up, slots_up)
+
+        with tm.span("stage2"):
+            h2, w2 = h1 * 2, w1 * 2
+            s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
+            video = sampling.noised_state(
+                (1, f * h2 * w2, 128), sampling.video_positions(f, h2, w2, cfps), seed + 2, sigma=s0,
+                initial=sampling.patchify(up), tokens_per_frame=h2 * w2, bf16_noise=self.bf16_noise)
+            video, _ = sampling.append_slots(video, slot_frames, h2, w2, cfps, slots_up, s0, seed + 2)
+            video = sampling.append_reference(
+                video, sampling.patchify(half), sampling.video_positions(f, h1, w1, cfps), lora.reference_downscale)
+            audio = sampling.noised_state(
+                (1, audio_t, 128), apos, seed + 2, sigma=s0, initial=a1, bf16_noise=self.bf16_noise)
+            lora.attach(dit, detail_strength)
+            try:
+                v2, _ = sampling.euler_loop(
+                    denoise, video, audio, sampling.STAGE_2_DISTILLED_SIGMAS, on_step=stepper("stage2"))
+            finally:
+                lora.detach(dit)
+
+        keep = (num_frames - 1) // 8 + 1  # trim the canvas padding back off
+        latent = sampling.unpatchify(v2[:, : f * h2 * w2], (f, h2, w2))[:, :, :keep]
+        return Result(latent, a1[:, : sampling.audio_token_count(num_frames, fps)], num_frames, height, width, fps, tm)
 
     # ---- dev --------------------------------------------------------------
     def load_distilled_lora(self):

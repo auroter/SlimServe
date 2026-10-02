@@ -248,3 +248,78 @@ class Guidance:
             factor = mx.sqrt(mx.var(cond)) / (mx.sqrt(mx.var(pred)) + 1e-8)
             pred = pred * (self.rescale * factor + (1 - self.rescale))
         return pred
+
+
+# ---- DFR: canvas, generated keyframe slots, reference tokens ---------------
+SLOT_NOISE_SEED_OFFSET = 20000
+SEGMENT_CANDIDATES = (24, 32)
+
+
+def dfr_canvas(num_frames: int) -> tuple[int, int, list[int]]:
+    """(canvas frames, segment, slot pixel frames): the clip padded to whole
+    keyframe segments (24 or 32 frames, least padding, longer on ties) with
+    one generated keyframe slot at every segment boundary."""
+    if num_frames < 9 or (num_frames - 1) % 8:
+        raise ValueError(f"num_frames must be 8k + 1 with k >= 1, got {num_frames}")
+    content = num_frames - 1
+    segment = min(SEGMENT_CANDIDATES, key=lambda s: ((-content) % s, -s))
+    padded = content + (-content) % segment
+    return padded + 1, segment, [segment * i for i in range(1, padded // segment + 1)]
+
+
+def conditioning_fps(fps: float) -> float:
+    return 60.0 if fps > 30.0 else fps
+
+
+def append_slots(state: LatentState, pixel_frames: list[int], h: int, w: int, fps: float,
+                 initial: mx.array | None, sigma: float, seed: int) -> tuple[LatentState, slice]:
+    """Append one single-frame keyframe slot per pixel frame (generated tokens,
+    marked in keyframes_mask, noised from their own seed). Returns the slot token slice."""
+    b, n, c = state.latent.shape
+    per = h * w
+    y = mx.arange(h).astype(G) * 32 + 16.0
+    x = mx.arange(w).astype(G) * 32 + 16.0
+    pos = []
+    for frame in pixel_frames:  # a single pixel frame: temporal midpoint (frame + 0.5) / fps
+        t = mx.full((h, w), (frame + 0.5) / fps, dtype=G)
+        pos.append(mx.stack([t, mx.broadcast_to(y[:, None], (h, w)), mx.broadcast_to(x[None, :], (h, w))], axis=-1).reshape(1, per, 3))
+    pos = mx.broadcast_to(mx.concatenate(pos, axis=1), (b, per * len(pixel_frames), 3))
+    count = per * len(pixel_frames)
+    slot = mx.zeros((b, count, c), dtype=G) if initial is None else mx.concatenate(
+        [patchify(initial[:, :, k : k + 1]) for k in range(initial.shape[2])], axis=1).astype(G)
+    mx.random.seed(seed + SLOT_NOISE_SEED_OFFSET)
+    noise = mx.random.normal(slot.shape)
+    noised = noise * sigma + slot * (1.0 - sigma)
+    kf = state.keyframes_mask if state.keyframes_mask is not None else mx.zeros((b, n, 1), dtype=G)
+    return replace(
+        state,
+        latent=mx.concatenate([state.latent, noised], axis=1),
+        clean=mx.concatenate([state.clean, mx.zeros_like(slot)], axis=1),
+        denoise_mask=mx.concatenate([state.denoise_mask, mx.ones((b, count, 1), dtype=G)], axis=1),
+        positions=mx.concatenate([state.positions, pos], axis=1),
+        keyframes_mask=mx.concatenate([kf, mx.ones((b, count, 1), dtype=G)], axis=1),
+    ), slice(n, n + count)
+
+
+def append_reference(state: LatentState, tokens: mx.array, positions: mx.array, downscale: int,
+                     strength: float = 1.0) -> LatentState:
+    """Append clean IC-LoRA reference tokens (denoise mask 1 - strength); their
+    spatial positions are scaled to the target's pixel grid."""
+    b, n, _ = state.latent.shape
+    count = tokens.shape[1]
+    tokens = tokens.astype(G)
+    pos = positions * mx.array([1.0, float(downscale), float(downscale)])
+    kf = state.keyframes_mask
+    return replace(
+        state,
+        latent=mx.concatenate([state.latent, tokens], axis=1),
+        clean=mx.concatenate([state.clean, tokens], axis=1),
+        denoise_mask=mx.concatenate([state.denoise_mask, mx.full((b, count, 1), 1.0 - strength, dtype=G)], axis=1),
+        positions=mx.concatenate([state.positions, mx.broadcast_to(pos, (b, count, 3))], axis=1),
+        keyframes_mask=None if kf is None else mx.concatenate([kf, mx.zeros((b, count, 1), dtype=G)], axis=1),
+    )
+
+
+def slots_to_latent(tokens: mx.array, slots: slice, count: int, h: int, w: int) -> mx.array:
+    """Slot tokens -> (B, C, K, H, W)."""
+    return unpatchify(tokens[:, slots], (count, h, w))

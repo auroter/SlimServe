@@ -25,14 +25,16 @@ class Lora:
     def __init__(self, component: str, root: Path | None = None):
         self.path = checkpoints.path_of(component, root)
         self.pairs: dict[str, tuple[mx.array, mx.array]] = {}
+        self.reference_downscale = 1
 
     def load(self) -> "Lora":
         if self.pairs:
             return self
         header = checkpoints.read_header(self.path)
         rank, alpha = header.metadata.get("lora_rank"), header.metadata.get("lora_alpha")
-        if rank != alpha:
+        if rank != alpha:  # both absent on the IC-LoRA, which the reference applies unscaled as well
             raise ValueError(f"{self.path.name}: lora_alpha {alpha} != lora_rank {rank}; scaling not implemented")
+        self.reference_downscale = int(header.metadata.get("reference_downscale_factor", 1))
         raw = checkpoints.cast_operands(checkpoints.load_raw(self.path))
         for key in [k for k in raw if k.endswith(".lora_A.weight")]:
             name = key[len(PREFIX) : -len(".lora_A.weight")]
