@@ -21,6 +21,7 @@ from slimserve.video.ltx25.sampling import LatentState
 
 G = mx.float32
 OS_RESERVE_BYTES = 24 << 30  # never plan Metal memory into the last 24 GiB
+CACHE_BYTES = 12 << 30  # MLX buffer cache: reuse across steps and decodes without unbounded growth
 
 
 @dataclass
@@ -138,9 +139,11 @@ class LTX25Engine:
 
     def __init__(self, root: Path | None = None, variant: str = "distilled", bf16_noise: bool = False):
         self.root = root or checkpoints.model_root()
+        # Metal memory is wired: it cannot be compressed or swapped, and MLX's
+        # buffer cache counts. Active + cache is held OS_RESERVE below RAM.
         total = int(mx.device_info()["memory_size"])
-        mx.set_memory_limit(total - OS_RESERVE_BYTES)
-        mx.set_cache_limit(8 << 30)
+        mx.set_cache_limit(CACHE_BYTES)
+        mx.set_memory_limit(total - OS_RESERVE_BYTES - CACHE_BYTES)
         self.variant = variant
         self.bf16_noise = bf16_noise
         self.dit: LTX25DiT | None = None
@@ -200,8 +203,8 @@ class LTX25Engine:
         and the OS reserve. The decoder tiles to fit. Metal memory is wired, so
         overshooting this takes the machine down, not just the process."""
         total = int(mx.device_info()["memory_size"])
-        free = total - mx.get_active_memory() - OS_RESERVE_BYTES
-        return int(max(4 << 30, min(free, total // 2)))
+        free = total - mx.get_active_memory() - OS_RESERVE_BYTES - CACHE_BYTES
+        return int(max(6 << 30, min(free, total // 2)))
 
     @staticmethod
     def _stepper(tm: Timings, on_step):
@@ -461,8 +464,15 @@ class LTX25Engine:
 
         tm = result.timings
         with tm.span("vae_decode"):
-            frames = self.load_vae().decode(
-                result.video_latent, frame_rate=result.fps, budget_bytes=self.decode_budget())
+            from slimserve.video.ltx25 import vae as vae_mod
+
+            vae = self.load_vae()
+            # An untiled decode is exact and fastest. If the resident text
+            # encoder is what stands in the way, release it (4.8 s to reload)
+            # rather than blend tiles.
+            if vae_mod.estimate_peak_bytes(result.video_latent.shape, None) > self.decode_budget():
+                self.unload_text()
+            frames = vae.decode(result.video_latent, frame_rate=result.fps, budget_bytes=self.decode_budget())
         with tm.span("audio_decode"):
             waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
         with tm.span("mux"):

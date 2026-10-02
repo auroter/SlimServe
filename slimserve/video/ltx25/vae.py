@@ -34,24 +34,46 @@ SLAB_SCRATCH_BYTES = 4 << 30  # im2col-equivalent scratch allowed per conv slab
 CONV_HOOK: Callable[[str, tuple, tuple, float], None] | None = None
 
 
-def conv3d(x: mx.array, w: mx.array, b: mx.array, causal: bool = False, tag: str = "") -> mx.array:
-    """3x3x3 stride-1 conv. Temporal padding replicates the edge frame (front
-    only when causal), spatial padding is zeros. x (B, D, H, W, I), w (O, 3, 3, 3, I)."""
-    first = x[:, :1]
-    if causal:
-        x = mx.concatenate([first, first, x], axis=1)
-    else:
-        x = mx.concatenate([first, x, x[:, -1:]], axis=1)
-    x = mx.pad(x, [(0, 0), (0, 0), (1, 1), (1, 1), (0, 0)])
-    if CONV_HOOK is None:
-        return _conv_slabs(x, w, b)
+def conv3d(x: mx.array, w: mx.array, b: mx.array, causal: bool = False, tag: str = "",
+           act: bool = False, operand: mx.Dtype | None = None, stream: mx.Dtype | None = None) -> mx.array:
+    """3x3x3 stride-1 conv, optionally preceded by pixel-norm + SiLU (`act`).
+
+    Temporal padding replicates the edge frame (front only when causal),
+    spatial padding is zeros. x (B, D, H, W, I), w (O, 3, 3, 3, I).
+
+    Evaluated in temporal slabs: output frame t reads input frames t-1..t+1
+    (t-2..t when causal), so slabs are exact. MLX's conv3d allocates scratch
+    proportional to its whole input (a 768x512x121 decode peaked near 60 GiB
+    for activations of 1.5 GiB each). Each slab gathers its own frames, applies
+    the activation, pads and convolves, so no full-size padded or activated
+    copy of the input ever exists and equal-shaped slabs reuse buffers.
+    """
+    d = x.shape[1]
+    front = 2 if causal else 1
+    per_frame = (x.shape[2] + 2) * (x.shape[3] + 2) * max(x.shape[4], w.shape[0]) * (operand or x.dtype).size
+    frames = max(1, int(SLAB_SCRATCH_BYTES // (27 * per_frame)))
     mx.eval(x)
-    mx.synchronize()
-    t = time.perf_counter()
-    y = mx.conv3d(x, w) + b
-    mx.eval(y)
-    mx.synchronize()
-    CONV_HOOK(tag, tuple(x.shape), tuple(w.shape), time.perf_counter() - t)
+    t_start = time.perf_counter() if CONV_HOOK is not None else 0.0
+    out = []
+    for t in range(0, d, frames):
+        hi = min(t + frames, d)
+        idx = [min(max(i - front, 0), d - 1) for i in range(t, hi + 2)]
+        xs = x[:, idx[0] : idx[-1] + 1] if idx == list(range(idx[0], idx[-1] + 1)) else mx.take(x, mx.array(idx), axis=1)
+        if act:
+            xs = silu(pixel_norm(xs))
+        if operand is not None:
+            xs = xs.astype(operand)
+        y = mx.conv3d(mx.pad(xs, [(0, 0), (0, 0), (1, 1), (1, 1), (0, 0)]), w) + b
+        if stream is not None:
+            y = y.astype(stream)
+        mx.eval(y)
+        out.append(y)
+    y = out[0] if len(out) == 1 else mx.concatenate(out, axis=1)
+    if CONV_HOOK is not None:
+        mx.eval(y)
+        mx.synchronize()
+        CONV_HOOK(tag, (x.shape[0], d + 2, x.shape[2] + 2, x.shape[3] + 2, x.shape[4]), tuple(w.shape),
+                  time.perf_counter() - t_start)
     return y
 
 
@@ -172,10 +194,12 @@ def decode_tiles(latent_shape: tuple[int, ...], tiling: Tiling) -> list[tuple[tu
     return tiles
 
 
-# fp32 untiled peak per output pixel-frame with slab convolutions. Measured
-# 2026-10-02: 768x512x121 peaks at 14.4 GiB (303 B). Before slabs the same decode
-# peaked near 60 GiB (1,260 B); the baseline quotes 750 B for its bf16 decode.
-BYTES_PER_PIXEL_FRAME = 340
+# fp32 untiled decode peak = DECODE_BASE_BYTES + BYTES_PER_PIXEL_FRAME x pixel-frames.
+# Measured 2026-10-02 with slab convolutions: 768x512x121 peaks at 10.1 GiB and
+# 1536x1024x121 at 27.3 GiB (slope 129 B, intercept 4.4 GiB: weights + slab scratch).
+# Before slabs the short clip peaked near 60 GiB.
+BYTES_PER_PIXEL_FRAME = 135
+DECODE_BASE_BYTES = 5 << 30
 _ACCUM_BYTES_PER_PIXEL = 4 * 3 * 4
 
 
@@ -183,7 +207,7 @@ def estimate_peak_bytes(latent_shape: tuple[int, ...], tiling: Tiling | None, by
     _, _, f, h, w = latent_shape
     fp, hp, wp = SCALE_T * f - 7, SCALE_S * h, SCALE_S * w
     if tiling is None:
-        return bytes_per * fp * hp * wp
+        return DECODE_BASE_BYTES + bytes_per * fp * hp * wp
     tf, th, tw = fp, hp, wp
     if tiling.temporal:
         tf = min(fp, tiling.temporal[0])
@@ -191,7 +215,7 @@ def estimate_peak_bytes(latent_shape: tuple[int, ...], tiling: Tiling | None, by
         size, ov = tiling.spatial[0] // SCALE_S, tiling.spatial[1] // SCALE_S
         px = lambda n: min(n, max(max(2, ov + 1), round(size * n / max(h, w)))) * SCALE_S  # noqa: E731
         th, tw = px(h), px(w)
-    return bytes_per * tf * th * tw + tf * hp * wp * _ACCUM_BYTES_PER_PIXEL
+    return DECODE_BASE_BYTES + bytes_per * tf * th * tw + tf * hp * wp * _ACCUM_BYTES_PER_PIXEL
 
 
 def plan_tiling(latent_shape: tuple[int, ...], frame_rate: float = 24.0, budget_bytes: int | None = None,
@@ -223,28 +247,6 @@ def to_uint8(pixels: mx.array) -> np.ndarray:
     """(1, 3, T, H, W) in [-1, 1] -> uint8 (T, H, W, 3)."""
     x = ((mx.clip(pixels[0], -1.0, 1.0) + 1.0) * 127.5).astype(mx.uint8)
     return np.array(x.transpose(1, 2, 3, 0))
-
-
-def _conv_slabs(x: mx.array, w: mx.array, b: mx.array) -> mx.array:
-    """Valid 3x3x3 conv of an already padded input, evaluated in temporal slabs.
-
-    Output frame t reads padded frames t..t+2 only, so slabs are exact. MLX's
-    conv3d allocates scratch proportional to the whole input (a 768x512x121
-    decode peaked at 60 GiB for activations of 1.5 GiB); bounding the slab
-    bounds the scratch, and equal-shaped slabs reuse the same buffers.
-    """
-    d_out = x.shape[1] - 2
-    per_frame = x.shape[2] * x.shape[3] * max(x.shape[4], w.shape[0]) * x.dtype.size
-    frames = max(1, int(SLAB_SCRATCH_BYTES // (27 * per_frame)))
-    if frames >= d_out:
-        return mx.conv3d(x, w) + b
-    mx.eval(x)
-    out = []
-    for t in range(0, d_out, frames):
-        y = mx.conv3d(x[:, t : min(t + frames, d_out) + 2], w) + b
-        mx.eval(y)
-        out.append(y)
-    return mx.concatenate(out, axis=1)
 
 
 class VideoVAE:
@@ -294,14 +296,16 @@ class VideoVAE:
     def denormalize(self, latent: mx.array) -> mx.array:
         return latent.astype(G) * self.std + self.mean
 
-    def _conv(self, name: str, x: mx.array, causal: bool) -> mx.array:
-        y = conv3d(x.astype(self.dtype), self.w[name + ".conv.weight"], self.w[name + ".conv.bias"], causal, name)
-        return y.astype(self.stream)
+    def _conv(self, name: str, x: mx.array, causal: bool, act: bool = False) -> mx.array:
+        return conv3d(x, self.w[name + ".conv.weight"], self.w[name + ".conv.bias"], causal, name,
+                      act=act, operand=self.dtype, stream=self.stream)
 
     def _res(self, p: str, n: int, x: mx.array, causal: bool) -> mx.array:
         for i in range(n):
-            h = self._conv(f"{p}.res_blocks.{i}.conv1", silu(pixel_norm(x)), causal)
-            x = x + self._conv(f"{p}.res_blocks.{i}.conv2", silu(pixel_norm(h)), causal)
+            h = self._conv(f"{p}.res_blocks.{i}.conv1", x, causal, act=True)
+            x = x + self._conv(f"{p}.res_blocks.{i}.conv2", h, causal, act=True)
+            del h
+            mx.eval(x)
         return x
 
     def decode_raw(self, latent: mx.array, materialize: bool = True) -> mx.array:
@@ -324,7 +328,7 @@ class VideoVAE:
                     x = x[:, 1:]
             if materialize:
                 mx.eval(x)
-        x = self._conv("decoder.conv_out", silu(pixel_norm(x)), False)
+        x = self._conv("decoder.conv_out", x, False, act=True)
         b, f, h, w, _ = x.shape  # unpatchify: b (c p r q) f h w -> b c (f p) (h q) (w r), q = r = 4
         x = x.reshape(b, f, h, w, 3, 4, 4).transpose(0, 1, 2, 6, 3, 5, 4).reshape(b, f, h * 4, w * 4, 3)
         return x.transpose(0, 4, 1, 2, 3).astype(G)
@@ -394,7 +398,7 @@ class VideoVAE:
 
     def encode(self, pixels: mx.array) -> mx.array:
         """Pixels (B, 3, 8k+1, H, W) in [-1, 1] -> normalized latent (B, 128, k+1, H/32, W/32) fp32."""
-        x = pixels.transpose(0, 2, 3, 4, 1).astype(self.dtype)
+        x = pixels.transpose(0, 2, 3, 4, 1).astype(self.stream)
         b, f, h, w, c = x.shape  # patchify: b c (f p) (h q) (w r) -> b (c p r q) f h w
         x = x.reshape(b, f, h // 4, 4, w // 4, 4, c).transpose(0, 1, 2, 4, 6, 5, 3).reshape(b, f, h // 4, w // 4, c * 16)
         x = self._conv("encoder.conv_in", x, True)
@@ -413,7 +417,7 @@ class VideoVAE:
                     skip = skip.reshape(*skip.shape[:-1], out_ch, group).mean(axis=-1)
                 x = space_to_depth(self._conv(p + ".conv", x, True), st, sh, sw) + skip
             mx.eval(x)
-        x = self._conv("encoder.conv_out", silu(pixel_norm(x)), True)[..., :128]
+        x = self._conv("encoder.conv_out", x, True, act=True)[..., :128]
         return self.normalize(x.transpose(0, 4, 1, 2, 3))
 
     def encode_tiled(self, pixels: mx.array, tiling: Tiling) -> mx.array:
