@@ -113,6 +113,28 @@ def apply_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     return mx.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
 
 
+# Elementwise chains, compiled so MLX emits one fused kernel pass for each
+# instead of one pass (and one temporary) per arithmetic op.
+@mx.compile
+def _modulate(xn: mx.array, scale: mx.array, shift: mx.array) -> mx.array:
+    return (xn * (1.0 + scale) + shift).astype(F)
+
+
+@mx.compile
+def _gated_residual(x: mx.array, y: mx.array, gate: mx.array) -> mx.array:
+    return x + y * gate
+
+
+@mx.compile
+def _gelu_tanh(h: mx.array) -> mx.array:
+    return 0.5 * h * (1.0 + mx.tanh(0.7978845608028654 * (h + 0.044715 * h * h * h)))
+
+
+@mx.compile
+def _head_gate(out: mx.array, logits: mx.array) -> mx.array:
+    return out * (2.0 * mx.sigmoid(logits)).transpose(0, 2, 1)[..., None]
+
+
 class Modulation:
     """One AdaLN head's output: (rows, P, dim) fp32, optionally per-token.
 
@@ -228,16 +250,13 @@ class LTX25DiT:
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=hd**-0.5, mask=mask)
         if skip is not None:  # STG: perturbed samples pass the values through
             out = out * skip + v * (1.0 - skip)
-        gate = 2.0 * mx.sigmoid(self.lin(p + ".to_gate_logits", x))  # (B, N, heads)
-        out = out * gate.transpose(0, 2, 1)[..., None]
+        out = _head_gate(out, self.lin(p + ".to_gate_logits", x))  # logits (B, N, heads)
         out = out.transpose(0, 2, 1, 3).reshape(b, -1, heads * hd)
         return self.lin(p + ".to_out.0", out)
 
     def _ff(self, p: str, x: mx.array) -> mx.array:
-        h = self.lin(p + ".net.0.proj", x)
         # gelu-approximate (tanh form), as the checkpoint's activation_fn.
-        h = 0.5 * h * (1.0 + mx.tanh(0.7978845608028654 * (h + 0.044715 * h * h * h)))
-        return self.lin(p + ".net.2", h)
+        return self.lin(p + ".net.2", _gelu_tanh(self.lin(p + ".net.0.proj", x)))
 
     def _norm(self, x: mx.array) -> mx.array:
         return mx.fast.rms_norm(x, None, self.cfg.norm_eps)
@@ -255,50 +274,50 @@ class LTX25DiT:
             return None if m is None else m.reshape([-1] + [1] * (like_ndim - 1))
 
         # 1. video self-attention (table rows 0..2 = shift, scale, gate)
-        x = (self._norm(v) * (1.0 + vm.get(1, vt[1])) + vm.get(0, vt[0])).astype(F)
+        x = _modulate(self._norm(v), vm.get(1, vt[1]), vm.get(0, vt[0]))
         sk = skip("video_self", 4)
         y = self._attn(p + ".attn1", x, rope_q=s["video_rope"], mask=s["video_mask"],
                        skip=None if sk is None else sk.astype(F))
-        v = v + y * vm.get(2, vt[2])
+        v = _gated_residual(v, y, vm.get(2, vt[2]))
 
         # 2. audio self-attention
-        x = (self._norm(a) * (1.0 + am.get(1, at[1])) + am.get(0, at[0])).astype(F)
+        x = _modulate(self._norm(a), am.get(1, at[1]), am.get(0, at[0]))
         sk = skip("audio_self", 4)
         y = self._attn(p + ".audio_attn1", x, rope_q=s["audio_rope"], mask=s["audio_mask"],
                        skip=None if sk is None else sk.astype(F))
-        a = a + y * am.get(2, at[2])
+        a = _gated_residual(a, y, am.get(2, at[2]))
 
         # 3. video text cross-attention (rows 6..8; prompt table modulates the text)
         if s["video_text"] is not None:
-            x = (self._norm(v) * (1.0 + vm.get(7, vt[7])) + vm.get(6, vt[6])).astype(F)
+            x = _modulate(self._norm(v), vm.get(7, vt[7]), vm.get(6, vt[6]))
             pt, pm = w[p + ".prompt_scale_shift_table"], s["video_prompt_mod"]
             text = (s["video_text"] * (1.0 + pm.get(1, pt[1])) + pm.get(0, pt[0])).astype(F)
             y = self._attn(p + ".attn2", x, ctx=text, mask=s["video_cross_mask"])
-            v = v + y * vm.get(8, vt[8])
+            v = _gated_residual(v, y, vm.get(8, vt[8]))
 
         # 4. audio text cross-attention
         if s["audio_text"] is not None:
-            x = (self._norm(a) * (1.0 + am.get(7, at[7])) + am.get(6, at[6])).astype(F)
+            x = _modulate(self._norm(a), am.get(7, at[7]), am.get(6, at[6]))
             pt, pm = w[p + ".audio_prompt_scale_shift_table"], s["audio_prompt_mod"]
             text = (s["audio_text"] * (1.0 + pm.get(1, pt[1])) + pm.get(0, pt[0])).astype(F)
             y = self._attn(p + ".audio_attn2", x, ctx=text)
-            a = a + y * am.get(8, at[8])
+            a = _gated_residual(a, y, am.get(8, at[8]))
 
         # 5-6. audio<->video cross attention; both directions read the same norms.
         # Table rows: 0 scale_a2v, 1 shift_a2v, 2 scale_v2a, 3 shift_v2a, 4 gate.
         cvt, cat = w[p + ".scale_shift_table_a2v_ca_video"], w[p + ".scale_shift_table_a2v_ca_audio"]
         cvm, cam = s["av_video_mod"], s["av_audio_mod"]
         vn, an = self._norm(v), self._norm(a)
-        vq = (vn * (1.0 + cvm.get(0, cvt[0])) + cvm.get(1, cvt[1])).astype(F)
-        akv = (an * (1.0 + cam.get(0, cat[0])) + cam.get(1, cat[1])).astype(F)
+        vq = _modulate(vn, cvm.get(0, cvt[0]), cvm.get(1, cvt[1]))
+        akv = _modulate(an, cam.get(0, cat[0]), cam.get(1, cat[1]))
         y = self._attn(p + ".audio_to_video_attn", vq, ctx=akv,
                        rope_q=s["video_cross_rope"], rope_k=s["audio_cross_rope"])
         y = y * s["a2v_gate_mod"].get(0, cvt[4])
         sk = skip("a2v", 3)
         v_new = v + (y if sk is None else y * sk)
 
-        aq = (an * (1.0 + cam.get(2, cat[2])) + cam.get(3, cat[3])).astype(F)
-        vkv = (vn * (1.0 + cvm.get(2, cvt[2])) + cvm.get(3, cvt[3])).astype(F)
+        aq = _modulate(an, cam.get(2, cat[2]), cam.get(3, cat[3]))
+        vkv = _modulate(vn, cvm.get(2, cvt[2]), cvm.get(3, cvt[3]))
         y = self._attn(p + ".video_to_audio_attn", aq, ctx=vkv,
                        rope_q=s["audio_cross_rope"], rope_k=s["video_cross_rope"])
         y = y * s["v2a_gate_mod"].get(0, cat[4])
@@ -307,10 +326,10 @@ class LTX25DiT:
         v = v_new
 
         # 7-8. feed-forward (rows 3..5)
-        x = (self._norm(v) * (1.0 + vm.get(4, vt[4])) + vm.get(3, vt[3])).astype(F)
-        v = v + self._ff(p + ".ff", x) * vm.get(5, vt[5])
-        x = (self._norm(a) * (1.0 + am.get(4, at[4])) + am.get(3, at[3])).astype(F)
-        a = a + self._ff(p + ".audio_ff", x) * am.get(5, at[5])
+        x = _modulate(self._norm(v), vm.get(4, vt[4]), vm.get(3, vt[3]))
+        v = _gated_residual(v, self._ff(p + ".ff", x), vm.get(5, vt[5]))
+        x = _modulate(self._norm(a), am.get(4, at[4]), am.get(3, at[3]))
+        a = _gated_residual(a, self._ff(p + ".audio_ff", x), am.get(5, at[5]))
         return v, a
 
     # ---- model ------------------------------------------------------------
