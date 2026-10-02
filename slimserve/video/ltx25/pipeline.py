@@ -21,9 +21,9 @@ from slimserve.video.ltx25.sampling import LatentState
 
 G = mx.float32
 OS_RESERVE_BYTES = 24 << 30  # never plan Metal memory into the last 24 GiB
-CACHE_BYTES = (
-    12 << 30
-)  # MLX buffer cache: reuse across steps and decodes without unbounded growth
+# MLX buffer cache: decode buffers are reused across steps and requests; a
+# 12 GiB cap cost 0.8 s per short decode, 16 GiB 0.5 s, unbounded nothing.
+CACHE_BYTES = 16 << 30
 DEFAULT_VIDEO_GUIDANCE = sampling.Guidance(cfg=3.0)
 DEFAULT_AUDIO_GUIDANCE = sampling.Guidance(cfg=7.0)
 
