@@ -55,10 +55,10 @@ a cold process, prompt to mp4, including model loads.
 
 | clip | pipeline | baseline q8 | baseline bf16 | SlimServe | vs q8 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 768x512x121 | distilled | 116.9 s | 202.4 s | **90.4 s** | 1.29x |
+| 768x512x121 | distilled | 116.9 s | 202.4 s | **86 s** cold, **71 s** resident | 1.36x |
 | 768x512x121 | dev, 30 steps | 606.9 s | | **406 s** | 1.49x |
 | 768x512x121 | DFR | 170.9 s | | **125 s** | 1.37x |
-| 1536x1024x121 | distilled | 504.9 s (tiled attention and decode; untiled dies in decode) | | **358 s**, untiled | 1.41x |
+| 1536x1024x121 | distilled | 504.9 s (tiled attention and decode; untiled dies in decode) | | **343 s**, untiled | 1.47x |
 
 SlimServe runs the unquantized official weights; the q8 baseline is an 8-bit
 pack. Per-forward accuracy against an fp32 run of the same weights on
@@ -91,7 +91,13 @@ Evidence, per-op profiles and every intermediate number are in
 6. **Runtime adapters.** The rank-450 distilled LoRA and the detailing
    IC-LoRA are applied as low-rank terms next to the base GEMM. No second
    39 GiB transformer, no reload between stages, exact detach.
-7. **Text path.** Gemma-4 12B runs on the prompt's real tokens only (padding
+7. **Shape-aware convolutions.** MLX's conv3d runs 1024-channel layers on
+   small grids at 1.5 TF/s; those run as per-tap split-K GEMMs instead (the
+   upscaler 2.5 to 0.45 s), chosen per shape by a persisted measurement.
+8. **Compiled filters.** The vocoder's 12-tap anti-aliasing filters are
+   compiled multiply-add chains instead of 200 dispatch-bound convolutions
+   (audio 2.5 to 0.36 s).
+9. **Text path.** Gemma-4 12B runs on the prompt's real tokens only (padding
    is masked and replaced by registers in the connector either way): 0.85 s
    per prompt.
 

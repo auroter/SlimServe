@@ -494,3 +494,40 @@ a profile shows an MLX op far below 18 TF/s, as K=16384 was. (5) QuixiCore-Metal
 PR: there is no new Metal kernel to upstream yet; the candidates are the
 split-K GEMM dispatch and the slab conv3d driver. (6) M5 int8 path on M5
 hardware.
+
+## 16. Second optimization round and the remaining-headroom accounting (2026-10-02)
+
+Asked for: every potential win estimated, and the campaign to run until the
+rest is within ~1%. Measured on the warm resident short clip (77.3 s before
+this round), which is what a server runs.
+
+| lever | measured | kept |
+| --- | --- | --- |
+| dispatch bubbles: `async_eval` between block groups and sampler steps | forward 11.53 -> 11.44 s, bit-identical | yes |
+| fused QKV(+gate) projection GEMMs at 1,536 rows | 8.53 vs 8.51 ms: MLX already pipelines back-to-back GEMMs at 18 TF/s; the low per-op rates in the sync profiler were inflation | no |
+| spatial upscaler: 1024-channel conv3d at a 16x8x12 grid ran at 1.4-1.7 TF/s in MLX | per-tap split-K GEMM (K = 3 x 1024): 51 -> 11 ms per conv, rel 3e-6; upscaler 2.5 -> 0.45 s (HD 6.6 -> 1.4 s) | yes |
+| VAE decoder convs of the same shape class (`conv3d_core`, choice measured per shape and persisted in `~/.cache/slimserve/ltx25_conv3d_choice.json`) | decode 8.0 -> 7.1 s, HD 33.7 -> 29.9 s; same parity (2.7e-6 vs the runner in fp32) | yes |
+| vocoder anti-aliasing filters: 12-tap single-channel convs, 2.5-6 ms per call x 200, dispatch-bound | compiled shifted multiply-add FIRs: 0.9 ms per call, 1e-6 agreement; audio decode 2.5 -> 0.36 s | yes |
+| MLX cache limit vs decode first-touch | 12 GiB: 8.5 s, 16: 7.95, 20: 7.7, 24: 7.15; 16 GiB chosen so the dev profile still decodes without evicting the text encoder | yes |
+| stage-2 GEMMs "at 17 TF/s inside the forward" | sum of standalone kernel times at measured rates (GEMM 0.175 PF at 18.8 + attention 0.034 PF at 15.1) = 11.55 s vs 11.44 s measured: nothing left between kernels | closed, 0% |
+
+After the round: warm short clip **71.2 s** (text 1.4, stage 1 23.1, upscale
+0.45, stage 2 34.5, decode 9.9, audio 1.15, mux 0.7); cold HD distilled
+**343 s** (was 358). Stage-1 profile: `stage1_profile.md`.
+
+**What is left, output-preserving, M1 Ultra** (estimates against the 71.2 s
+warm short clip and the 343 s HD clip):
+
+| lever | short | HD | status |
+| --- | ---: | ---: | --- |
+| attention kernel 15.3 -> ~19 TF/s (D128 fp16) | ~1.5% | ~5% | days of kernel work, parity with MLX's steel kernel not assured; the one real kernel target left |
+| GEMM kernel above MLX's 18.5-19.3 | <=5% | <=5% | section 15: our prototype reached half of MLX; rejected |
+| decode: remaining first-touch under the 16 GiB cache | 1% | <1% | closed by the cache choice |
+| cold loads overlapped with prompt encoding (CLI one-shot only) | 2% cold | <1% | not done; serving is warm |
+| dispatch/glue | <0.5% | <0.5% | closed |
+
+Everything beyond this changes the output and is opt-in: fp16 VAE decode
+(55 dB, 3-4%), step caching on dev (1.5-2x), sparse attention at HD, lower
+step counts. The campaign's output-preserving work on M1 Ultra is at its
+epsilon except for the attention kernel, which is recorded as the open
+item with its expected value.
