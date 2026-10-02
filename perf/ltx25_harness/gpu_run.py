@@ -15,7 +15,13 @@ Why: on 2026-10-02 four model-loading processes ran at once (84.7 + 64.2 +
 compressor ran out of space, watchdogd was starved for 90 s and the kernel
 panicked. See HANDOFF.md, "Ops constraints".
 """
-import argparse, fcntl, os, subprocess, sys, time
+
+import argparse
+import fcntl
+import os
+import subprocess
+import sys
+import time
 
 LOCK = os.path.expanduser("~/.local/scratch/ltx25/gpu.lock")
 OS_RESERVE_GB = 16  # never plan into the last 16 GiB
@@ -29,15 +35,28 @@ def sysctl(name: str) -> int:
 def available_gb() -> float:
     page = sysctl("hw.pagesize")
     out = subprocess.check_output(["vm_stat"], text=True)
-    pages = {l.split(":")[0]: int(l.split(":")[1].strip().rstrip(".")) for l in out.splitlines()[1:] if ":" in l}
-    free = pages.get("Pages free", 0) + pages.get("Pages inactive", 0) + pages.get("Pages speculative", 0) + pages.get("Pages purgeable", 0)
+    pages = {
+        line.split(":")[0]: int(line.split(":")[1].strip().rstrip("."))
+        for line in out.splitlines()[1:]
+        if ":" in line
+    }
+    free = (
+        pages.get("Pages free", 0)
+        + pages.get("Pages inactive", 0)
+        + pages.get("Pages speculative", 0)
+        + pages.get("Pages purgeable", 0)
+    )
     return free * page / 2**30
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--need-gb", type=float, required=True, help="expected peak memory of the job")
-    ap.add_argument("--wait-s", type=float, default=3600, help="how long to wait for the lock")
+    ap.add_argument(
+        "--need-gb", type=float, required=True, help="expected peak memory of the job"
+    )
+    ap.add_argument(
+        "--wait-s", type=float, default=3600, help="how long to wait for the lock"
+    )
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
@@ -45,28 +64,42 @@ def main() -> int:
         ap.error("no command")
     total = sysctl("hw.memsize") / 2**30
     if a.need_gb + OS_RESERVE_GB > total:
-        sys.exit(f"[gpu_run] refused: job needs {a.need_gb:.0f} GiB + {OS_RESERVE_GB} GiB reserve > {total:.0f} GiB RAM")
+        sys.exit(
+            f"[gpu_run] refused: job needs {a.need_gb:.0f} GiB + {OS_RESERVE_GB} GiB "
+            f"reserve > {total:.0f} GiB RAM"
+        )
     wired = sysctl("iogpu.wired_limit_mb")
     if wired > MAX_WIRED_LIMIT_MB:
-        sys.exit(f"[gpu_run] refused: iogpu.wired_limit_mb={wired} leaves the OS too little; "
-                 f"set it to 0 (default) or <= {MAX_WIRED_LIMIT_MB}: sudo sysctl iogpu.wired_limit_mb=0")
+        sys.exit(
+            f"[gpu_run] refused: iogpu.wired_limit_mb={wired} leaves the OS too "
+            "little; "
+            f"set it to 0 (default) or <= {MAX_WIRED_LIMIT_MB}: "
+            "sudo sysctl iogpu.wired_limit_mb=0"
+        )
     os.makedirs(os.path.dirname(LOCK), exist_ok=True)
-    fh = open(LOCK, "a+")
-    deadline = time.time() + a.wait_s
-    while True:
-        try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if time.time() > deadline:
-                sys.exit("[gpu_run] refused: another GPU job still holds the lock")
-            time.sleep(2)
-    avail = available_gb()
-    if avail < a.need_gb + OS_RESERVE_GB:
-        sys.exit(f"[gpu_run] refused: {avail:.0f} GiB available, job needs {a.need_gb:.0f} + {OS_RESERVE_GB} reserve; "
-                 "something else is holding memory (check `ps -axm -o rss,pid,comm | sort -nr | head`)")
-    fh.seek(0); fh.truncate(); fh.write(f"{os.getpid()} need={a.need_gb} {' '.join(cmd)}\n"); fh.flush()
-    return subprocess.call(cmd)  # lock is held until this process exits
+    with open(LOCK, "a+") as fh:
+        deadline = time.time() + a.wait_s
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > deadline:
+                    sys.exit("[gpu_run] refused: another GPU job still holds the lock")
+                time.sleep(2)
+        avail = available_gb()
+        if avail < a.need_gb + OS_RESERVE_GB:
+            sys.exit(
+                f"[gpu_run] refused: {avail:.0f} GiB available, job needs "
+                f"{a.need_gb:.0f} + {OS_RESERVE_GB} reserve; "
+                "something else is holding memory "
+                "(check `ps -axm -o rss,pid,comm | sort -nr | head`)"
+            )
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()} need={a.need_gb} {' '.join(cmd)}\n")
+        fh.flush()
+        return subprocess.call(cmd)  # lock is held until this process exits
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 # HANDOFF — LTX-2.5 on Apple Silicon: support + Metal kernel campaign
 
 Branch `ltx25-metal` (worktree `SlimServe-ltx25`, from origin/main 6aa3c395).
-Written 2026-10-02 at the close of the investigation phase; nothing in the
-engine exists yet. The previous HANDOFF (NVFP4 Qwen3.8 campaign, complete) is
+Written 2026-10-02 at the close of the investigation phase and updated the
+same day after bring-up (see Status). The previous HANDOFF (NVFP4 Qwen3.8 campaign, complete) is
 in git history on main. Companion documents, read them in this order:
 
 1. This file: mission, rules, decisions, milestones, gates, ops, risks.
@@ -13,6 +13,35 @@ in git history on main. Companion documents, read them in this order:
    model facts, kernel prior art).
 4. `perf/ltx25_harness/`: the measurement scripts that produced the ledger.
 5. `perf/results/2026-10-01-ltx25-baseline/`: raw logs and frames.
+
+## Status (2026-10-02, end of the bring-up session)
+
+Done and gated: N0 loader, N1 forward, N2 distilled end to end, the
+output-preserving kernel-wave items that paid (split-K, fused glue, slab
+VAE), N5 dev and DFR (default configuration), N6 profiles + CLI + serving.
+Numbers: ledger sections 13 and 15. User and design documentation:
+`docs/ltx25_metal.md`.
+
+| clip | pipeline | baseline q8 | ours |
+| --- | --- | ---: | ---: |
+| 768x512x121 | distilled | 116.9 s | 90.4 s (86.1 s through `slimserve`) |
+| 768x512x121 | dev 30 steps | 606.9 s | 406 s |
+| 768x512x121 | DFR | 170.9 s | 125 s |
+| 1536x1024x121 | distilled | 504.9 s tiled | 358 s untiled |
+
+Not done: I2V conditioning, DFR temporal rounds and second spatial epilogue,
+duration head, prompt enhancer, res_2s, the opt-in tier, any hand-written
+Metal kernel (measured headroom on M1-M4 is at most ~10% of a forward; see
+ledger section 15), N7 (nothing to upstream yet), the dev-vs-DFR quality A/B,
+HD runs of dev and DFR, a PR. The branch is local only (not pushed).
+
+How to run anything heavy: `perf/ltx25_harness/gpu_run.py --need-gb N -- <cmd>`
+with `PYTHONPATH=<worktree>`. Environments: the engine and its tests run in
+`~/.local/scratch/ltx25/venv-slimserve` (MLX 0.32.2 + the CLI's imports); the
+registry suite runs in the main checkout's `.venv` (no MLX; the video tests
+skip their MLX parts there); the baseline runner has its own venv. The main
+SlimServe venv has no MLX: `requirements/video-metal.txt` lists what the
+video profiles add.
 
 ## Mission
 

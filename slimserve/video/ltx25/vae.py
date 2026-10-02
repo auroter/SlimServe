@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import itertools
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import mlx.core as mx
 import numpy as np
@@ -34,8 +35,16 @@ SLAB_SCRATCH_BYTES = 4 << 30  # im2col-equivalent scratch allowed per conv slab
 CONV_HOOK: Callable[[str, tuple, tuple, float], None] | None = None
 
 
-def conv3d(x: mx.array, w: mx.array, b: mx.array, causal: bool = False, tag: str = "",
-           act: bool = False, operand: mx.Dtype | None = None, stream: mx.Dtype | None = None) -> mx.array:
+def conv3d(
+    x: mx.array,
+    w: mx.array,
+    b: mx.array,
+    causal: bool = False,
+    tag: str = "",
+    act: bool = False,
+    operand: mx.Dtype | None = None,
+    stream: mx.Dtype | None = None,
+) -> mx.array:
     """3x3x3 stride-1 conv, optionally preceded by pixel-norm + SiLU (`act`).
 
     Temporal padding replicates the edge frame (front only when causal),
@@ -50,7 +59,12 @@ def conv3d(x: mx.array, w: mx.array, b: mx.array, causal: bool = False, tag: str
     """
     d = x.shape[1]
     front = 2 if causal else 1
-    per_frame = (x.shape[2] + 2) * (x.shape[3] + 2) * max(x.shape[4], w.shape[0]) * (operand or x.dtype).size
+    per_frame = (
+        (x.shape[2] + 2)
+        * (x.shape[3] + 2)
+        * max(x.shape[4], w.shape[0])
+        * (operand or x.dtype).size
+    )
     frames = max(1, int(SLAB_SCRATCH_BYTES // (27 * per_frame)))
     mx.eval(x)
     t_start = time.perf_counter() if CONV_HOOK is not None else 0.0
@@ -58,7 +72,11 @@ def conv3d(x: mx.array, w: mx.array, b: mx.array, causal: bool = False, tag: str
     for t in range(0, d, frames):
         hi = min(t + frames, d)
         idx = [min(max(i - front, 0), d - 1) for i in range(t, hi + 2)]
-        xs = x[:, idx[0] : idx[-1] + 1] if idx == list(range(idx[0], idx[-1] + 1)) else mx.take(x, mx.array(idx), axis=1)
+        xs = (
+            x[:, idx[0] : idx[-1] + 1]
+            if idx == list(range(idx[0], idx[-1] + 1))
+            else mx.take(x, mx.array(idx), axis=1)
+        )
         if act:
             xs = silu(pixel_norm(xs))
         if operand is not None:
@@ -72,8 +90,12 @@ def conv3d(x: mx.array, w: mx.array, b: mx.array, causal: bool = False, tag: str
     if CONV_HOOK is not None:
         mx.eval(y)
         mx.synchronize()
-        CONV_HOOK(tag, (x.shape[0], d + 2, x.shape[2] + 2, x.shape[3] + 2, x.shape[4]), tuple(w.shape),
-                  time.perf_counter() - t_start)
+        CONV_HOOK(
+            tag,
+            (x.shape[0], d + 2, x.shape[2] + 2, x.shape[3] + 2, x.shape[4]),
+            tuple(w.shape),
+            time.perf_counter() - t_start,
+        )
     return y
 
 
@@ -95,7 +117,9 @@ def depth_to_space(x: mx.array, sf: int, tf: int) -> mx.array:
 
 def space_to_depth(x: mx.array, st: int, sh: int, sw: int) -> mx.array:
     b, d, h, w, c = x.shape
-    x = x.reshape(b, d // st, st, h // sh, sh, w // sw, sw, c).transpose(0, 1, 3, 5, 7, 2, 4, 6)
+    x = x.reshape(b, d // st, st, h // sh, sh, w // sw, sw, c).transpose(
+        0, 1, 3, 5, 7, 2, 4, 6
+    )
     return x.reshape(b, d // st, h // sh, w // sw, c * st * sh * sw)
 
 
@@ -105,7 +129,9 @@ class Tiling:
     """Tile sizes/overlaps in pixels and frames; None disables that axis."""
 
     spatial: tuple[int, int] | None = None  # (tile px, overlap px), multiples of 32
-    temporal: tuple[int, int] | None = None  # (tile frames, overlap frames), multiples of 8
+    temporal: tuple[int, int] | None = (
+        None  # (tile frames, overlap frames), multiples of 8
+    )
 
     def describe(self) -> str:
         parts = []
@@ -116,8 +142,13 @@ class Tiling:
         return " ".join(parts) or "untiled"
 
 
-def _trapezoid(length: int, ramp_left: int, ramp_right: int, left_from_0: bool) -> mx.array:
-    ramp_left, ramp_right = max(0, min(ramp_left, length)), max(0, min(ramp_right, length))
+def _trapezoid(
+    length: int, ramp_left: int, ramp_right: int, left_from_0: bool
+) -> mx.array:
+    ramp_left, ramp_right = (
+        max(0, min(ramp_left, length)),
+        max(0, min(ramp_right, length)),
+    )
     mask = mx.ones(length)
     if ramp_left > 0:
         fade = mx.linspace(0.0, 1.0, ramp_left + (1 if left_from_0 else 2))[:-1]
@@ -146,7 +177,14 @@ def _split(length: int, size: int, overlap: int) -> list[tuple[int, int, int, in
     out = []
     for i in range(n):
         s = i * (size - overlap)
-        out.append((s, length if i == n - 1 else s + size, overlap if i else 0, overlap if i < n - 1 else 0))
+        out.append(
+            (
+                s,
+                length if i == n - 1 else s + size,
+                overlap if i else 0,
+                overlap if i < n - 1 else 0,
+            )
+        )
     return out
 
 
@@ -158,10 +196,14 @@ def _axis_mask(mask: mx.array | None, axis: int) -> mx.array:
     return mask.reshape(shape)
 
 
-def decode_tiles(latent_shape: tuple[int, ...], tiling: Tiling) -> list[tuple[tuple, tuple, mx.array]]:
+def decode_tiles(
+    latent_shape: tuple[int, ...], tiling: Tiling
+) -> list[tuple[tuple, tuple, mx.array]]:
     """[(latent slices, pixel slices, blend mask)], temporal-major order."""
     _, _, f, h, w = latent_shape
-    axes: list[list[tuple[slice, slice, mx.array | None]]] = [[(slice(0, None), slice(0, None), None)]] * 2
+    axes: list[list[tuple[slice, slice, mx.array | None]]] = [
+        [(slice(0, None), slice(0, None), None)]
+    ] * 2
     if tiling.temporal:
         size, ov = tiling.temporal[0] // SCALE_T, tiling.temporal[1] // SCALE_T
         t_axis = []
@@ -170,7 +212,13 @@ def decode_tiles(latent_shape: tuple[int, ...], tiling: Tiling) -> list[tuple[tu
                 s, lr = s - 1, lr + 1
             start, stop = s * SCALE_T, 1 + (e - 1) * SCALE_T
             lrf = 0 if lr == 0 else 1 + (lr - 1) * SCALE_T
-            t_axis.append((slice(s, e), slice(start, stop), _trapezoid(stop - start, lrf, rr * SCALE_T, True)))
+            t_axis.append(
+                (
+                    slice(s, e),
+                    slice(start, stop),
+                    _trapezoid(stop - start, lrf, rr * SCALE_T, True),
+                )
+            )
         axes.append(t_axis)
     else:
         axes.append([(slice(0, None), slice(0, None), None)])
@@ -178,11 +226,18 @@ def decode_tiles(latent_shape: tuple[int, ...], tiling: Tiling) -> list[tuple[tu
         if tiling.spatial:
             size, ov = tiling.spatial[0] // SCALE_S, tiling.spatial[1] // SCALE_S
             size = max(max(2, ov + 1), round(size * n / max(h, w)))
-            axes.append([
-                (slice(s, e), slice(s * SCALE_S, e * SCALE_S),
-                 _trapezoid((e - s) * SCALE_S, lr * SCALE_S, rr * SCALE_S, False))
-                for s, e, lr, rr in _split(n, size, ov)
-            ])
+            axes.append(
+                [
+                    (
+                        slice(s, e),
+                        slice(s * SCALE_S, e * SCALE_S),
+                        _trapezoid(
+                            (e - s) * SCALE_S, lr * SCALE_S, rr * SCALE_S, False
+                        ),
+                    )
+                    for s, e, lr, rr in _split(n, size, ov)
+                ]
+            )
         else:
             axes.append([(slice(0, None), slice(0, None), None)])
     tiles = []
@@ -203,7 +258,11 @@ DECODE_BASE_BYTES = 5 << 30
 _ACCUM_BYTES_PER_PIXEL = 4 * 3 * 4
 
 
-def estimate_peak_bytes(latent_shape: tuple[int, ...], tiling: Tiling | None, bytes_per: int = BYTES_PER_PIXEL_FRAME) -> int:
+def estimate_peak_bytes(
+    latent_shape: tuple[int, ...],
+    tiling: Tiling | None,
+    bytes_per: int = BYTES_PER_PIXEL_FRAME,
+) -> int:
     _, _, f, h, w = latent_shape
     fp, hp, wp = SCALE_T * f - 7, SCALE_S * h, SCALE_S * w
     if tiling is None:
@@ -213,17 +272,31 @@ def estimate_peak_bytes(latent_shape: tuple[int, ...], tiling: Tiling | None, by
         tf = min(fp, tiling.temporal[0])
     if tiling.spatial:
         size, ov = tiling.spatial[0] // SCALE_S, tiling.spatial[1] // SCALE_S
-        px = lambda n: min(n, max(max(2, ov + 1), round(size * n / max(h, w)))) * SCALE_S  # noqa: E731
+        px = lambda n: (
+            min(n, max(max(2, ov + 1), round(size * n / max(h, w)))) * SCALE_S
+        )  # noqa: E731
         th, tw = px(h), px(w)
-    return DECODE_BASE_BYTES + bytes_per * tf * th * tw + tf * hp * wp * _ACCUM_BYTES_PER_PIXEL
+    return (
+        DECODE_BASE_BYTES
+        + bytes_per * tf * th * tw
+        + tf * hp * wp * _ACCUM_BYTES_PER_PIXEL
+    )
 
 
-def plan_tiling(latent_shape: tuple[int, ...], frame_rate: float = 24.0, budget_bytes: int | None = None,
-                bytes_per: int = BYTES_PER_PIXEL_FRAME) -> Tiling | None:
+def plan_tiling(
+    latent_shape: tuple[int, ...],
+    frame_rate: float = 24.0,
+    budget_bytes: int | None = None,
+    bytes_per: int = BYTES_PER_PIXEL_FRAME,
+) -> Tiling | None:
     """None when the whole clip fits the budget (default: half of unified
     memory), else the first rung that fits: temporal tiles 80 -> 40 frames,
     then spatial 768 -> 512 -> 256 px at 40 frames, then temporal down to 16."""
-    budget = budget_bytes if budget_bytes is not None else int(mx.device_info()["memory_size"]) // 2
+    budget = (
+        budget_bytes
+        if budget_bytes is not None
+        else int(mx.device_info()["memory_size"]) // 2
+    )
     if estimate_peak_bytes(latent_shape, None, bytes_per) <= budget:
         return None
     fp = SCALE_T * latent_shape[2] - 7
@@ -235,7 +308,9 @@ def plan_tiling(latent_shape: tuple[int, ...], frame_rate: float = 24.0, budget_
     preferred = [n for n in sizes if n >= 40]
     ladder = [Tiling(temporal=temporal(n)) for n in preferred]
     base = temporal(preferred[-1]) if preferred else None
-    ladder += [Tiling(spatial=s, temporal=base) for s in ((768, 64), (512, 32), (256, 32))]
+    ladder += [
+        Tiling(spatial=s, temporal=base) for s in ((768, 64), (512, 32), (256, 32))
+    ]
     ladder += [Tiling(spatial=(256, 32), temporal=temporal(n)) for n in sizes if n < 40]
     for t in ladder:
         if estimate_peak_bytes(latent_shape, t, bytes_per) <= budget:
@@ -254,26 +329,58 @@ class VideoVAE:
     preserving default; see perf/ltx25_metal_campaign.md for the fp16 numbers."""
 
     # decoder: (kind, blocks | (spatial factor, temporal factor))
-    DEC = (("res", 2), ("up", (2, 2)), ("res", 2), ("up", (2, 2)), ("res", 4), ("up", (1, 2)),
-           ("res", 6), ("up", (2, 1)), ("res", 4))
+    DEC = (
+        ("res", 2),
+        ("up", (2, 2)),
+        ("res", 2),
+        ("up", (2, 2)),
+        ("res", 4),
+        ("up", (1, 2)),
+        ("res", 6),
+        ("up", (2, 1)),
+        ("res", 4),
+    )
     # encoder: (kind, blocks | (stride t, h, w))
-    ENC = (("res", 4), ("down", (1, 2, 2)), ("res", 6), ("down", (2, 1, 1)), ("res", 4),
-           ("down", (2, 2, 2)), ("res", 2), ("down", (2, 2, 2)), ("res", 2))
+    ENC = (
+        ("res", 4),
+        ("down", (1, 2, 2)),
+        ("res", 6),
+        ("down", (2, 1, 1)),
+        ("res", 4),
+        ("down", (2, 2, 2)),
+        ("res", 2),
+        ("down", (2, 2, 2)),
+        ("res", 2),
+    )
 
-    def __init__(self, root: Path | None = None, dtype: mx.Dtype = G, stream: mx.Dtype | None = None):
+    def __init__(
+        self,
+        root: Path | None = None,
+        dtype: mx.Dtype = G,
+        stream: mx.Dtype | None = None,
+    ):
         self.path = checkpoints.path_of("video-vae", root)
         self.dtype = dtype  # conv operands (weights and conv inputs)
         self.stream = stream or dtype  # activations between convs: norm, SiLU, residual
         self.w: dict[str, mx.array] = {}
         self.config: dict[str, Any] = {}
 
-    def load(self, encoder: bool = True) -> "VideoVAE":
+    def load(self, encoder: bool = True) -> VideoVAE:
         cfg = checkpoints.read_header(self.path).config()["vae"]
-        want = {"norm_layer": "pixel_norm", "patch_size": 4, "causal_decoder": False,
-                "timestep_conditioning": False, "spatial_padding_mode": "zeros", "latent_channels": 128}
+        want = {
+            "norm_layer": "pixel_norm",
+            "patch_size": 4,
+            "causal_decoder": False,
+            "timestep_conditioning": False,
+            "spatial_padding_mode": "zeros",
+            "latent_channels": 128,
+        }
         for k, v in want.items():
             if cfg.get(k) != v:
-                raise ValueError(f"LTX-2.5 video VAE config {k}={cfg.get(k)!r}, engine implements {v!r}")
+                raise ValueError(
+                    f"LTX-2.5 video VAE config {k}={cfg.get(k)!r}, "
+                    f"engine implements {v!r}"
+                )
         self.config = cfg
         raw = checkpoints.load_raw(self.path)
         w = {}
@@ -296,9 +403,19 @@ class VideoVAE:
     def denormalize(self, latent: mx.array) -> mx.array:
         return latent.astype(G) * self.std + self.mean
 
-    def _conv(self, name: str, x: mx.array, causal: bool, act: bool = False) -> mx.array:
-        return conv3d(x, self.w[name + ".conv.weight"], self.w[name + ".conv.bias"], causal, name,
-                      act=act, operand=self.dtype, stream=self.stream)
+    def _conv(
+        self, name: str, x: mx.array, causal: bool, act: bool = False
+    ) -> mx.array:
+        return conv3d(
+            x,
+            self.w[name + ".conv.weight"],
+            self.w[name + ".conv.bias"],
+            causal,
+            name,
+            act=act,
+            operand=self.dtype,
+            stream=self.stream,
+        )
 
     def _res(self, p: str, n: int, x: mx.array, causal: bool) -> mx.array:
         for i in range(n):
@@ -309,7 +426,8 @@ class VideoVAE:
         return x
 
     def decode_raw(self, latent: mx.array, materialize: bool = True) -> mx.array:
-        """Normalized latent (B, 128, F, H, W) -> pixels (B, 3, 8F-7, 32H, 32W) fp32 in ~[-1, 1].
+        """Normalized latent (B, 128, F, H, W) -> pixels (B, 3, 8F-7, 32H, 32W) fp32 in
+        ~[-1, 1].
 
         `materialize` evaluates after every stage so the previous stage's
         activations are released before the next (larger) one; values are
@@ -329,15 +447,28 @@ class VideoVAE:
             if materialize:
                 mx.eval(x)
         x = self._conv("decoder.conv_out", x, False, act=True)
-        b, f, h, w, _ = x.shape  # unpatchify: b (c p r q) f h w -> b c (f p) (h q) (w r), q = r = 4
-        x = x.reshape(b, f, h, w, 3, 4, 4).transpose(0, 1, 2, 6, 3, 5, 4).reshape(b, f, h * 4, w * 4, 3)
+        b, f, h, w, _ = (
+            x.shape
+        )  # unpatchify: b (c p r q) f h w -> b c (f p) (h q) (w r), q = r = 4
+        x = (
+            x.reshape(b, f, h, w, 3, 4, 4)
+            .transpose(0, 1, 2, 6, 3, 5, 4)
+            .reshape(b, f, h * 4, w * 4, 3)
+        )
         return x.transpose(0, 4, 1, 2, 3).astype(G)
 
-    def decode_chunks(self, latent: mx.array, tiling: Tiling | None | str = "auto", frame_rate: float = 24.0,
-                      budget_bytes: int | None = None) -> Iterator[mx.array]:
+    def decode_chunks(
+        self,
+        latent: mx.array,
+        tiling: Tiling | None | str = "auto",
+        frame_rate: float = 24.0,
+        budget_bytes: int | None = None,
+    ) -> Iterator[mx.array]:
         """Yield evaluated pixel chunks (B, 3, T, H, W) fp32 in temporal order."""
         if tiling == "auto":
-            per = BYTES_PER_PIXEL_FRAME if self.dtype == G else BYTES_PER_PIXEL_FRAME // 2
+            per = (
+                BYTES_PER_PIXEL_FRAME if self.dtype == G else BYTES_PER_PIXEL_FRAME // 2
+            )
             tiling = plan_tiling(latent.shape, frame_rate, budget_bytes, per)
         if tiling is None:
             px = self.decode_raw(latent)
@@ -380,7 +511,9 @@ class VideoVAE:
                     buf = mx.concatenate([merged, buf[:, :, ov:]], axis=2)
                     wts = mx.concatenate([merged_w, wts[:, :, ov:]], axis=2)
                 if start > prev_start:
-                    chunk = (prev / mx.maximum(prev_w, 1e-8))[:, :, : start - prev_start]
+                    chunk = (prev / mx.maximum(prev_w, 1e-8))[
+                        :, :, : start - prev_start
+                    ]
                     mx.eval(chunk)
                     yield chunk
             prev, prev_w, prev_start, prev_stop = buf, wts, start, stop
@@ -388,19 +521,34 @@ class VideoVAE:
         mx.eval(chunk)
         yield chunk
 
-    def decode(self, latent: mx.array, tiling: Tiling | None | str = "auto", frame_rate: float = 24.0,
-               budget_bytes: int | None = None) -> np.ndarray:
+    def decode(
+        self,
+        latent: mx.array,
+        tiling: Tiling | None | str = "auto",
+        frame_rate: float = 24.0,
+        budget_bytes: int | None = None,
+    ) -> np.ndarray:
         """Normalized latent (1, 128, F, H, W) -> uint8 frames (8F-7, 32H, 32W, 3).
 
         The conv decoder is deterministic: no seed, no decode timestep.
         """
-        return np.concatenate([to_uint8(c) for c in self.decode_chunks(latent, tiling, frame_rate, budget_bytes)])
+        return np.concatenate(
+            [
+                to_uint8(c)
+                for c in self.decode_chunks(latent, tiling, frame_rate, budget_bytes)
+            ]
+        )
 
     def encode(self, pixels: mx.array) -> mx.array:
-        """Pixels (B, 3, 8k+1, H, W) in [-1, 1] -> normalized latent (B, 128, k+1, H/32, W/32) fp32."""
+        """Pixels (B, 3, 8k+1, H, W) in [-1, 1] -> normalized latent
+        (B, 128, k+1, H/32, W/32) fp32."""
         x = pixels.transpose(0, 2, 3, 4, 1).astype(self.stream)
         b, f, h, w, c = x.shape  # patchify: b c (f p) (h q) (w r) -> b (c p r q) f h w
-        x = x.reshape(b, f, h // 4, 4, w // 4, 4, c).transpose(0, 1, 2, 4, 6, 5, 3).reshape(b, f, h // 4, w // 4, c * 16)
+        x = (
+            x.reshape(b, f, h // 4, 4, w // 4, 4, c)
+            .transpose(0, 1, 2, 4, 6, 5, 3)
+            .reshape(b, f, h // 4, w // 4, c * 16)
+        )
         x = self._conv("encoder.conv_in", x, True)
         for i, (kind, arg) in enumerate(self.ENC):
             p = f"encoder.down_blocks.{i}"
@@ -434,16 +582,31 @@ class VideoVAE:
                 if len(ivs) > 1 and i < len(ivs) - 1:
                     e += 1
                 lo, hi = s // SCALE_T, (e - 1) // SCALE_T + 1
-                t_axis.append((slice(s, e), slice(lo, hi), _rect(hi - lo, 0 if lr == 0 else 1 + (lr - 1) // SCALE_T, 0)))
+                t_axis.append(
+                    (
+                        slice(s, e),
+                        slice(lo, hi),
+                        _rect(hi - lo, 0 if lr == 0 else 1 + (lr - 1) // SCALE_T, 0),
+                    )
+                )
         s_axes = []
         for n in (h, w):
             if tiling.spatial:
                 size, ov = tiling.spatial[0], max(tiling.spatial[1], 64)
-                s_axes.append([
-                    (slice(s, e), slice(s // SCALE_S, e // SCALE_S),
-                     _rect((e - s) // SCALE_S, max(0, lr // SCALE_S - 1), 1 if rr else 0))
-                    for s, e, lr, rr in _split(n, size, ov)
-                ])
+                s_axes.append(
+                    [
+                        (
+                            slice(s, e),
+                            slice(s // SCALE_S, e // SCALE_S),
+                            _rect(
+                                (e - s) // SCALE_S,
+                                max(0, lr // SCALE_S - 1),
+                                1 if rr else 0,
+                            ),
+                        )
+                        for s, e, lr, rr in _split(n, size, ov)
+                    ]
+                )
             else:
                 s_axes.append([(slice(0, None), slice(0, None), None)])
         buf = mx.zeros((b, 128, (f - 1) // 8 + 1, h // SCALE_S, w // SCALE_S))

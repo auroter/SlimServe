@@ -46,7 +46,7 @@ class DiTConfig:
     norm_eps: float = 1e-6
 
     @classmethod
-    def from_checkpoint(cls, t: dict[str, Any]) -> "DiTConfig":
+    def from_checkpoint(cls, t: dict[str, Any]) -> DiTConfig:
         unsupported = {
             "rope_type": "split",
             "qk_norm": "rms_norm",
@@ -59,7 +59,10 @@ class DiTConfig:
         }
         for key, want in unsupported.items():
             if t.get(key) != want:
-                raise ValueError(f"LTX-2.5 DiT config {key}={t.get(key)!r}, engine implements {want!r}")
+                raise ValueError(
+                    f"LTX-2.5 DiT config {key}={t.get(key)!r}, "
+                    f"engine implements {want!r}"
+                )
         return cls(
             num_layers=t["num_layers"],
             video_dim=t["cross_attention_dim"],
@@ -84,7 +87,11 @@ def timestep_embedding(t: mx.array, dim: int) -> mx.array:
 
 
 def rope_tables(
-    positions: mx.array, inner_dim: int, heads: int, max_pos: tuple[int, ...], theta: float
+    positions: mx.array,
+    inner_dim: int,
+    heads: int,
+    max_pos: tuple[int, ...],
+    theta: float,
 ) -> tuple[mx.array, mx.array]:
     """Split-RoPE cos/sin, shape (B, heads, N, head_dim / 2), fp32.
 
@@ -145,7 +152,9 @@ class Modulation:
 
     __slots__ = ("rows", "inverse", "batch", "tokens")
 
-    def __init__(self, rows: mx.array, inverse: mx.array | None, batch: int, tokens: int):
+    def __init__(
+        self, rows: mx.array, inverse: mx.array | None, batch: int, tokens: int
+    ):
         self.rows, self.inverse, self.batch, self.tokens = rows, inverse, batch, tokens
 
     def get(self, i: int, table_row: mx.array | None = None) -> mx.array:
@@ -160,7 +169,9 @@ class Modulation:
 class LTX25DiT:
     """Functional forward over the official weight dict."""
 
-    def __init__(self, weights: dict[str, mx.array], config: DiTConfig, eval_every: int = 8):
+    def __init__(
+        self, weights: dict[str, mx.array], config: DiTConfig, eval_every: int = 8
+    ):
         self.w = weights
         self.cfg = config
         self.eval_every = eval_every
@@ -169,9 +180,16 @@ class LTX25DiT:
         # every GEMM in the fast regime: 79 -> 45 ms at 6,144 rows, 526 -> 172
         # ms at 24,576. The chunks replace the original, so memory is unchanged.
         self.split_k: dict[str, list[mx.array]] = {}
-        for name in [n for n, a in weights.items() if n.endswith(".weight") and a.ndim == 2 and a.shape[1] >= SPLIT_K_MIN]:
+        for name in [
+            n
+            for n, a in weights.items()
+            if n.endswith(".weight") and a.ndim == 2 and a.shape[1] >= SPLIT_K_MIN
+        ]:
             a = weights.pop(name)
-            parts = [mx.contiguous(a[:, i : i + SPLIT_K_CHUNK]) for i in range(0, a.shape[1], SPLIT_K_CHUNK)]
+            parts = [
+                mx.contiguous(a[:, i : i + SPLIT_K_CHUNK])
+                for i in range(0, a.shape[1], SPLIT_K_CHUNK)
+            ]
             mx.eval(parts)
             self.split_k[name[: -len(".weight")]] = parts
         # name -> [(A, B, scale)]: runtime low-rank terms, y += scale * (x A^T) B^T.
@@ -196,28 +214,39 @@ class LTX25DiT:
             y = y + ((x @ a_mat.T) @ b_mat.T) * scale
         return y
 
-    def _adaln(self, name: str, t_emb: mx.array, num_params: int, dim: int) -> tuple[mx.array, mx.array]:
+    def _adaln(
+        self, name: str, t_emb: mx.array, num_params: int, dim: int
+    ) -> tuple[mx.array, mx.array]:
         e = self.lin(f"{name}.emb.timestep_embedder.linear_1", t_emb.astype(F))
         e = self.lin(f"{name}.emb.timestep_embedder.linear_2", e * mx.sigmoid(e))
         p = self.lin(f"{name}.linear", e * mx.sigmoid(e))
         return p.astype(G).reshape(-1, num_params, dim), e.astype(G)
 
     def _modulation(
-        self, names: list[tuple[str, int, int]], t: mx.array, per_token: mx.array | None, scale: float
+        self,
+        names: list[tuple[str, int, int]],
+        t: mx.array,
+        per_token: mx.array | None,
+        scale: float,
     ) -> list[tuple[Modulation, Modulation]]:
-        """Run AdaLN heads on one timestep source. Returns (params, embedded) per head."""
+        """Run AdaLN heads on one timestep source. Returns (params, embedded) per
+        head."""
         if per_token is None:
             emb = timestep_embedding(t * scale, self.cfg.timestep_dim)
             inverse, b, n = None, int(t.shape[0]), 1
         else:
             b, n = per_token.shape
-            uniq, inv = np.unique(np.array(per_token.astype(G)).reshape(-1), return_inverse=True)
+            uniq, inv = np.unique(
+                np.array(per_token.astype(G)).reshape(-1), return_inverse=True
+            )
             emb = timestep_embedding(mx.array(uniq) * scale, self.cfg.timestep_dim)
             inverse = mx.array(inv.astype(np.int32))
         out = []
         for name, num_params, dim in names:
             p, e = self._adaln(name, emb, num_params, dim)
-            out.append((Modulation(p, inverse, b, n), Modulation(e[:, None, :], inverse, b, n)))
+            out.append(
+                (Modulation(p, inverse, b, n), Modulation(e[:, None, :], inverse, b, n))
+            )
         return out
 
     def _attn(
@@ -235,8 +264,12 @@ class LTX25DiT:
         heads = w[p + ".to_gate_logits.weight"].shape[0]
         b = x.shape[0]
         kv = x if ctx is None else ctx
-        q = mx.fast.rms_norm(self.lin(p + ".to_q", x), w[p + ".q_norm.weight"], self.cfg.norm_eps)
-        k = mx.fast.rms_norm(self.lin(p + ".to_k", kv), w[p + ".k_norm.weight"], self.cfg.norm_eps)
+        q = mx.fast.rms_norm(
+            self.lin(p + ".to_q", x), w[p + ".q_norm.weight"], self.cfg.norm_eps
+        )
+        k = mx.fast.rms_norm(
+            self.lin(p + ".to_k", kv), w[p + ".k_norm.weight"], self.cfg.norm_eps
+        )
         v = self.lin(p + ".to_v", kv)
         hd = q.shape[-1] // heads
         q = q.reshape(b, -1, heads, hd).transpose(0, 2, 1, 3)
@@ -250,7 +283,9 @@ class LTX25DiT:
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=hd**-0.5, mask=mask)
         if skip is not None:  # STG: perturbed samples pass the values through
             out = out * skip + v * (1.0 - skip)
-        out = _head_gate(out, self.lin(p + ".to_gate_logits", x))  # logits (B, N, heads)
+        out = _head_gate(
+            out, self.lin(p + ".to_gate_logits", x)
+        )  # logits (B, N, heads)
         out = out.transpose(0, 2, 1, 3).reshape(b, -1, heads * hd)
         return self.lin(p + ".to_out.0", out)
 
@@ -262,7 +297,9 @@ class LTX25DiT:
         return mx.fast.rms_norm(x, None, self.cfg.norm_eps)
 
     # ---- block ------------------------------------------------------------
-    def _block(self, i: int, v: mx.array, a: mx.array, s: dict[str, Any]) -> tuple[mx.array, mx.array]:
+    def _block(
+        self, i: int, v: mx.array, a: mx.array, s: dict[str, Any]
+    ) -> tuple[mx.array, mx.array]:
         w = self.w
         p = f"transformer_blocks.{i}"
         vt, at = w[p + ".scale_shift_table"], w[p + ".audio_scale_shift_table"]
@@ -276,22 +313,34 @@ class LTX25DiT:
         # 1. video self-attention (table rows 0..2 = shift, scale, gate)
         x = _modulate(self._norm(v), vm.get(1, vt[1]), vm.get(0, vt[0]))
         sk = skip("video_self", 4)
-        y = self._attn(p + ".attn1", x, rope_q=s["video_rope"], mask=s["video_mask"],
-                       skip=None if sk is None else sk.astype(F))
+        y = self._attn(
+            p + ".attn1",
+            x,
+            rope_q=s["video_rope"],
+            mask=s["video_mask"],
+            skip=None if sk is None else sk.astype(F),
+        )
         v = _gated_residual(v, y, vm.get(2, vt[2]))
 
         # 2. audio self-attention
         x = _modulate(self._norm(a), am.get(1, at[1]), am.get(0, at[0]))
         sk = skip("audio_self", 4)
-        y = self._attn(p + ".audio_attn1", x, rope_q=s["audio_rope"], mask=s["audio_mask"],
-                       skip=None if sk is None else sk.astype(F))
+        y = self._attn(
+            p + ".audio_attn1",
+            x,
+            rope_q=s["audio_rope"],
+            mask=s["audio_mask"],
+            skip=None if sk is None else sk.astype(F),
+        )
         a = _gated_residual(a, y, am.get(2, at[2]))
 
         # 3. video text cross-attention (rows 6..8; prompt table modulates the text)
         if s["video_text"] is not None:
             x = _modulate(self._norm(v), vm.get(7, vt[7]), vm.get(6, vt[6]))
             pt, pm = w[p + ".prompt_scale_shift_table"], s["video_prompt_mod"]
-            text = (s["video_text"] * (1.0 + pm.get(1, pt[1])) + pm.get(0, pt[0])).astype(F)
+            text = (
+                s["video_text"] * (1.0 + pm.get(1, pt[1])) + pm.get(0, pt[0])
+            ).astype(F)
             y = self._attn(p + ".attn2", x, ctx=text, mask=s["video_cross_mask"])
             v = _gated_residual(v, y, vm.get(8, vt[8]))
 
@@ -299,27 +348,42 @@ class LTX25DiT:
         if s["audio_text"] is not None:
             x = _modulate(self._norm(a), am.get(7, at[7]), am.get(6, at[6]))
             pt, pm = w[p + ".audio_prompt_scale_shift_table"], s["audio_prompt_mod"]
-            text = (s["audio_text"] * (1.0 + pm.get(1, pt[1])) + pm.get(0, pt[0])).astype(F)
+            text = (
+                s["audio_text"] * (1.0 + pm.get(1, pt[1])) + pm.get(0, pt[0])
+            ).astype(F)
             y = self._attn(p + ".audio_attn2", x, ctx=text)
             a = _gated_residual(a, y, am.get(8, at[8]))
 
         # 5-6. audio<->video cross attention; both directions read the same norms.
         # Table rows: 0 scale_a2v, 1 shift_a2v, 2 scale_v2a, 3 shift_v2a, 4 gate.
-        cvt, cat = w[p + ".scale_shift_table_a2v_ca_video"], w[p + ".scale_shift_table_a2v_ca_audio"]
+        cvt, cat = (
+            w[p + ".scale_shift_table_a2v_ca_video"],
+            w[p + ".scale_shift_table_a2v_ca_audio"],
+        )
         cvm, cam = s["av_video_mod"], s["av_audio_mod"]
         vn, an = self._norm(v), self._norm(a)
         vq = _modulate(vn, cvm.get(0, cvt[0]), cvm.get(1, cvt[1]))
         akv = _modulate(an, cam.get(0, cat[0]), cam.get(1, cat[1]))
-        y = self._attn(p + ".audio_to_video_attn", vq, ctx=akv,
-                       rope_q=s["video_cross_rope"], rope_k=s["audio_cross_rope"])
+        y = self._attn(
+            p + ".audio_to_video_attn",
+            vq,
+            ctx=akv,
+            rope_q=s["video_cross_rope"],
+            rope_k=s["audio_cross_rope"],
+        )
         y = y * s["a2v_gate_mod"].get(0, cvt[4])
         sk = skip("a2v", 3)
         v_new = v + (y if sk is None else y * sk)
 
         aq = _modulate(an, cam.get(2, cat[2]), cam.get(3, cat[3]))
         vkv = _modulate(vn, cvm.get(2, cvt[2]), cvm.get(3, cvt[3]))
-        y = self._attn(p + ".video_to_audio_attn", aq, ctx=vkv,
-                       rope_q=s["audio_cross_rope"], rope_k=s["video_cross_rope"])
+        y = self._attn(
+            p + ".video_to_audio_attn",
+            aq,
+            ctx=vkv,
+            rope_q=s["audio_cross_rope"],
+            rope_k=s["video_cross_rope"],
+        )
         y = y * s["v2a_gate_mod"].get(0, cat[4])
         sk = skip("v2a", 3)
         a = a + (y if sk is None else y * sk)
@@ -363,48 +427,83 @@ class LTX25DiT:
 
         v = self.lin("patchify_proj", video_latent.astype(F)).astype(G)
         if video_keyframes_mask is not None:
-            v = v + (video_keyframes_mask > 0).astype(G) * w["keyframes_abs_pos_embedding"].astype(G)
+            v = v + (video_keyframes_mask > 0).astype(G) * w[
+                "keyframes_abs_pos_embedding"
+            ].astype(G)
         a = self.lin("audio_patchify_proj", audio_latent.astype(F)).astype(G)
 
         ts = cfg.timestep_scale
         (video_mod, video_emb), (av_video_mod, _) = self._modulation(
             [("adaln_single", 9, vd), ("av_ca_video_scale_shift_adaln_single", 4, vd)],
-            timestep, video_timesteps, ts)
+            timestep,
+            video_timesteps,
+            ts,
+        )
         (audio_mod, audio_emb), (av_audio_mod, _) = self._modulation(
-            [("audio_adaln_single", 9, ad), ("av_ca_audio_scale_shift_adaln_single", 4, ad)],
-            timestep, audio_timesteps, ts)
+            [
+                ("audio_adaln_single", 9, ad),
+                ("av_ca_audio_scale_shift_adaln_single", 4, ad),
+            ],
+            timestep,
+            audio_timesteps,
+            ts,
+        )
         # Prompt AdaLN reads its own modality's sigma; each cross gate reads the
         # other modality's sigma at the av_ca scale. Always scalar per sample.
         vs = timestep if video_sigma is None else video_sigma.astype(G)
         as_ = timestep if audio_sigma is None else audio_sigma.astype(G)
-        ((video_prompt_mod, _),) = self._modulation([("prompt_adaln_single", 2, vd)], vs, None, ts)
-        ((audio_prompt_mod, _),) = self._modulation([("audio_prompt_adaln_single", 2, ad)], as_, None, ts)
+        ((video_prompt_mod, _),) = self._modulation(
+            [("prompt_adaln_single", 2, vd)], vs, None, ts
+        )
+        ((audio_prompt_mod, _),) = self._modulation(
+            [("audio_prompt_adaln_single", 2, ad)], as_, None, ts
+        )
         ((a2v_gate_mod, _),) = self._modulation(
-            [("av_ca_a2v_gate_adaln_single", 1, vd)], as_, None, cfg.av_ca_timestep_scale)
+            [("av_ca_a2v_gate_adaln_single", 1, vd)],
+            as_,
+            None,
+            cfg.av_ca_timestep_scale,
+        )
         ((v2a_gate_mod, _),) = self._modulation(
-            [("av_ca_v2a_gate_adaln_single", 1, ad)], vs, None, cfg.av_ca_timestep_scale)
+            [("av_ca_v2a_gate_adaln_single", 1, ad)], vs, None, cfg.av_ca_timestep_scale
+        )
 
         heads = cfg.heads
         cross_inner = w["transformer_blocks.0.audio_to_video_attn.to_q.weight"].shape[0]
         cross_max = (max(cfg.max_pos[0], cfg.audio_max_pos[0]),)
         rope = lambda pos, inner, h, mp: tuple(  # noqa: E731
-            t.astype(F) for t in rope_tables(pos, inner, h, mp, cfg.rope_theta))
+            t.astype(F) for t in rope_tables(pos, inner, h, mp, cfg.rope_theta)
+        )
         state = {
-            "video_mod": video_mod, "audio_mod": audio_mod,
-            "video_prompt_mod": video_prompt_mod, "audio_prompt_mod": audio_prompt_mod,
-            "av_video_mod": av_video_mod, "av_audio_mod": av_audio_mod,
-            "a2v_gate_mod": a2v_gate_mod, "v2a_gate_mod": v2a_gate_mod,
+            "video_mod": video_mod,
+            "audio_mod": audio_mod,
+            "video_prompt_mod": video_prompt_mod,
+            "audio_prompt_mod": audio_prompt_mod,
+            "av_video_mod": av_video_mod,
+            "av_audio_mod": av_audio_mod,
+            "a2v_gate_mod": a2v_gate_mod,
+            "v2a_gate_mod": v2a_gate_mod,
             "video_text": None if video_text is None else video_text.astype(G),
             "audio_text": None if audio_text is None else audio_text.astype(G),
             "video_rope": rope(video_positions, vd, heads, cfg.max_pos),
             "audio_rope": rope(audio_positions, ad, cfg.audio_heads, cfg.audio_max_pos),
-            "video_cross_rope": rope(video_positions[:, :, 0:1], cross_inner, heads, cross_max),
-            "audio_cross_rope": rope(audio_positions[:, :, 0:1], cross_inner, heads, cross_max),
-            "video_mask": video_attention_mask, "audio_mask": audio_attention_mask,
+            "video_cross_rope": rope(
+                video_positions[:, :, 0:1], cross_inner, heads, cross_max
+            ),
+            "audio_cross_rope": rope(
+                audio_positions[:, :, 0:1], cross_inner, heads, cross_max
+            ),
+            "video_mask": video_attention_mask,
+            "audio_mask": audio_attention_mask,
             "video_cross_mask": video_cross_attention_mask,
             "stg": stg,
         }
-        mx.eval(state["video_rope"], state["audio_rope"], state["video_cross_rope"], state["audio_cross_rope"])
+        mx.eval(
+            state["video_rope"],
+            state["audio_rope"],
+            state["video_cross_rope"],
+            state["audio_cross_rope"],
+        )
 
         for i in range(cfg.num_layers):
             v, a = self._block(i, v, a, state)
@@ -417,7 +516,9 @@ class LTX25DiT:
             self._out(a, audio_emb, w["audio_scale_shift_table"], "audio_proj_out"),
         )
 
-    def _out(self, x: mx.array, emb: Modulation, table: mx.array, proj: str) -> mx.array:
+    def _out(
+        self, x: mx.array, emb: Modulation, table: mx.array, proj: str
+    ) -> mx.array:
         e = emb.get(0)
         x = mx.fast.layer_norm(x, None, None, self.cfg.norm_eps)
         x = x * (1.0 + (table[1] + e)) + (table[0] + e)

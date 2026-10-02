@@ -401,3 +401,81 @@ HANDOFF.md: one model-loading process at a time through `gpu_run.py`
 (exclusive lock, headroom check, 16 GiB reserve, refuses a wired limit above
 110000), agents never touch the GPU, the engine sets an MLX memory limit of
 RAM - 24 GiB and plans VAE decode inside what is left.
+
+## 15. Kernel wave, dev, DFR, HD and serving (2026-10-02, after the restart)
+
+**What the kernels can still give on M1 Ultra.** Per-op profile of the
+engine forward at 6,144 tokens (`n3_forward_profile.py`,
+`forward_profile_6k.md`): GEMMs run at 16.5-18.3 TF/s, self-attention at
+15.1, glue is 10% sync-inflated. Clean forward 11.5 s against 10.1 s at the
+20.8 TF/s peak: 84-88% of the hardware. Decisions, each measured:
+
+| item | result | decision |
+| --- | --- | --- |
+| split-K FFN GEMM | 13.71 -> 11.92 s, error unchanged | kept |
+| compiled glue (modulate+cast, gated residual, GELU, head gate) | 11.92 -> 11.52 s, bit-identical | kept |
+| compiled RoPE; eval cadence 1/2/4/16/48 | 11.46-11.60 s, noise | not adopted |
+| query-chunked attention | MLX's SDPA is already flash-style: 1.1 GiB peak and 15.4 TF/s at 24,576 tokens, chunking only costs | not adopted |
+| row- or N-chunked GEMM at 24k rows | 18.4-19.2 TF/s either way; only K=2048 inputs at 24k rows gain (14.5 -> 18.0) | not adopted (audio-side, <1%) |
+| fp16 VAE decode (operands, or operands + stream) | 8.7 -> 5.5-6.2 s but 55.1 dB from fp32, max error 14/255: MLX's fp16 Winograd conv loses accuracy in the conv itself, an fp32 stream does not recover it | opt-in only (`VideoVAE(dtype=mx.float16)`), fp32 default |
+| custom flash attention / GEMM kernels | ceiling is 15.4 -> ~19 TF/s on 14% (6k) to 40% (24k) of the forward, and ~17.5 -> ~19 on GEMMs: at most ~10% of an HD forward. QuixiCore-Metal's own `gemm_v3` reached 94-99% of MPS without beating it and `attn_fwd` D128 measured 1.1x on small shapes | not started; ranked below the product milestones, see "Next" |
+| conv3d implicit GEMM | MLX's fp32 conv3d is a Winograd path at an effective 18-25 TF/s steady state, above what a direct fp32 GEMM conv can reach (6 TF/s) and equal to a direct fp16 one; M1 has no fp16-operand/fp32-accumulate MMA | not a speed lever on M1-M4; the VAE win was memory and stalls (slabs) |
+
+Honest reading: on M1-M4 the engine is at the MLX kernel ceiling and MLX's
+kernels are within 10-25% of the chip. The measured 1.3-1.5x over the q8
+baseline (2.2x over bf16) came from the precision path, split-K, glue
+fusion, batching and the VAE restructure, not from hand-written Metal. The
+remaining multipliers are the opt-in tier and M5's int8 MMA.
+
+**HD forward** (`n3_forward_hd.py`, 24,576 tokens, synthetic latents, real
+text): 69.7 s before glue fusion, 67.3 s in the end-to-end run, flat
+39.5 GiB. Baseline: 111.1 s untiled, 80.8 s with tiled attention.
+
+**Dev** (`pipeline.dev`): one guided step on identical inputs
+(`n5_guided_step.py`) vs the baseline: cond 0.0050, negative 0.0064, STG
+0.0050, modality 0.0050 video rel-L2; guided 0.0072 batched, 0.0074
+sequential (the baseline's STG pass differs from its cond by 0.51, so the
+skip path is exercised). Runtime distilled LoRA (`n5_lora_check.py`): dev +
+LoRA vs the distilled checkpoint 0.0093 (dev alone 0.29); runtime vs fused
+fp32 2.9e-4 per linear; 11.51 -> 14.06 s per forward; detach restores the
+base bit for bit. 768x512x121, 30 steps: 406 s cold (stage 1 330 s at
+11.0 s per 4-pass step, stage 2 42 s). The baseline's 606.9 s figure is
+its 30-step run; its saved mp4 was a 2-step run and is not a visual
+reference.
+
+**DFR** (`pipeline.dfr`, default configuration): canvas and slot layout
+identical to the baseline for 9..241 frames; 768x512x121: 125 s cold
+(stage 1 31.3 s at 2,016 tokens, stage 2 61.1 s at 9,600), same scene as
+the baseline's DFR clip (`dfr_side.png`); baseline 170.9 s.
+
+**VAE** after the per-slab rewrite: decode 768x512x121 8.0-8.7 s at
+10.1 GiB; 1536x1024x121 untiled 33.7 s at 27.3 GiB (baseline: 83.8 s tiled,
+53 GiB; untiled killed it); encode 49 frames 3.4 s at 8.1 GiB. Planner:
+5 GiB + 135 B per output pixel-frame.
+
+**HD end to end**, 1536x1024x121 distilled, fully untiled: 358 s cold,
+65.7 GiB peak (stage 1 92.4 s, stage 2 202.1 s, decode 40.4 s). Baseline
+504.9 s with tiled attention and decode.
+
+**Serving** (`n6_serve_check.py`, HTTP, weights resident, 768x512x49 clips):
+
+| pipeline | ready | concurrent requests | per clip | resident | peak | result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| distilled (MLX 0.31.2) | 17.2 s | 3 + 1 | 40.7 s | 68.6 GiB flat | 71.4 GiB | PASS |
+| dfr | 16.6 s | 2 + 1 | 51.9 s | 68.9 GiB flat | 74.1 GiB | PASS |
+| dev | 19.4 s | 2 + 1 | 194-203 s | 76.9 GiB flat | 82.1 GiB | PASS |
+
+Requests run strictly one at a time (queued count visible in /health), an
+oversize request is refused with a 400, every mp4 probes as H.264 + AAC with
+the right frame count. `slimserve ltx25-distilled -p ... --size 768x512
+--seconds 5`: 86.1 s through the real CLI.
+
+**Next, in order.** (1) I2V conditioning (encoder already ported). (2) DFR
+temporal rounds and spatial epilogue. (3) Opt-in tier with its own A/B:
+step caching, fp16 VAE, HD sparse attention. (4) A flash-attention kernel
+through `mx.fast.metal_kernel` as an experiment with a pre-registered bar
+(>= 18 TF/s at 24,576 tokens, D128, fp16, equal output at fp32 tolerance);
+drop it if the first tile-loop prototype is under 16. (5) QuixiCore-Metal
+PR: there is no new Metal kernel to upstream yet; the candidates are the
+split-K GEMM dispatch and the slab conv3d driver. (6) M5 int8 path on M5
+hardware.

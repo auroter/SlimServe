@@ -25,15 +25,23 @@ import mlx.core as mx
 
 # Relative to the model root (the layout of the Lightricks/LTX-2.5 repo).
 FILES = {
-    "dit-distilled": "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+    "dit-distilled": (
+        "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+    ),
     "dit-dev": "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
     "distilled-lora": "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
-    "detail-lora": "loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors",
+    "detail-lora": (
+        "loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors"
+    ),
     "text-encoder": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
     "video-vae": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
     "audio-vae": "vae/ltx-2.5-audio-vae-bf16.safetensors",
-    "spatial-upscaler": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
-    "temporal-upscaler": "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors",
+    "spatial-upscaler": (
+        "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+    ),
+    "temporal-upscaler": (
+        "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors"
+    ),
     "duration-head": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
 }
 
@@ -128,7 +136,9 @@ def load_dit(
     stripped = {}
     for name in list(raw):
         if not name.startswith(DIT_PREFIX):
-            raise ValueError(f"unexpected tensor outside the DiT in {path.name}: {name}")
+            raise ValueError(
+                f"unexpected tensor outside the DiT in {path.name}: {name}"
+            )
         stripped[name[len(DIT_PREFIX) :]] = raw.pop(name)
     weights = cast_operands(stripped)
     connectors = {

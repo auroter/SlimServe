@@ -45,7 +45,11 @@ def token_count(num_frames: int, fps: float = 24.0) -> int:
 def positions(num_tokens: int) -> mx.array:
     """(1, T, 1) fp32 token midpoints in seconds (causal mel timing)."""
     idx = np.arange(num_tokens + 1, dtype=np.float32)
-    t = np.maximum(idx * LATENT_DOWNSAMPLE + 1 - LATENT_DOWNSAMPLE, 0.0) * MEL_HOP / MEL_SAMPLE_RATE
+    t = (
+        np.maximum(idx * LATENT_DOWNSAMPLE + 1 - LATENT_DOWNSAMPLE, 0.0)
+        * MEL_HOP
+        / MEL_SAMPLE_RATE
+    )
     return mx.array(((t[:-1] + t[1:]) / 2.0).astype(np.float32))[None, :, None]
 
 
@@ -62,7 +66,9 @@ def unpatchify(tokens: mx.array) -> mx.array:
 
 
 # ---- weights --------------------------------------------------------------
-def load_weights(root: Path | None = None, encoder: bool = False) -> tuple[dict[str, mx.array], dict[str, Any]]:
+def load_weights(
+    root: Path | None = None, encoder: bool = False
+) -> tuple[dict[str, mx.array], dict[str, Any]]:
     """fp32 weights in MLX layouts, upstream names. Encoder only on request."""
     path = checkpoints.path_of("audio-vae", root)
     cfg = checkpoints.read_header(path).config()
@@ -78,10 +84,9 @@ def load_weights(root: Path | None = None, encoder: bool = False) -> tuple[dict[
         if a.ndim == 4:  # Conv2d (O, I, H, W) -> (O, H, W, I)
             a = a.transpose(0, 2, 3, 1)
         elif a.ndim == 3:
-            if ".ups." in name:  # ConvTranspose1d (I, O, K) -> (O, K, I)
-                a = a.transpose(1, 2, 0)
-            else:  # Conv1d / filters / STFT basis (O, I, K) -> (O, K, I)
-                a = a.transpose(0, 2, 1)
+            # ConvTranspose1d (I, O, K) -> (O, K, I)
+            # Conv1d / filters / STFT basis (O, I, K) -> (O, K, I)
+            a = a.transpose(1, 2, 0) if ".ups." in name else a.transpose(0, 2, 1)
         w[name] = a
     mx.eval(w)
     return w, cfg
@@ -123,8 +128,13 @@ def decode_mel(w: dict[str, mx.array], latent: mx.array) -> mx.array:
     v, p = _VAE(w), "audio_vae.decoder"
     b, c, t, f = latent.shape
     x = patchify(latent.astype(G))
-    x = x * w["audio_vae.per_channel_statistics.std-of-means"] + w["audio_vae.per_channel_statistics.mean-of-means"]
-    x = x.reshape(b, t, c, f).transpose(0, 1, 3, 2)  # (B, T, 16, 8): time, freq, channels
+    x = (
+        x * w["audio_vae.per_channel_statistics.std-of-means"]
+        + w["audio_vae.per_channel_statistics.mean-of-means"]
+    )
+    x = x.reshape(b, t, c, f).transpose(
+        0, 1, 3, 2
+    )  # (B, T, 16, 8): time, freq, channels
     x = v.mid(p, v.conv(p + ".conv_in", x))
     level = 0
     while f"{p}.up.{level + 1}.block.0.conv1.conv.weight" in w:
@@ -136,7 +146,9 @@ def decode_mel(w: dict[str, mx.array], latent: mx.array) -> mx.array:
             j += 1
         if f"{p}.up.{i}.upsample.conv.conv.weight" in w:
             x = mx.repeat(mx.repeat(x, 2, axis=1), 2, axis=2)
-            x = v.conv(f"{p}.up.{i}.upsample.conv", x)[:, 1:]  # causal: drop the first frame
+            x = v.conv(f"{p}.up.{i}.upsample.conv", x)[
+                :, 1:
+            ]  # causal: drop the first frame
     x = v.conv(p + ".conv_out", _silu(_pixel_norm(x)))
     return x.transpose(0, 3, 1, 2)
 
@@ -153,12 +165,17 @@ def encode_mel(w: dict[str, mx.array], mel: mx.array) -> mx.array:
             j += 1
         if f"{p}.down.{i}.downsample.conv.weight" in w:
             x = mx.pad(x, [(0, 0), (2, 0), (0, 1), (0, 0)])
-            x = mx.conv2d(x, w[f"{p}.down.{i}.downsample.conv.weight"], stride=2) + w[f"{p}.down.{i}.downsample.conv.bias"]
+            x = (
+                mx.conv2d(x, w[f"{p}.down.{i}.downsample.conv.weight"], stride=2)
+                + w[f"{p}.down.{i}.downsample.conv.bias"]
+            )
         i += 1
     x = v.conv(p + ".conv_out", _silu(_pixel_norm(v.mid(p, x))))
     b, t = x.shape[0], x.shape[1]
     x = x[..., :LATENT_CHANNELS].transpose(0, 1, 3, 2).reshape(b, t, -1)
-    x = (x - w["audio_vae.per_channel_statistics.mean-of-means"]) / (w["audio_vae.per_channel_statistics.std-of-means"] + 1e-8)
+    x = (x - w["audio_vae.per_channel_statistics.mean-of-means"]) / (
+        w["audio_vae.per_channel_statistics.std-of-means"] + 1e-8
+    )
     return unpatchify(x)
 
 
@@ -171,9 +188,12 @@ def _edge_pad(x: mx.array, left: int, right: int) -> mx.array:
     return mx.concatenate(parts, axis=1)
 
 
-def _sinc_upsample(x: mx.array, kernel: mx.array, ratio: int, pad: int, left: int, right: int) -> mx.array:
+def _sinc_upsample(
+    x: mx.array, kernel: mx.array, ratio: int, pad: int, left: int, right: int
+) -> mx.array:
     """Upstream UpSample1d on (N, T, 1): replicate-pad the samples, transposed
-    conv with the (symmetric) sinc kernel (1, K, 1), scale, crop -> (N, T * ratio, 1)."""
+    conv with the (symmetric) sinc kernel (1, K, 1), scale, crop
+    -> (N, T * ratio, 1)."""
     y = mx.conv_transpose1d(_edge_pad(x, pad, pad), kernel, stride=ratio) * float(ratio)
     return y[:, left : y.shape[1] - right]
 
@@ -194,7 +214,9 @@ class _Generator:
         k = up.shape[1]
         pad = k // 2 - 1
         h = x.transpose(0, 2, 1).reshape(b * c, t, 1)
-        h = _sinc_upsample(h, up, 2, pad, pad * 2 + (k - 2) // 2, pad * 2 + (k - 1) // 2)
+        h = _sinc_upsample(
+            h, up, 2, pad, pad * 2 + (k - 2) // 2, pad * 2 + (k - 1) // 2
+        )
         h = h.reshape(b, c, 2 * t).transpose(0, 2, 1)
         alpha, beta = mx.exp(w[p + ".act.alpha"]), mx.exp(w[p + ".act.beta"])
         h = h + (1.0 / (beta + 1e-9)) * mx.square(mx.sin(alpha * h))
@@ -214,15 +236,21 @@ class _Generator:
         w, p = self.w, self.p
         x = self.conv(p + ".conv_pre", mel)
         for i, (rate, kernel) in enumerate(zip(self.rates, self.kernels)):
-            x = mx.conv_transpose1d(x, w[f"{p}.ups.{i}.weight"], stride=rate, padding=(kernel - rate) // 2)
+            x = mx.conv_transpose1d(
+                x, w[f"{p}.ups.{i}.weight"], stride=rate, padding=(kernel - rate) // 2
+            )
             x = x + w[f"{p}.ups.{i}.bias"]
             acc = None
             for j, dils in enumerate(self.dilations):
                 rp = f"{p}.resblocks.{i * len(self.res_kernels) + j}"
                 h = x
                 for n, d in enumerate(dils):
-                    y = self.conv(f"{rp}.convs1.{n}", self.act(f"{rp}.acts1.{n}", h), dilation=d)
-                    h = h + self.conv(f"{rp}.convs2.{n}", self.act(f"{rp}.acts2.{n}", y))
+                    y = self.conv(
+                        f"{rp}.convs1.{n}", self.act(f"{rp}.acts1.{n}", h), dilation=d
+                    )
+                    h = h + self.conv(
+                        f"{rp}.convs2.{n}", self.act(f"{rp}.acts2.{n}", y)
+                    )
                 acc = h if acc is None else acc + h
             x = acc / len(self.res_kernels)
             mx.eval(x)
@@ -230,14 +258,19 @@ class _Generator:
 
 
 def _resample(x: mx.array, ratio: int) -> mx.array:
-    """Hann-windowed sinc upsample (upstream UpSample1d, window_type="hann"), (N, T) -> (N, T * ratio)."""
+    """Hann-windowed sinc upsample (upstream UpSample1d, window_type="hann"),
+    (N, T) -> (N, T * ratio)."""
     rolloff, lpfw = 0.99, 6
     width = math.ceil(lpfw / rolloff)
     k = 2 * width * ratio + 1
     t = (np.arange(k, dtype=np.float64) / ratio - width) * rolloff
     window = np.cos(np.clip(t, -lpfw, lpfw) * np.pi / lpfw / 2) ** 2
-    kernel = mx.array((np.sinc(t) * window * rolloff / ratio).astype(np.float32))[None, :, None]
-    return _sinc_upsample(x[:, :, None], kernel, ratio, width, 2 * width * ratio, k - ratio)[..., 0]
+    kernel = mx.array((np.sinc(t) * window * rolloff / ratio).astype(np.float32))[
+        None, :, None
+    ]
+    return _sinc_upsample(
+        x[:, :, None], kernel, ratio, width, 2 * width * ratio, k - ratio
+    )[..., 0]
 
 
 class Vocoder:
@@ -256,20 +289,29 @@ class Vocoder:
         return mel.transpose(0, 1, 3, 2).reshape(b, c * m, t).transpose(0, 2, 1)
 
     def _log_mel(self, wav: mx.array) -> mx.array:
-        """Causal STFT (left pad n_fft - hop) with the checkpoint's bases. (N, T) -> (N, T', 64)."""
+        """Causal STFT (left pad n_fft - hop) with the checkpoint's bases.
+        (N, T) -> (N, T', 64)."""
         n_fft, hop = self.bwe_cfg["n_fft"], self.bwe_cfg["hop_length"]
         x = mx.pad(wav[:, :, None], [(0, 0), (n_fft - hop, 0), (0, 0)])
-        spec = mx.conv1d(x, self.w["vocoder.mel_stft.stft_fn.forward_basis"], stride=hop)
+        spec = mx.conv1d(
+            x, self.w["vocoder.mel_stft.stft_fn.forward_basis"], stride=hop
+        )
         bins = n_fft // 2 + 1
         power = mx.square(spec[..., :bins]) + mx.square(spec[..., bins:])
-        return mx.log(mx.maximum(mx.sqrt(power) @ self.w["vocoder.mel_stft.mel_basis"].T, 1e-5))
+        return mx.log(
+            mx.maximum(mx.sqrt(power) @ self.w["vocoder.mel_stft.mel_basis"].T, 1e-5)
+        )
 
     def __call__(self, mel: mx.array) -> mx.array:
         mel = mel.astype(G)
         b, c = mel.shape[:2]
         x = self.base(self._fold(mel))
         # use_tanh_at_final is false in the 2.5 checkpoint: the 16 kHz stage clamps.
-        x = mx.tanh(x) if self.base_cfg.get("use_tanh_at_final", True) else mx.clip(x, -1.0, 1.0)
+        x = (
+            mx.tanh(x)
+            if self.base_cfg.get("use_tanh_at_final", True)
+            else mx.clip(x, -1.0, 1.0)
+        )
         x = x.transpose(0, 2, 1)  # (B, 2, T16)
         length = x.shape[-1]
         ratio = self.sample_rate // self.bwe_cfg["input_sampling_rate"]
@@ -283,19 +325,37 @@ class Vocoder:
         residual = self.bwe(self._fold(bwe_mel)).transpose(0, 2, 1)
         skip = _resample(flat, ratio).reshape(b, c, -1)
         n = min(skip.shape[-1], residual.shape[-1])
-        return mx.clip(skip[..., :n] + residual[..., :n], -1.0, 1.0)[..., : length * ratio]
+        return mx.clip(skip[..., :n] + residual[..., :n], -1.0, 1.0)[
+            ..., : length * ratio
+        ]
 
 
 # ---- encoder-side mel (audio-conditioned pipelines) -----------------------
-def _slaney_filterbank(sr: int, n_fft: int, n_mels: int, f_min: float, f_max: float) -> np.ndarray:
-    to_mel = lambda f: np.where(f < 1000.0, 3.0 * f / 200.0, 15.0 + 27.0 * np.log(np.maximum(f, 1e-10) / 1000.0) / np.log(6.4))  # noqa: E731
-    to_hz = lambda m: np.where(m < 15.0, 200.0 * m / 3.0, 1000.0 * np.exp((m - 15.0) * np.log(6.4) / 27.0))  # noqa: E731
-    hz = to_hz(np.linspace(float(to_mel(np.float64(f_min))), float(to_mel(np.float64(f_max))), n_mels + 2))
+def _slaney_filterbank(
+    sr: int, n_fft: int, n_mels: int, f_min: float, f_max: float
+) -> np.ndarray:
+    to_mel = lambda f: np.where(
+        f < 1000.0,
+        3.0 * f / 200.0,
+        15.0 + 27.0 * np.log(np.maximum(f, 1e-10) / 1000.0) / np.log(6.4),
+    )  # noqa: E731
+    to_hz = lambda m: np.where(
+        m < 15.0, 200.0 * m / 3.0, 1000.0 * np.exp((m - 15.0) * np.log(6.4) / 27.0)
+    )  # noqa: E731
+    hz = to_hz(
+        np.linspace(
+            float(to_mel(np.float64(f_min))),
+            float(to_mel(np.float64(f_max))),
+            n_mels + 2,
+        )
+    )
     freqs = np.linspace(0, sr / 2.0, n_fft // 2 + 1)
     fb = np.zeros((n_mels, freqs.shape[0]))
     for i in range(n_mels):
         lo, mid, hi = hz[i : i + 3]
-        fb[i] = np.maximum(0, (freqs - lo) / (mid - lo)) * (freqs <= mid) + np.maximum(0, (hi - freqs) / (hi - mid)) * (freqs > mid)
+        fb[i] = np.maximum(0, (freqs - lo) / (mid - lo)) * (freqs <= mid) + np.maximum(
+            0, (hi - freqs) / (hi - mid)
+        ) * (freqs > mid)
         fb[i] *= 2.0 / (hi - lo)
     return fb.astype(np.float32)
 
@@ -305,14 +365,28 @@ def waveform_to_mel(waveform: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
     (Slaney mel, centered reflect-padded STFT, magnitude). Resampling to 16 kHz
     is the caller's job (ffmpeg). Ported from the runner; not parity-gated yet."""
     pre = cfg["audio_vae"]["preprocessing"]
-    sr, n_fft, hop = pre["audio"]["sampling_rate"], pre["stft"]["filter_length"], pre["stft"]["hop_length"]
-    fb = _slaney_filterbank(sr, n_fft, pre["mel"]["n_mel_channels"], pre["mel"]["mel_fmin"], pre["mel"]["mel_fmax"])
+    sr, n_fft, hop = (
+        pre["audio"]["sampling_rate"],
+        pre["stft"]["filter_length"],
+        pre["stft"]["hop_length"],
+    )
+    fb = _slaney_filterbank(
+        sr,
+        n_fft,
+        pre["mel"]["n_mel_channels"],
+        pre["mel"]["mel_fmin"],
+        pre["mel"]["mel_fmax"],
+    )
     window = np.hanning(n_fft + 1)[:-1].astype(np.float32)
     out = []
     for ch in np.asarray(waveform, dtype=np.float32):
         padded = np.pad(ch, n_fft // 2, mode="reflect")
         frames = np.lib.stride_tricks.sliding_window_view(padded, n_fft)[::hop] * window
-        out.append(np.log(np.maximum(np.abs(np.fft.rfft(frames)).astype(np.float32) @ fb.T, 1e-5)))
+        out.append(
+            np.log(
+                np.maximum(np.abs(np.fft.rfft(frames)).astype(np.float32) @ fb.T, 1e-5)
+            )
+        )
     return np.stack(out)[None]
 
 
@@ -329,7 +403,7 @@ class AudioDecoder:
         self.cfg: dict[str, Any] = {}
         self.vocoder: Vocoder | None = None
 
-    def load(self) -> "AudioDecoder":
+    def load(self) -> AudioDecoder:
         if self.w is None:
             self.w, self.cfg = load_weights(self.root, encoder=self.with_encoder)
             self.vocoder = Vocoder(self.w, self.cfg["vocoder"])
@@ -358,4 +432,6 @@ class AudioDecoder:
         if not self.with_encoder:
             raise RuntimeError("AudioDecoder(encoder=True) is required to encode")
         self.load()
-        return patchify(encode_mel(self.w, mx.array(waveform_to_mel(waveform_16k, self.cfg))))
+        return patchify(
+            encode_mel(self.w, mx.array(waveform_to_mel(waveform_16k, self.cfg)))
+        )

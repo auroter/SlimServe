@@ -8,6 +8,7 @@ is a few milliseconds off the video length and truncating would drop frames).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -57,8 +58,24 @@ def write_mp4(
         raise ValueError("size=(H, W) is required when frames is an iterable")
     height, width = size
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    cmd = [_ffmpeg(), "-y", "-loglevel", "error", "-f", "rawvideo", "-vcodec", "rawvideo",
-           "-s", f"{width}x{height}", "-pix_fmt", "rgb24", "-r", str(fps), "-i", "-"]
+    cmd = [
+        _ffmpeg(),
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{width}x{height}",
+        "-pix_fmt",
+        "rgb24",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+    ]
     wav_path = None
     if waveform is not None:
         fd, wav_path = tempfile.mkstemp(suffix=".wav")
@@ -73,19 +90,23 @@ def write_mp4(
                 for chunk in frames:
                     chunk = np.ascontiguousarray(chunk, dtype=np.uint8)
                     if chunk.shape[-3:] != (height, width, 3):
-                        raise ValueError(f"frame shape {chunk.shape}, expected (..., {height}, {width}, 3)")
+                        raise ValueError(
+                            f"frame shape {chunk.shape}, "
+                            f"expected (..., {height}, {width}, 3)"
+                        )
                     proc.stdin.write(memoryview(chunk).cast("B"))
             except BrokenPipeError:
                 pass  # ffmpeg died; its stderr below says why
             finally:
-                try:
+                with contextlib.suppress(BrokenPipeError):
                     proc.stdin.close()
-                except BrokenPipeError:
-                    pass
                 proc.wait()
             if proc.returncode != 0:
                 err.seek(0)
-                raise RuntimeError(f"ffmpeg exited {proc.returncode}: {err.read().decode(errors='replace')[-2000:]}")
+                raise RuntimeError(
+                    f"ffmpeg exited {proc.returncode}: "
+                    f"{err.read().decode(errors='replace')[-2000:]}"
+                )
     finally:
         if wav_path:
             Path(wav_path).unlink(missing_ok=True)

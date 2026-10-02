@@ -30,6 +30,14 @@ def _big_enough(profile_id: str, platform: str) -> int:
     return source["quants"][default_quant]["min_memory_bytes"][platform]
 
 
+def _language_model_records():
+    """Chat-serving policy (prefix caching, tool calling, thinking, graph
+    modes) is defined for language-model profiles; video profiles are covered
+    by tests/slimserve/test_video_profiles.py."""
+    profiles = registry._registry()["profiles"]
+    return [(pid, profiles[pid]) for pid in registry.language_model_profile_ids()]
+
+
 def test_every_profile_resolves_on_a_platform_it_claims():
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
@@ -477,6 +485,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-flash-next-nvfp4",
         "glm53f-nvfp4",
         "glm53f-gguf",
+        "ltx25",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -754,7 +763,7 @@ def test_engine_kwargs_drop_server_only_settings():
 
 
 def _all_plans():
-    for profile_id in registry.profile_ids():
+    for profile_id in registry.language_model_profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             yield resolve(profile_id, platform, 8, None, memory_bytes=512 * 1024**3)
 
@@ -817,7 +826,7 @@ def test_profiles_use_their_validated_graph_mode():
     """Graph mode is per-platform evidence: DSpark/TurboQuant DSV4 runs eager
     on MI300X/Metal, while the A100 profiles qualified PIECEWISE capture
     (128K lifecycle, perf/optimization_status.md)."""
-    for profile_id in registry.profile_ids():
+    for profile_id in registry.language_model_profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             engine = resolve(
                 profile_id,
@@ -1162,7 +1171,7 @@ def test_every_profile_states_prefix_caching_explicitly():
     returns True for hybrid generative models -- so an off record is a
     stale default, never a capability limit.
     """
-    for profile_id, entry in registry._registry()["profiles"].items():
+    for profile_id, entry in _language_model_records():
         for platform, record in entry.get("variants", {}).items():
             engine = record.get("engine", {})
             assert "enable_prefix_caching" in engine, (
@@ -1191,7 +1200,7 @@ def test_every_profile_serves_with_tool_calling_and_thinking():
     kwargs = _SERVING_DEFAULTS.get("default_chat_template_kwargs", {})
     assert kwargs.get("thinking") is True and kwargs.get("enable_thinking") is True
 
-    for profile_id, entry in registry._registry()["profiles"].items():
+    for profile_id, entry in _language_model_records():
         for platform, record in entry.get("variants", {}).items():
             engine = record.get("engine", {})
             assert engine.get("tool_call_parser"), (

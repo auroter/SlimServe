@@ -71,6 +71,18 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable speculative decoding for performance diagnosis",
     )
+    video = parser.add_argument_group("video profiles (with --prompt)")
+    video.add_argument(
+        "--output", help="where to write the clip (default <pipeline>-<seed>.mp4)"
+    )
+    video.add_argument(
+        "--size", help="WIDTHxHEIGHT, multiples of 64 (default: the profile's)"
+    )
+    video.add_argument(
+        "--seconds", type=float, help="clip length (default: the profile's)"
+    )
+    video.add_argument("--seed", type=int, help="random seed (default 42)")
+    video.add_argument("--negative-prompt", help="dev pipeline only")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -287,8 +299,8 @@ def _show(plan: Plan) -> None:
     print(f"  model     {plan.entry_file}")
     for key, value in sorted(plan.engine.items()):
         print(f"  {key:<9} {value}")
-    if plan.speculative:
-        spec = plan.source["speculator"]
+    if plan.speculative and plan.speculator:
+        spec = plan.speculator
         method = spec["engine"].get("method", "dspark")
         print(f"  spec      {method} k={spec['engine']['num_speculative_tokens']}")
     for key, value in sorted(plan.env.items()):
@@ -475,6 +487,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.download_only:
         term.ok(f"ready: {plan.entry_file}")
         return 0
+
+    if not registry.is_language_model(plan.source):
+        from slimserve.video import cli as video_cli
+
+        return video_cli.run(plan, args)
 
     if args.chat or args.prompt:
         return _chat(plan, args.prompt, args.engine_log)

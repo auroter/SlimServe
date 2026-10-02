@@ -158,7 +158,7 @@ class Plan:
     # source-level speculator.
     variant_speculator: dict[str, Any] | None = None
     # Operator-supplied checkpoint served in place of the registered one.
-    model_override: "ModelOverride | None" = None
+    model_override: ModelOverride | None = None
 
     @property
     def speculator(self) -> dict[str, Any] | None:
@@ -447,6 +447,24 @@ _SERVING_DEFAULTS: dict[str, Any] = {
 }
 
 
+def is_language_model(source: dict[str, Any]) -> bool:
+    """False for sources served by a non-LLM engine (`"kind": "video"`).
+
+    The LLM serving policy (prefix caching, tool calling, thinking, drafters,
+    KV tiers) is defined for chat endpoints and does not apply to them.
+    """
+    return source.get("kind", "llm") == "llm"
+
+
+def language_model_profile_ids() -> list[str]:
+    data = _registry()
+    return [
+        pid
+        for pid, entry in data["profiles"].items()
+        if is_language_model(data["sources"][entry["source"]])
+    ]
+
+
 def validate_cache_policy(config: dict[str, Any]) -> None:
     """Reject prohibited target/draft cache settings, including overrides."""
     for key, value in config.items():
@@ -566,10 +584,13 @@ def resolve(
         for key, value in (quant_override.get("env") or {}).items():
             merged["env"][key] = value
 
-    # Thinking and tool calling are on by default for every profile on every
-    # platform. A profile sets these keys itself only to opt out.
-    for key, value in _SERVING_DEFAULTS.items():
-        merged["engine"].setdefault(key, copy.deepcopy(value))
+    # Thinking and tool calling are on by default for every language-model
+    # profile on every platform. A profile sets these keys itself only to opt
+    # out. Video profiles have no chat surface; their engine block is the
+    # pipeline configuration and nothing is added to it.
+    if is_language_model(source):
+        for key, value in _SERVING_DEFAULTS.items():
+            merged["engine"].setdefault(key, copy.deepcopy(value))
 
     if template_asset := source.get("chat_template_asset"):
         merged["engine"].setdefault(
@@ -634,7 +655,9 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
         wanted.append(
             {
                 **entry,
-                "url": f"{base}/{entry['path']}",
+                # A file may live in another repository (an adapter published
+                # on its own): it then names its own URL.
+                "url": entry.get("url") or f"{base}/{entry['path']}",
                 "local_dir": plan.source["local_dir"],
                 "role": "model",
                 **(

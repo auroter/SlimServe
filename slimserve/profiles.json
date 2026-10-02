@@ -1797,6 +1797,144 @@
           }
         }
       }
+    },
+    "ltx25": {
+      "title": "LTX-2.5",
+      "kind": "video",
+      "modalities": [
+        "text"
+      ],
+      "output": [
+        "video",
+        "audio"
+      ],
+      "format": "safetensors",
+      "repo": "Lightricks/LTX-2.5",
+      "revision": "5e6e71018ee1756ed329b697a7b4aedc934dfce9",
+      "base_url": "https://huggingface.co/Lightricks/LTX-2.5/resolve/5e6e71018ee1756ed329b697a7b4aedc934dfce9",
+      "local_dir": "ltx-2.5/official",
+      "shared_note": "Official Lightricks bf16 safetensors, loaded directly by slimserve/video/ltx25 (no converted pack). Gated: the Hugging Face token must have accepted Lightricks/LTX-2.5, and Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler for the DFR quant. Nothing is quantized on M1-M4: bf16 converts to fp16 exactly and fp16 is the only matrix-multiply-accumulate those GPUs have.",
+      "quants": {
+        "bf16-distilled": {
+          "title": "bf16, distilled transformer",
+          "bytes": 71094963980,
+          "summary": "Distilled 22B transformer, Gemma-4 12B text encoder, conv video VAE, audio VAE + vocoder, spatial latent upscaler.",
+          "min_gpus": {},
+          "files": [
+            {
+              "path": "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+              "bytes": 42018190584,
+              "sha256_recorded": "31eb3cad89b9e54e99dd3baf286f70825ac4f6c660a70d9184d895be76d7bff4"
+            },
+            {
+              "path": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+              "bytes": 26263858182,
+              "sha256_recorded": "ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1"
+            },
+            {
+              "path": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+              "bytes": 1452269922,
+              "sha256": "685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d"
+            },
+            {
+              "path": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+              "bytes": 364866540,
+              "sha256": "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5"
+            },
+            {
+              "path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+              "bytes": 995778752,
+              "sha256": "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"
+            }
+          ],
+          "min_memory_bytes": {
+            "metal": 137438953472
+          }
+        },
+        "bf16-dev": {
+          "title": "bf16, dev transformer + distilled LoRA",
+          "bytes": 79994853548,
+          "summary": "Dev 22B transformer for guided stage 1, the rank-450 distilled LoRA applied at runtime in stage 2, and the shared text encoder, VAEs and upscaler.",
+          "min_gpus": {},
+          "files": [
+            {
+              "path": "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
+              "bytes": 42018190584,
+              "sha256_recorded": "792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584"
+            },
+            {
+              "path": "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
+              "bytes": 8899889568,
+              "sha256_recorded": "86370bbf79a9eb4edaa158907e2b48a5188fe4c5dc8ce30c7eb8f2f131a9bbf5"
+            },
+            {
+              "path": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+              "bytes": 26263858182,
+              "sha256_recorded": "ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1"
+            },
+            {
+              "path": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+              "bytes": 1452269922,
+              "sha256": "685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d"
+            },
+            {
+              "path": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+              "bytes": 364866540,
+              "sha256": "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5"
+            },
+            {
+              "path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+              "bytes": 995778752,
+              "sha256": "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"
+            }
+          ],
+          "min_memory_bytes": {
+            "metal": 137438953472
+          }
+        },
+        "bf16-dfr": {
+          "title": "bf16, distilled transformer + detailing IC-LoRA",
+          "bytes": 71422286620,
+          "summary": "The distilled set plus Lightricks' pixel-spatial-upscaler IC-LoRA (its own gated repository), applied at runtime at strength 0.5 in stage 2.",
+          "min_gpus": {},
+          "files": [
+            {
+              "path": "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+              "bytes": 42018190584,
+              "sha256_recorded": "31eb3cad89b9e54e99dd3baf286f70825ac4f6c660a70d9184d895be76d7bff4"
+            },
+            {
+              "path": "loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors",
+              "bytes": 327322640,
+              "sha256": "984851b769ea2bcb4c9e0a239a7676239e42c6a6001ddc69943b41ff0b283c1d",
+              "url": "https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler/resolve/main/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors"
+            },
+            {
+              "path": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+              "bytes": 26263858182,
+              "sha256_recorded": "ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1"
+            },
+            {
+              "path": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+              "bytes": 1452269922,
+              "sha256": "685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d"
+            },
+            {
+              "path": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+              "bytes": 364866540,
+              "sha256": "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5"
+            },
+            {
+              "path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+              "bytes": 995778752,
+              "sha256": "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"
+            }
+          ],
+          "min_memory_bytes": {
+            "metal": 137438953472
+          }
+        }
+      }
     }
   },
   "platforms": {
@@ -3611,6 +3749,90 @@
             "Resident loading is the first qualification target. Expert offload is only needed if the complete runtime at native context exceeds the 128 GiB memory budget.",
             "No speculative decoder is enabled during the initial target-model qualification.",
             "Main KV is fp8 (e4m3) through kv_cache_dtype, per the standing directive that FP8 is the official KV cache quantization. NOT yet validated on box: it is part of the pending Metal qualification, together with resident loading and the vision encoder."
+          ]
+        }
+      }
+    },
+    "ltx25-distilled": {
+      "title": "LTX-2.5 distilled on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Audio+video generation with Lightricks' DistilledPipeline: 8 ancestral steps at half resolution, 2x latent upscale, 3 refinement steps. The fast path: 1536x1024x121 in 358 s and 768x512x121 in 90 s cold on an M1 Ultra (the fastest prior Mac path: 505 s tiled and 117 s).",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-distilled",
+          "engine": {
+            "pipeline": "distilled",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 36 GiB active plus a 12 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "Precision: fp32 residual stream, norms, AdaLN and model boundary; fp16 GEMM and attention operands. Per-forward rel-L2 0.0069 against fp32 (the q8 baseline as shipped: 0.042). Measured in perf/ltx25_metal_campaign.md sections 9 and 13.",
+            "Resident while serving about 69 GiB; the text encoder (28 GiB) is released before an HD decode when that is what lets it run untiled, and reloads in 5 s."
+          ]
+        }
+      }
+    },
+    "ltx25-dev": {
+      "title": "LTX-2.5 dev (two-stage, guided) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Audio+video generation with Lightricks' TI2VidTwoStagesPipeline: 30 guided steps (CFG 3.0 video / 7.0 audio, STG 1.0 on block 28, modality 3.0, rescale 0.7) at half resolution, 2x latent upscale, 3 steps with the distilled LoRA. The quality path: 768x512x121 in 406 s cold on an M1 Ultra (the fastest prior Mac path: 607 s).",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "dev",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 36 GiB active plus a 12 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "The four guidance passes of a step run as one batch of four. One guided step matches the reference pass by pass on identical inputs (rel-L2 <= 0.0064, the reference's own bf16 error).",
+            "The distilled LoRA (rank 450) is a runtime low-rank term in stage 2: +22% per forward on 3 forwards, 8.3 GiB instead of a second 39 GiB transformer, exact detach. negative_prompt is accepted; the default is Lightricks' DEFAULT_NEGATIVE_PROMPT."
+          ]
+        }
+      }
+    },
+    "ltx25-dfr": {
+      "title": "LTX-2.5 DFR on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Audio+video generation with Lightricks' DFRPipeline in its default configuration: the distilled flow with one generated keyframe slot per 24/32-frame segment, then stage 2 under the detailing IC-LoRA (strength 0.5) with the upscaled slots and the half-resolution latent as reference tokens. 768x512x121 in 125 s cold on an M1 Ultra (the fastest prior Mac path: 171 s).",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dfr",
+          "engine": {
+            "pipeline": "dfr",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 36 GiB active plus a 12 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "Temporal rounds and the second spatial epilogue of DFRPipeline are not implemented; requests for them are not accepted.",
+            "Stage 2 carries the slot and reference tokens (9,600 tokens at 768x512x121 against 6,144 for the distilled pipeline), which is where the extra time goes."
           ]
         }
       }

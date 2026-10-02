@@ -1,0 +1,5 @@
+# The LTX-2.5 video profiles on Apple Silicon (slimserve/video). Not needed
+# for language-model serving. ffmpeg must also be on PATH.
+mlx>=0.31.2
+numpy
+tokenizers

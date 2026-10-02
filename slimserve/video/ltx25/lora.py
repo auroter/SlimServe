@@ -27,14 +27,24 @@ class Lora:
         self.pairs: dict[str, tuple[mx.array, mx.array]] = {}
         self.reference_downscale = 1
 
-    def load(self) -> "Lora":
+    def load(self) -> Lora:
         if self.pairs:
             return self
         header = checkpoints.read_header(self.path)
-        rank, alpha = header.metadata.get("lora_rank"), header.metadata.get("lora_alpha")
-        if rank != alpha:  # both absent on the IC-LoRA, which the reference applies unscaled as well
-            raise ValueError(f"{self.path.name}: lora_alpha {alpha} != lora_rank {rank}; scaling not implemented")
-        self.reference_downscale = int(header.metadata.get("reference_downscale_factor", 1))
+        rank, alpha = (
+            header.metadata.get("lora_rank"),
+            header.metadata.get("lora_alpha"),
+        )
+        if (
+            rank != alpha
+        ):  # both absent on the IC-LoRA, which the reference applies unscaled as well
+            raise ValueError(
+                f"{self.path.name}: lora_alpha {alpha} != lora_rank {rank}; "
+                "scaling not implemented"
+            )
+        self.reference_downscale = int(
+            header.metadata.get("reference_downscale_factor", 1)
+        )
         raw = checkpoints.cast_operands(checkpoints.load_raw(self.path))
         for key in [k for k in raw if k.endswith(".lora_A.weight")]:
             name = key[len(PREFIX) : -len(".lora_A.weight")]
@@ -42,10 +52,15 @@ class Lora:
         return self
 
     def attach(self, dit: LTX25DiT, strength: float = 1.0) -> None:
-        known = {k[: -len(".weight")] for k in dit.w if k.endswith(".weight")} | set(dit.split_k)
+        known = {k[: -len(".weight")] for k in dit.w if k.endswith(".weight")} | set(
+            dit.split_k
+        )
         missing = [n for n in self.pairs if n not in known]
         if missing:
-            raise KeyError(f"{self.path.name}: {len(missing)} adapter targets not in the DiT, e.g. {missing[:3]}")
+            raise KeyError(
+                f"{self.path.name}: {len(missing)} adapter targets not in the DiT, "
+                f"e.g. {missing[:3]}"
+            )
         for name, (a, b) in self.pairs.items():
             dit.lora.setdefault(name, []).append((a, b, strength))
 
