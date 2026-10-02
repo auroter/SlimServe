@@ -87,13 +87,19 @@ def main() -> int:
                 if time.time() > deadline:
                     sys.exit("[gpu_run] refused: another GPU job still holds the lock")
                 time.sleep(2)
-        avail = available_gb()
+        # A process that just exited releases its wired memory over several
+        # seconds; wait a little for that before concluding something holds it.
+        deadline_mem = time.time() + 90
+        while True:
+            avail = available_gb()
+            if avail >= a.need_gb + OS_RESERVE_GB or time.time() > deadline_mem:
+                break
+            time.sleep(3)
         if avail < a.need_gb + OS_RESERVE_GB:
             sys.exit(
                 f"[gpu_run] refused: {avail:.0f} GiB available, job needs "
-                f"{a.need_gb:.0f} + {OS_RESERVE_GB} reserve; "
-                "something else is holding memory "
-                "(check `ps -axm -o rss,pid,comm | sort -nr | head`)"
+                f"{a.need_gb:.0f} + {OS_RESERVE_GB} reserve; something else is "
+                "holding memory (check `ps -axm -o rss,pid,comm | sort -nr | head`)"
             )
         fh.seek(0)
         fh.truncate()

@@ -507,9 +507,11 @@ class LTX25DiT:
 
         for i in range(cfg.num_layers):
             v, a = self._block(i, v, a, state)
-            # Bound each Metal command buffer (GPU watchdog) and the live graph.
+            # Bound each Metal command buffer (GPU watchdog) and the live graph
+            # without stalling: the GPU runs this group while Python builds the
+            # next one.
             if self.eval_every and (i + 1) % self.eval_every == 0:
-                mx.eval(v, a)
+                mx.async_eval(v, a)
 
         return (
             self._out(v, video_emb, w["scale_shift_table"], "proj_out"),

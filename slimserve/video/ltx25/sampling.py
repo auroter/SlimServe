@@ -165,7 +165,7 @@ def euler_loop(
         dt = s_next - s
         vx = vx + (vx - v0) / s * dt
         ax = ax + (ax - a0) / s * dt
-        mx.eval(vx, ax)
+        mx.async_eval(vx, ax)
         if on_step:
             on_step(i, s)
     return vx, ax
@@ -209,7 +209,7 @@ def euler_ancestral_loop(
             vx, ax = step(vx, v0, s, s_next, vn), step(ax, a0, s, s_next, an)
             if eta > 0:
                 vx, ax = blend(vx, video), blend(ax, audio)
-        mx.eval(vx, ax)
+        mx.async_eval(vx, ax)
         if on_step:
             on_step(i, s)
         if s_next == 0:

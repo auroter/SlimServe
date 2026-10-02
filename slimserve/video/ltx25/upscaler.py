@@ -14,6 +14,7 @@ from pathlib import Path
 import mlx.core as mx
 
 from slimserve.video.ltx25 import checkpoints
+from slimserve.video.ltx25.vae import conv3d_core
 
 G = mx.float32
 
@@ -75,8 +76,10 @@ class LatentUpscaler:
 
     def _conv(self, name: str, x: mx.array) -> mx.array:
         w = self.w[name + ".weight"]
-        op = mx.conv3d if w.ndim == 5 else mx.conv2d
-        return op(x, w, padding=1) + self.w[name + ".bias"]
+        if w.ndim == 5:
+            padded = mx.pad(x, [(0, 0), (1, 1), (1, 1), (1, 1), (0, 0)])
+            return conv3d_core(padded, w, self.w[name + ".bias"])
+        return mx.conv2d(x, w, padding=1) + self.w[name + ".bias"]
 
     def _norm(self, name: str, x: mx.array) -> mx.array:
         return _group_norm(x, self.w[name + ".weight"], self.w[name + ".bias"])

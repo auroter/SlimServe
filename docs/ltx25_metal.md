@@ -107,8 +107,8 @@ Metal memory is wired: it cannot be compressed or swapped. Overshooting does
 not fail an allocation, it starves the OS (on 2026-10-02 four concurrent
 model-loading jobs panicked this machine). The engine therefore:
 
-- caps MLX active memory at RAM - 24 GiB - 12 GiB cache and the buffer cache
-  at 12 GiB;
+- caps MLX active memory at RAM - 24 GiB - 16 GiB cache and the buffer cache
+  at 16 GiB;
 - loads each checkpoint in 4 GiB chunks, dropping the bf16 source as it casts;
 - plans the VAE decode from a measured model (5 GiB + 135 B per output
   pixel-frame in fp32) against what the resident models leave, releases the

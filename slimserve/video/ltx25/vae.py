@@ -15,6 +15,8 @@ returns the PyTorch layout (B, C, F, H, W). Every convolution goes through
 from __future__ import annotations
 
 import itertools
+import json
+import os
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -81,7 +83,7 @@ def conv3d(
             xs = silu(pixel_norm(xs))
         if operand is not None:
             xs = xs.astype(operand)
-        y = mx.conv3d(mx.pad(xs, [(0, 0), (0, 0), (1, 1), (1, 1), (0, 0)]), w) + b
+        y = conv3d_core(mx.pad(xs, [(0, 0), (0, 0), (1, 1), (1, 1), (0, 0)]), w, b)
         if stream is not None:
             y = y.astype(stream)
         mx.eval(y)
@@ -97,6 +99,106 @@ def conv3d(
             time.perf_counter() - t_start,
         )
     return y
+
+
+# ---- 3x3x3 valid conv on a padded block: MLX conv3d or a per-tap split-K GEMM --
+# MLX's conv3d is a Winograd path that runs at an effective 18-25 TF/s on the
+# wide-grid, narrow-channel layers but at 1.4-3 TF/s on the small-grid,
+# 1024-channel ones (the VAE's first stages, the latent upscaler). Those are
+# GEMM-shaped: 27 taps x C_in. Summing one GEMM per three taps (K = 3 C_in,
+# below the K cliff of section 13) runs them at 8-14 TF/s in fp32 with
+# fp32-level agreement (rel 3e-6). The choice is measured once per shape in
+# this process and cached.
+TAPS_PER_GEMM = 3
+_CONV_CHOICE: dict[tuple, str] = {}
+_CONV_TIMINGS: dict[tuple, dict] = {}
+_CHOICE_FILE = Path(
+    os.environ.get(
+        "SLIMSERVE_LTX25_TUNE", "~/.cache/slimserve/ltx25_conv3d_choice.json"
+    )
+).expanduser()
+
+
+def _choice_key(key: tuple) -> str:
+    return json.dumps(key)
+
+
+def _load_choices() -> None:
+    """The table is per machine (chip and MLX version), persisted so a cold
+    process pays no timing. 2-3 s of measurement per process otherwise."""
+    if _CONV_CHOICE:
+        return
+    try:
+        data = json.loads(_CHOICE_FILE.read_text())
+        if data.get("device") == _device_tag():
+            _CONV_CHOICE.update({k: v for k, v in data["choices"].items()})
+    except (OSError, ValueError, KeyError):
+        pass
+    _CONV_CHOICE.setdefault("__loaded__", "1")
+
+
+def _device_tag() -> str:
+    info = mx.device_info()
+    return f"{info.get('device_name')} mlx{mx.__version__}"
+
+
+def _save_choices() -> None:
+    try:
+        _CHOICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CHOICE_FILE.with_suffix(".tmp")
+        choices = {k: v for k, v in _CONV_CHOICE.items() if k != "__loaded__"}
+        tmp.write_text(
+            json.dumps({"device": _device_tag(), "choices": choices}, indent=0)
+        )
+        tmp.replace(_CHOICE_FILE)
+    except OSError:
+        pass
+
+
+_TAPS = [(i, j, k) for i in range(3) for j in range(3) for k in range(3)]
+
+
+def _conv_tap_gemm(xp: mx.array, w: mx.array, b: mx.array) -> mx.array:
+    bsz, dp, hp, wp, c = xp.shape
+    d, h, wd = dp - 2, hp - 2, wp - 2
+    y = None
+    for s in range(0, 27, TAPS_PER_GEMM):
+        group = _TAPS[s : s + TAPS_PER_GEMM]
+        cols = mx.concatenate(
+            [xp[:, i : i + d, j : j + h, k : k + wd, :] for (i, j, k) in group], axis=-1
+        ).reshape(bsz * d * h * wd, -1)
+        wm = mx.concatenate([w[:, i, j, k, :] for (i, j, k) in group], axis=-1)
+        part = cols @ wm.T
+        y = part if y is None else y + part
+    return (y + b).reshape(bsz, d, h, wd, -1)
+
+
+def conv3d_core(xp: mx.array, w: mx.array, b: mx.array) -> mx.array:
+    """Valid 3x3x3 conv of an already padded block, by the faster of the two
+    formulations for this shape (measured on first use)."""
+    _load_choices()
+    key = _choice_key((tuple(xp.shape), tuple(w.shape), str(xp.dtype)))
+    choice = _CONV_CHOICE.get(key)
+    if choice is None:
+        if xp.shape[-1] < 256:  # narrow channels: Winograd wins by far, no need to time
+            choice = "mlx"
+        else:
+            timings = {}
+            for name, fn in (
+                ("mlx", lambda: mx.conv3d(xp, w) + b),
+                ("taps", lambda: _conv_tap_gemm(xp, w, b)),
+            ):
+                mx.eval(fn())
+                mx.synchronize()
+                t0 = time.perf_counter()
+                mx.eval(fn())
+                mx.synchronize()
+                timings[name] = time.perf_counter() - t0
+            choice = min(timings, key=timings.get)
+            _CONV_TIMINGS[key] = timings
+        _CONV_CHOICE[key] = choice
+        _save_choices()
+    return mx.conv3d(xp, w) + b if choice == "mlx" else _conv_tap_gemm(xp, w, b)
 
 
 def pixel_norm(x: mx.array) -> mx.array:

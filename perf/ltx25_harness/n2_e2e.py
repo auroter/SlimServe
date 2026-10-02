@@ -13,6 +13,9 @@ eng = LTX25Engine(variant="dev" if pipe == "dev" else "distilled", bf16_noise="-
 kw = dict(height=h, width=w, num_frames=n, fps=24.0, seed=42, keep_text="--keep-text" in flags)
 if pipe == "dev" and "--sequential" in flags: kw["batched"] = False
 res = getattr(eng, pipe)(PROMPT, **kw)
+if "--repeat" in flags:  # a second clip on the resident engine: the serving steady state
+    mx.eval(res.video_latent, res.audio_tokens); eng.render(res, f"{out}/clip_cold.mp4")
+    t_start = time.perf_counter(); res = getattr(eng, pipe)(PROMPT, **kw)
 mx.eval(res.video_latent, res.audio_tokens)
 np.savez(f"{out}/latents.npz", video=np.array(res.video_latent), audio=np.array(res.audio_tokens))
 path = eng.render(res, f"{out}/clip.mp4")

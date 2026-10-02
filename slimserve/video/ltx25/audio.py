@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import mlx.core as mx
@@ -193,9 +194,77 @@ def _sinc_upsample(
 ) -> mx.array:
     """Upstream UpSample1d on (N, T, 1): replicate-pad the samples, transposed
     conv with the (symmetric) sinc kernel (1, K, 1), scale, crop
-    -> (N, T * ratio, 1)."""
+    -> (N, T * ratio, 1). Reference form, kept for the parity script."""
     y = mx.conv_transpose1d(_edge_pad(x, pad, pad), kernel, stride=ratio) * float(ratio)
     return y[:, left : y.shape[1] - right]
+
+
+# The anti-aliasing filters are 12 taps on one channel. MLX's conv1d and
+# conv_transpose1d spend ~2.5-6 ms per call on them regardless of size
+# (dispatch-bound: 200 calls per clip), so each filter is compiled once into a
+# shifted multiply-add chain with its taps as constants: 0.9 ms a call and
+# agreement to 1e-6 (perf/ltx25_metal_campaign.md section 15).
+_FIR_CACHE: dict[tuple, Callable] = {}
+
+
+def _taps(kernel: mx.array) -> tuple[float, ...]:
+    return tuple(float(v) for v in np.array(kernel).reshape(-1))
+
+
+def _upsample2(
+    x: mx.array, kernel: mx.array, pad: int, left: int, right: int
+) -> mx.array:
+    """== _sinc_upsample(x, kernel, 2, pad, left, right), as polyphase FIRs."""
+    taps = _taps(kernel)
+    key = ("up", taps)
+    if key not in _FIR_CACHE:
+        # transposed conv, stride 2: y[2n + ph] = sum_j x[n - j] k[2j + ph]
+        phases = [taps[ph::2] for ph in (0, 1)]
+        length = max(len(ph) for ph in phases)
+        # correlation form: y_ph[n] = sum_j rows[ph][j] * xpp[n + j]
+        rows = [tuple(reversed(ph)) + (0.0,) * (length - len(ph)) for ph in phases]
+
+        @mx.compile
+        def fir(xpp: mx.array) -> mx.array:
+            n = xpp.shape[1] - (length - 1)
+            outs = [
+                sum(c * xpp[:, j : j + n] for j, c in enumerate(row) if c != 0.0)
+                for row in rows
+            ]
+            return mx.concatenate(outs, axis=-1).reshape(xpp.shape[0], 2 * n, 1) * 2.0
+
+        _FIR_CACHE[key] = (fir, length)
+    fir, length = _FIR_CACHE[key]
+    xp = _edge_pad(x, pad, pad)
+    xpp = mx.concatenate(
+        [mx.zeros((xp.shape[0], length - 1, 1), dtype=xp.dtype), xp], axis=1
+    )
+    y = fir(xpp)  # == the transposed conv's output, minus its last k - 2 samples
+    full = 2 * xp.shape[1] + kernel.shape[1] - 2
+    return y[:, left : full - right]
+
+
+def _downsample2(x: mx.array, kernel: mx.array, left: int, right: int) -> mx.array:
+    """== conv1d(_edge_pad(x, left, right), kernel, stride=2)."""
+    taps = _taps(kernel)
+    key = ("down", taps)
+    fir = _FIR_CACHE.get(key)
+    if fir is None:
+
+        @mx.compile
+        def fir(xp: mx.array) -> mx.array:
+            n = (xp.shape[1] - len(taps)) // 2 + 1
+            return sum(
+                c * xp[:, j : j + 2 * (n - 1) + 1 : 2] for j, c in enumerate(taps)
+            )
+
+        _FIR_CACHE[key] = fir
+    return fir(_edge_pad(x, left, right))
+
+
+@mx.compile
+def _snake(h: mx.array, alpha: mx.array, inv_beta: mx.array) -> mx.array:
+    return h + inv_beta * mx.square(mx.sin(alpha * h))
 
 
 class _Generator:
@@ -214,15 +283,13 @@ class _Generator:
         k = up.shape[1]
         pad = k // 2 - 1
         h = x.transpose(0, 2, 1).reshape(b * c, t, 1)
-        h = _sinc_upsample(
-            h, up, 2, pad, pad * 2 + (k - 2) // 2, pad * 2 + (k - 1) // 2
-        )
+        h = _upsample2(h, up, pad, pad * 2 + (k - 2) // 2, pad * 2 + (k - 1) // 2)
         h = h.reshape(b, c, 2 * t).transpose(0, 2, 1)
         alpha, beta = mx.exp(w[p + ".act.alpha"]), mx.exp(w[p + ".act.beta"])
-        h = h + (1.0 / (beta + 1e-9)) * mx.square(mx.sin(alpha * h))
+        h = _snake(h, alpha, 1.0 / (beta + 1e-9))
         k = down.shape[1]
         h = h.transpose(0, 2, 1).reshape(b * c, 2 * t, 1)
-        h = mx.conv1d(_edge_pad(h, k // 2 - (1 - k % 2), k // 2), down, stride=2)
+        h = _downsample2(h, down, k // 2 - (1 - k % 2), k // 2)
         return h.reshape(b, c, t).transpose(0, 2, 1)
 
     def conv(self, p: str, x: mx.array, dilation: int = 1) -> mx.array:
