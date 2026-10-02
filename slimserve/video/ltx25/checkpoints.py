@@ -104,11 +104,14 @@ def cast_operands(
         out[name] = a
         pending.append(a)
         pending_bytes += a.nbytes
+        del a
         if pending_bytes >= chunk_bytes:
             mx.eval(pending)
             pending, pending_bytes = [], 0
+            mx.clear_cache()  # return the freed bf16 source buffers to the OS
     if pending:
         mx.eval(pending)
+    mx.clear_cache()
     return out
 
 
