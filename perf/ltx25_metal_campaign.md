@@ -470,12 +470,27 @@ oversize request is refused with a 400, every mp4 probes as H.264 + AAC with
 the right frame count. `slimserve ltx25-distilled -p ... --size 768x512
 --seconds 5`: 86.1 s through the real CLI.
 
+**Hand-written GEMM experiment** (`n4_gemm_kernel_experiment.py`,
+`mx.fast.metal_kernel`, fp16 `simdgroup_half8x8`, one simdgroup per output
+tile, operands read straight from the arrays; M=6144, K=4096, N=4096):
+
+| kernel | TF/s | note |
+| --- | ---: | --- |
+| MLX matmul | 18.7 | rel error vs fp32 2.1e-4 |
+| tile 32x32, accumulators in arrays | 0.3 | the compiler keeps them in memory |
+| tile 8x8 / 16x16 / 32x32 / 32x64 / 64x64, unrolled into registers | 2.6 / 5.0 / **9.2** / 8.7 / 7.6 | rel error 9.4e-3: plain fp16 accumulation over K=4096 |
+
+Hypothesis: a simple tiled simdgroup kernel can match MLX. Result: half its
+rate and 45x its error; MLX accumulates more carefully than fp16 tiles.
+Closing the gap needs operand staging, split-K accumulation and tile tuning
+that MLX already has. Decision: rejected under the pre-registered bar (drop
+below 16 TF/s at the first prototype); no custom GEMM or attention kernel on
+M1-M4. This is the measured basis for "at the MLX kernel ceiling".
+
 **Next, in order.** (1) I2V conditioning (encoder already ported). (2) DFR
 temporal rounds and spatial epilogue. (3) Opt-in tier with its own A/B:
-step caching, fp16 VAE, HD sparse attention. (4) A flash-attention kernel
-through `mx.fast.metal_kernel` as an experiment with a pre-registered bar
-(>= 18 TF/s at 24,576 tokens, D128, fp16, equal output at fp32 tolerance);
-drop it if the first tile-loop prototype is under 16. (5) QuixiCore-Metal
+step caching, fp16 VAE, HD sparse attention. (4) Kernel work only where MLX leaves room: revisit on M5 (int8 MMA) and if
+a profile shows an MLX op far below 18 TF/s, as K=16384 was. (5) QuixiCore-Metal
 PR: there is no new Metal kernel to upstream yet; the candidates are the
 split-K GEMM dispatch and the slab conv3d driver. (6) M5 int8 path on M5
 hardware.
