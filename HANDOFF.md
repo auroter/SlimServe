@@ -227,10 +227,27 @@ reuse, VAE budget.
   config per process; reload from disk (2 s mmap).
 - Baseline GPU runs must be serial; a concurrent GPU job halves measured
   rates. The download process is CPU-only and safe.
+- **One model-loading process at a time, always through
+  `perf/ltx25_harness/gpu_run.py --need-gb N -- <cmd>`.** On 2026-10-02 at
+  11:07 the box kernel-panicked (`watchdog timeout: no checkins from
+  watchdogd in 90 seconds`) and had to be forced off. Cause: three parallel
+  component-port agents plus the lead each ran model-loading jobs; the
+  JetsamEvent reports show python processes at 84.7, 64.2 and 18.1 GiB
+  resident (167 GiB on a 128 GiB box) with a fourth loading the 39 GiB DiT,
+  `iogpu.wired_limit_mb` at 122880. Metal memory is wired: it cannot be
+  compressed or swapped, so the compressor ran out of space
+  (`vm-compressor-space-shortage` killed tccd, trustd, logd_helper, ...) and
+  watchdogd starved. Rules: never run parallel agents that touch the GPU or
+  load weights (parallel agents may read and write code only); every heavy
+  run goes through the guard (exclusive lock, headroom check, 16 GiB OS
+  reserve); parity scripts load one model copy per process and compare via
+  saved .npz files, never reference + candidate in one process.
+- `iogpu.wired_limit_mb` resets to 0 (the macOS default, about 3/4 of RAM)
+  at boot. Leave it there unless one resident configuration measurably needs
+  more, and never above 110000 on this box; the guard refuses to launch
+  above that. The old 122880 setting left the OS under 8 GiB.
 - Untiled VAE decode at 1536x1024x121 estimates 56 GB and killed the
   baseline process silently (only a leaked-semaphore warning).
-- `iogpu.wired_limit_mb` may need raising for HD + dev + resident Gemma
-  (the LLM campaigns used 122880); check `sysctl iogpu.wired_limit_mb`.
 - The runner's CLI needs ffmpeg on PATH; `brew install ffmpeg` done
   2026-10-01.
 - Comparing pipeline outputs across runs measures sampler divergence, not
