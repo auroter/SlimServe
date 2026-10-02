@@ -27,6 +27,7 @@ from slimserve.video.ltx25 import checkpoints
 
 G = mx.float32
 SCALE_T, SCALE_S = 8, 32
+SLAB_SCRATCH_BYTES = 4 << 30  # im2col-equivalent scratch allowed per conv slab
 
 # Optional profiler: called as hook(tag, x_shape, w_shape, seconds) with the conv
 # evaluated synchronously. Leave None in production (it serializes the graph).
@@ -43,7 +44,7 @@ def conv3d(x: mx.array, w: mx.array, b: mx.array, causal: bool = False, tag: str
         x = mx.concatenate([first, x, x[:, -1:]], axis=1)
     x = mx.pad(x, [(0, 0), (0, 0), (1, 1), (1, 1), (0, 0)])
     if CONV_HOOK is None:
-        return mx.conv3d(x, w) + b
+        return _conv_slabs(x, w, b)
     mx.eval(x)
     mx.synchronize()
     t = time.perf_counter()
@@ -171,7 +172,10 @@ def decode_tiles(latent_shape: tuple[int, ...], tiling: Tiling) -> list[tuple[tu
     return tiles
 
 
-BYTES_PER_PIXEL_FRAME = 750  # fp32 untiled peak, measured by the baseline (its issue #142)
+# fp32 untiled peak per output pixel-frame with slab convolutions. Measured
+# 2026-10-02: 768x512x121 peaks at 14.4 GiB (303 B). Before slabs the same decode
+# peaked near 60 GiB (1,260 B); the baseline quotes 750 B for its bf16 decode.
+BYTES_PER_PIXEL_FRAME = 340
 _ACCUM_BYTES_PER_PIXEL = 4 * 3 * 4
 
 
@@ -219,6 +223,28 @@ def to_uint8(pixels: mx.array) -> np.ndarray:
     """(1, 3, T, H, W) in [-1, 1] -> uint8 (T, H, W, 3)."""
     x = ((mx.clip(pixels[0], -1.0, 1.0) + 1.0) * 127.5).astype(mx.uint8)
     return np.array(x.transpose(1, 2, 3, 0))
+
+
+def _conv_slabs(x: mx.array, w: mx.array, b: mx.array) -> mx.array:
+    """Valid 3x3x3 conv of an already padded input, evaluated in temporal slabs.
+
+    Output frame t reads padded frames t..t+2 only, so slabs are exact. MLX's
+    conv3d allocates scratch proportional to the whole input (a 768x512x121
+    decode peaked at 60 GiB for activations of 1.5 GiB); bounding the slab
+    bounds the scratch, and equal-shaped slabs reuse the same buffers.
+    """
+    d_out = x.shape[1] - 2
+    per_frame = x.shape[2] * x.shape[3] * max(x.shape[4], w.shape[0]) * x.dtype.size
+    frames = max(1, int(SLAB_SCRATCH_BYTES // (27 * per_frame)))
+    if frames >= d_out:
+        return mx.conv3d(x, w) + b
+    mx.eval(x)
+    out = []
+    for t in range(0, d_out, frames):
+        y = mx.conv3d(x[:, t : min(t + frames, d_out) + 2], w) + b
+        mx.eval(y)
+        out.append(y)
+    return mx.concatenate(out, axis=1)
 
 
 class VideoVAE:
@@ -307,16 +333,12 @@ class VideoVAE:
         if tiling == "auto":
             per = BYTES_PER_PIXEL_FRAME if self.dtype == G else BYTES_PER_PIXEL_FRAME // 2
             tiling = plan_tiling(latent.shape, frame_rate, budget_bytes, per)
-        previous_limit = mx.set_cache_limit(0)  # keep freed activations out of the allocator cache
-        try:
-            if tiling is None:
-                px = self.decode_raw(latent)
-                mx.eval(px)
-                yield px
-                return
-            yield from self._decode_tiled(latent, tiling)
-        finally:
-            mx.set_cache_limit(previous_limit)
+        if tiling is None:
+            px = self.decode_raw(latent)
+            mx.eval(px)
+            yield px
+            return
+        yield from self._decode_tiled(latent, tiling)
 
     def _decode_tiled(self, latent: mx.array, tiling: Tiling) -> Iterator[mx.array]:
         b, _, f, h, w = latent.shape

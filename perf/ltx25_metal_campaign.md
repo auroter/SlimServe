@@ -318,3 +318,86 @@ env already exists). Alternatives considered: torch-MPS host (slow linear
 path, residency/alloc-churn pain from the LLM retrospective), C/Metal
 engine a la h3.c (months of loader/encoder/VAE/mux work before first frame;
 h3 still ended on MPSGraph for attention and conv). Awaiting Sean's go.
+
+## 13. Engine bring-up, N0-N2 (2026-10-02, `slimserve/video/ltx25/`)
+
+All runs one process at a time through `perf/ltx25_harness/gpu_run.py`
+(section 14). Raw logs: `perf/results/2026-10-02-ltx25-n2/`.
+
+**N0 loader.** Official safetensors read directly (`checkpoints.py`), bf16 ->
+fp16 in 4 GiB chunks with the source dropped as it goes. Distilled DiT: 4,091
+tensors + 258 connector tensors, 35.4 GiB fp16 + 0.02 GiB fp32 tables, 5.8 s,
+39.1 GiB peak. Key map: upstream names with `model.diffusion_model.` stripped;
+the runner's pack renames `to_out.0 -> to_out`, `ff.net.0.proj -> proj_in`,
+`ff.net.2 -> proj_out`, `linear_1/2 -> linear1/2` and transposes convs to
+channels-last, which the engine does at load instead.
+
+**N1 forward** (`n1_forward_gate.py`, captured stage-2 inputs, 6,144 tokens):
+
+| engine | s/forward | video rel-L2 vs fp32 | audio rel-L2 | vs the fp16 shim |
+| --- | ---: | ---: | ---: | ---: |
+| runner + fp16-operand shim (section 9) | 13.7 | 0.0071 | 0.0011 | 0 |
+| ours, policy as shimmed | 13.71 | 0.00709 | 0.00107 | 0.0025 |
+| ours + split-K FFN GEMM | **11.92** | 0.00692 | 0.00106 | 0.0025 |
+
+Deterministic across repeats. The 0.0025 distance to the shim is two fp16
+rounding realizations of the same math (keyframe embedding and AdaLN adds in
+fp32 here); both sit at the same distance from the truth, so the planned
+"<= 0.001 vs shim" gate was the wrong instrument and is dropped.
+
+**Split-K** (`dit.py`, first kernel-wave item, no custom kernel needed): MLX's
+fp16 GEMM is 18.4-19.3 TF/s for every DiT shape except K=16384, where it is
+10.3-10.4 TF/s (6.3 at 24,576 rows). Summing eight K=2048 chunks: 79.4 -> 44.6
+ms at 6,144 rows, 526 -> 172 ms at 24,576 (19.2 TF/s). Same error vs fp32
+(2.07e-4, output rounding). Worth 1.8 s per 6k forward, ~17 s per HD forward.
+
+**N2 components** (each vs the runner on identical inputs):
+
+| component | dtype | parity | time, memory |
+| --- | --- | --- | --- |
+| Gemma-4 12B + projection + connectors (`text.py`) | fp16 operands, fp32 stream | rel-L2 0.0003-0.0007 vs fp32; runner as shipped 0.005-0.010; no overflow (max GEMM output 8,232) | load 4.8 s, encode 0.85 s warm, 28.1 GiB |
+| video VAE decode (`vae.py`) | fp32 | rel-L2 2.0e-6 vs runner fp32, PSNR 89.7 dB; runner as shipped (bf16) is 47.3 dB from fp32; fp16 is 59.0 dB | 768x512x121: 9.6 s, 14.4 GiB |
+| VAE encode | fp32 (fp16 overflows) | 4.0e-6 | 49 f: 5.7 s |
+| latent upscalers (`upscaler.py`) | fp32 (fp16 overflows) | 2.9e-6 / 5.5e-6 | spatial 2.9 s cold |
+| audio VAE + vocoder + BWE (`audio.py`) | fp32 | mel 129.7 dB; waveform 64.5 dB vs the runner with its three deviations from upstream patched in, 28.0 dB as-is (the engine follows upstream: no tanh on the 16 kHz stage, no +1e-9 under the STFT sqrt, upstream edge handling) | 5 s clip: 2.6 s |
+| mux (`mux.py`) | | H.264 yuv420p CRF 18 + AAC 48 kHz stereo, raw rgb24 piped | 0.7 s |
+
+Text tower runs on the real tokens only (padding is masked and replaced by
+registers either way), which is why encode is 0.85 s.
+
+**VAE memory** (`vae.py: _conv_slabs`): MLX conv3d scratch scales with the
+whole input; the 121-frame decode peaked near 60 GiB for activations of 1.5
+GiB each. Each conv now runs in temporal slabs (exact: output frame t reads
+padded frames t..t+2). Peak 60 -> 14.4 GiB, 12.0 -> 9.6 s, output unchanged.
+Conv profile (`conv3d_layers_121_fp32.md`): 117.5 TFLOP nominal; MLX's
+Winograd path runs steady-state at an effective 18-25 TF/s in fp32, so a
+direct implicit-GEMM fp16 kernel (19 TF/s nominal) is not a speed lever
+here; the levers are fp16 operands with fp32 accumulate (2x, needs a kernel
+to keep fp32 accuracy), first-touch allocation stalls (0.8-1.2 s on the
+first conv of each new shape), and the remaining 9 full-size activations.
+
+**N2 end to end** (`n2_e2e.py`, 768x512x121 distilled, seed 42, fox prompt,
+cold process, wall includes imports and model loads):
+
+| engine | wall | text | load | stage 1 (8) | upscale | stage 2 (3) | decode | audio | mux | peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline q8 | 116.9 s | | | 4.3 s/step | | 17.8 s/step | 18.1 | | | 33.9 GiB Metal |
+| baseline bf16 | 202.4 s | | | 8.4 | | 32.3 | | | | 39.8 GiB RSS |
+| baseline + precision shim | 100.4 s | 8 | 3 | 3.5 | | 13.4 | 17.6 | | | |
+| **ours** | **90.4 s** | 5.7 | 4.8 | 24.7 (3.07/step) | 2.6 | 36.2 (12.06/step) | 12.7 | 2.65 | 0.7 | 52.8 GiB |
+
+1.29x the q8 baseline, 2.24x the bf16 baseline, before any custom kernel.
+Same scene as the baseline at frames 0/60/120 (`side.png`); stage-1 audio
+latent cos 0.99976 vs the runner after 8 ancestral steps. mp4: 121 frames,
+24 fps, H.264 + AAC 5.01 s. Gemma is unloaded after encoding in the one-shot
+path (resident serving keeps it: 28 + 40 GiB).
+
+## 14. Incident 2026-10-02: kernel panic from concurrent GPU jobs
+
+Four model-loading processes at once (84.7 + 64.2 + 18.1 GiB resident plus
+a 39 GiB DiT loading, 128 GiB box, `iogpu.wired_limit_mb=122880`) exhausted
+the compressor; watchdogd starved for 90 s; forced power-off. Rules now in
+HANDOFF.md: one model-loading process at a time through `gpu_run.py`
+(exclusive lock, headroom check, 16 GiB reserve, refuses a wired limit above
+110000), agents never touch the GPU, the engine sets an MLX memory limit of
+RAM - 24 GiB and plans VAE decode inside what is left.

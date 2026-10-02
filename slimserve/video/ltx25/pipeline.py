@@ -20,12 +20,14 @@ from slimserve.video.ltx25.dit import DiTConfig, LTX25DiT, x0_from_velocity
 from slimserve.video.ltx25.sampling import LatentState
 
 G = mx.float32
+OS_RESERVE_BYTES = 24 << 30  # never plan Metal memory into the last 24 GiB
 
 
 @dataclass
 class Timings:
     spans: dict[str, float] = field(default_factory=dict)
     steps: list[tuple[str, int, float]] = field(default_factory=list)
+    memory: dict[str, tuple[int, int, int]] = field(default_factory=dict)  # peak, active, cache bytes
 
     def span(self, name: str):
         timings = self
@@ -33,11 +35,13 @@ class Timings:
         class _Span:
             def __enter__(self):
                 mx.synchronize()
+                mx.reset_peak_memory()
                 self.t = time.perf_counter()
 
             def __exit__(self, *exc):
                 mx.synchronize()
                 timings.spans[name] = timings.spans.get(name, 0.0) + time.perf_counter() - self.t
+                timings.memory[name] = (mx.get_peak_memory(), mx.get_active_memory(), mx.get_cache_memory())
 
         return _Span()
 
@@ -80,6 +84,9 @@ class LTX25Engine:
 
     def __init__(self, root: Path | None = None, variant: str = "distilled", bf16_noise: bool = False):
         self.root = root or checkpoints.model_root()
+        total = int(mx.device_info()["memory_size"])
+        mx.set_memory_limit(total - OS_RESERVE_BYTES)
+        mx.set_cache_limit(8 << 30)
         self.variant = variant
         self.bf16_noise = bf16_noise
         self.dit: LTX25DiT | None = None
@@ -127,6 +134,19 @@ class LTX25Engine:
             self.audio.load()
         return self.audio
 
+    def unload_text(self) -> None:
+        if self.text is not None:
+            self.text.unload()
+            self.text = None
+
+    def decode_budget(self) -> int:
+        """Bytes the VAE decode may use: what is left after the resident models
+        and the OS reserve. The decoder tiles to fit. Metal memory is wired, so
+        overshooting this takes the machine down, not just the process."""
+        total = int(mx.device_info()["memory_size"])
+        free = total - mx.get_active_memory() - OS_RESERVE_BYTES
+        return int(max(4 << 30, min(free, total // 2)))
+
     # ---- distilled --------------------------------------------------------
     def distilled(
         self,
@@ -137,6 +157,7 @@ class LTX25Engine:
         fps: float = 24.0,
         seed: int = 42,
         text_embeds: tuple[mx.array, mx.array] | None = None,
+        keep_text: bool = True,
         on_step: Callable[[str, int, float], None] | None = None,
     ) -> Result:
         tm = Timings()
@@ -144,6 +165,8 @@ class LTX25Engine:
             with tm.span("text"):
                 video_text, audio_text = self.load_text().encode(prompt)[:2]
                 mx.eval(video_text, audio_text)
+            if not keep_text:
+                self.unload_text()
         else:
             video_text, audio_text = text_embeds
         with tm.span("load"):
@@ -206,7 +229,8 @@ class LTX25Engine:
 
         tm = result.timings
         with tm.span("vae_decode"):
-            frames = self.load_vae().decode(result.video_latent, seed=seed)
+            frames = self.load_vae().decode(
+                result.video_latent, frame_rate=result.fps, budget_bytes=self.decode_budget())
         with tm.span("audio_decode"):
             waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
         with tm.span("mux"):
