@@ -22,8 +22,8 @@ T latent frames decode to 4T - 3 mel frames -> (4T - 3) * 160 samples at
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
