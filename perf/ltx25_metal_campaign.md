@@ -1,0 +1,320 @@
+# LTX-2.5 on Apple Silicon: campaign plan (drafted 2026-10-01)
+
+Companion: `perf/ltx25_metal_research.md` (survey with URLs). This is the plan of
+record; decisions below were made with Sean on 2026-10-01 and are not open.
+
+## 1. Decisions
+
+**Scope: the whole M line, one kernel codebase.** Bring-up and the first
+profile are on the M1 Ultra 128 GiB Studio. Kernels are written once with
+per-chip variants (tile shapes, bf16 native on M3+, int8 tensor path on M5),
+the way llama.cpp handles it. Platform remains part of profile identity.
+
+**Three pipeline ids, same DiT, same kernels.**
+
+| id (working) | pipeline | stage 1 | stage 2 | position |
+| --- | --- | --- | --- | --- |
+| `ltx25-distilled` | DistilledPipeline | 8 forwards, half res, CFG 1 | 2x latent upscale, 3 steps, distilled LoRA | fast / iterate |
+| `ltx25-dev` | TI2VidTwoStages | 30 steps x 4 forwards (CFG 3.0, STG 1.0, modality 3.0), half res | same | quality |
+| `ltx25-dfr` | DFRPipeline | distilled + generated keyframe slots | upscale, spatial-detailing epilogue with the official detailing IC-LoRA (strength 0.5), optional temporal rounds (+8 steps each) | production (Lightricks' label) |
+
+Dev and distilled are the same architecture and shapes; dev's 4-way guidance
+batch is just M=4x rows. DFR adds a 0.33 GB IC-LoRA and tiling logic, no new
+kernels. Default output 1536x1024x121 @ 24 fps (stage 1 at 768x512).
+
+**Precision on M1-M4: no quantization.** bf16 checkpoints as shipped, fp16
+MMA operands with fp32 accumulate, fp32 glue (residual stream, norms, AdaLN,
+RoPE, softmax statistics, x0 recovery). Grounds, measured on this box
+(`scratchpad/gemm_bench.py`, 2026-10-01):
+
+| M tokens | fp16 | bf16 (emulated) | MLX int8 g64 | MLX int4 g64 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,536 | 18.5 TF/s | 13.5 | 15.4 | 15.4 |
+| 6,144 | 19.3 | 13.9 | 15.8 | 15.8 |
+| 14,080 | 18.6 | 14.0 | 15.9 | 15.9 |
+
+M1 has only fp16 simdgroup MMA; every format is converted to fp16 in-register
+at tile load, so a quant can match fp16 but never beat it, and bf16 compute
+costs 25-30%. Weight traffic is 38 GB/forward = 48 ms at 800 GB/s against
+seconds of compute. Memory does not force a quant: dev DiT 38 + runtime
+low-rank distilled LoRA 9 + Gemma 24 + VAE/upscalers 3 + activations <2 GB
+fits 128 GiB with room for untiled VAE decode. Gate: section 4.
+
+**Precision on M5: official int8 convrot (W8A8, Hadamard g256, 5 bf16
+islands) as the candidate**, because the neural accelerators do int8 MMA
+(Draw Things: 1.6-1.9x int8 GEMM over fp16 on M5). A custom calibrated quant
+only if the official one loses quality in the A/B. Nothing to build now.
+
+**Baseline: dgrauet/ltx-2-mlx** (v0.15.12, cloned at
+`~/.local/scratch/ltx25/ltx-2-mlx`, installed with uv). Most complete 2.5
+port, fastest measured Mac numbers, engine under ltx-video-mac (422 stars)
+and Rapid-MLX (3.9k). Baseline config = its recommended q8 pack; bf16 pack
+also timed. Secondary bar: ComfyUI on MPS (popular GGUF path; 2-3.5x slower,
+currently broken on M1 Ultra). Draw Things becomes a second bar if it ships
+2.5 (it has real Metal kernels; stops at 2.3 today).
+
+**Weights** (`~/models/ltx-2.5/`): `official/` (Lightricks/LTX-2.5 bf16 set
++ detailing IC-LoRA), `dgrauet-q8/`, `dgrauet-bf16/`. HF account auroter
+holds the gate acceptances. int8-convrot and nvfp4 deferred to M5 work.
+
+## 2. Physics on M1 Ultra (est., 1536x1024x121 output)
+
+Peak ~20.8 TF/s fp16, 800 GB/s. Tokens: 6,144 at stage 1, 24,576 at stage 2.
+Forward ~0.21 PFLOP at 6k (attn ~15%), ~1.2 PFLOP at 24k (attn ~40%).
+
+| pipeline | DiT forwards | PFLOP | 100% ALU | ~70% ALU |
+| --- | --- | ---: | ---: | ---: |
+| distilled | 8 @ 6k + 3 @ 24k | ~5.3 | ~4.2 min | ~6 min |
+| dev two-stage | 120 @ 6k + 3 @ 24k | ~29 | ~23 min | ~32 min |
+| DFR | distilled + epilogue (+ temporal rounds) | > distilled, measure | | |
+
+MLX `fast.scaled_dot_product_attention`, 32 heads x 128, self-attention
+(`scratchpad/sdpa_bench.py`, 2026-10-01):
+
+| B x N | fp16 | bf16 |
+| --- | ---: | ---: |
+| 1 x 6,144 | 15.1 TF/s (41 ms) | 11.5 (54 ms) |
+| 4 x 6,144 (dev guidance batch) | 15.3 (161 ms) | 11.9 (209 ms) |
+| 1 x 24,576 (stage 2) | 15.3 (645 ms) | 11.7 (846 ms) |
+
+So MLX attention already runs at ~73% of peak in fp16; a flash kernel's own
+headroom is ~1.2-1.3x (to the ~19 TF/s the GEMM reaches), and the bf16 ->
+fp16 switch alone is worth ~1.3x on both GEMM and attention. The larger
+unknowns are glue overhead (per-call RoPE, gating, masks, per-token AdaLN,
+eval guards, allocation churn) and the VAE; the baseline profile decides
+the ranking, not these microbenchmarks.
+
+Plus conv VAE decode (M3 Max: 6 s untiled at 768x512x121; scales ~4x at
+1536x1024), Gemma-4 12B encode (once per prompt, small), audio VAE + vocoder.
+GEMM is already at ~90% of peak in MLX, so the headroom is in attention
+(MLX SDPA is not IO-aware), conv3d (MLX decomposes to per-frame 2D Winograd;
+Draw Things' implicit GEMM is 2.4x on M1-M4), fused epilogues (AdaLN
+modulate, gated attention, RMSNorm+split-RoPE, GELU), and MPS/MLX glue
+(transient allocations, the retrospective's lesson). Caching (TeaCache in
+the baseline; FBCache/MagCache unported) and sparse attention multiply on
+top but change outputs; they are a separate, opt-in tier.
+
+## 3. Campaign phases
+
+1. **Baseline** (blocked on downloads): time all three pipelines in
+   ltx-2-mlx at the canonical clip (1536x1024x121, default DFR size) and a
+   short dev clip (768x512x121 output), q8 and bf16 packs, record peak
+   memory, per-op profile of one stage-1 forward and one VAE decode.
+2. **Precision gate** (section 4). Output: the dtype policy per op class.
+3. **Engine bring-up**: our own loader for the official safetensors,
+   DiT forward on QuixiCore-Metal kernels (attn_fwd/cross_attn/rotary/
+   gemm_* exist; conv3d does not), conv VAE decoder, Gemma-4 encode,
+   distilled pipeline end-to-end, bit-compared against the runner.
+4. **Kernel waves**, ranked by measured per-op share: flash attention
+   (D128, fp16, fp32 stats, gated epilogue), conv3d implicit GEMM, fused
+   AdaLN/GELU/RMSNorm-RoPE, runtime low-rank LoRA GEMM, tiled VAE.
+5. **Dev + DFR pipelines** on the same engine; dev-vs-DFR quality A/B.
+6. **Profiles**: three ids on platform `metal-m1ultra`; M5 variants later.
+
+## 4. Precision gate (the "quick experiment")
+
+Question: does fp16 operand compute change the output versus bf16?
+Runs, same seeds/prompts/sampler, distilled pipeline at 768x512x49 (cheap):
+
+1. bf16 reference (runner as-is; MLX bf16 is emulated but exact) with
+   per-block max|.| of residual stream, attention out, FFN intermediate.
+2. fp16 everywhere (weights cast at load, inputs cast fp16).
+3. fp16 operands + fp32 residual/glue (if run 2 shows range trouble).
+
+Metrics: latent cosine similarity and PSNR (stage 1 and final), per-block
+max activation, NaN/inf count, decoded video side-by-side. Pass: cos-sim
+~0.9999 (community int8 pack = 0.9982), no overflow. Also a one-time scan
+of all bf16 weights for |w| > 65504 or subnormal-range mass. Any block that
+overflows keeps fp32 operands rather than abandoning fp16 globally.
+
+## 5. Open items
+
+- Verify native bf16 on M3+ GPUs on hardware (affects whether fp16 cast
+  stays the policy there).
+- DFR forward count and memory at default size: measure in baseline.
+- Diffusion VAE decoder (NATTEN neighborhood attention) vs conv decoder
+  quality: conv is the profile default; revisit after kernels.
+
+## 6. Baseline measurements (dgrauet/ltx-2-mlx v0.15.12, q8 pack, M1 Ultra, seed 42, 2026-10-01)
+
+Prompt: snowy pine forest / red fox. Wall = `/usr/bin/time` real, includes
+Gemma load+encode (~7-11 s), DiT load (~2-3 s), decode+mux.
+
+| clip | pipeline | DiT forwards | per-forward | wall | peak RSS |
+| --- | --- | --- | --- | ---: | ---: |
+| 768x512x121 | distilled | 8 @ 1,536 tok + 3 @ 6,144 | 4.3 s / 17.8 s | **116.9 s** | 22.5 GB |
+| 768x512x121 | dev two-stage (30 steps, CFG+STG+modality = 4 passes) | 120 @ 1,536 (batched 4 = 17.2 s/step) + 3 @ 6,144 | 4.3 s / 18.7 s | **606.9 s** | 22.5 GB |
+| 768x512x121 | DFR (5 keyframe slots, detailing LoRA 0.5) | 8 @ 2,016 + 3 @ 9,600 | 5.5 s / 31.2 s | **170.9 s** | 22.8 GB |
+| 768x512x121 | distilled, **bf16 pack** | 8 @ 1,536 + 3 @ 6,144 | 8.4 s / 32.3 s | **202.4 s** | 39.8 GB |
+| 1536x1024x121 | distilled, untiled | 8 @ 6,144 + 3 @ 24,576 | 17.8 s / 111.1 s | DiT 475 s; untiled decode (est. 56 GB) killed the process | |
+| 1536x1024x121 | distilled, `--tile-spatial 2` (the runner's recommended HD config; tiles attention, output differs) | 8 @ 6,144 + 3 @ 24,576 | 20.7 s / 80.8 s | **504.9 s** (decode 83.8 s, 53.2 GB peak Metal) | 22.4 GB |
+
+Conv VAE decode 768x512x121: 18.1 s, 33.9 GB peak Metal memory (untiled).
+Dev full-size projected: 30 x (4 x 17.8) + 3 x 111 = ~41 min DiT + decode.
+
+Effective DiT throughput: 0.046 PFLOP / 4.3 s = 10.7 TF/s (1.5k tok);
+0.21 / 17.8 = 11.8 TF/s (6k); 1.2 / 111 = 10.8 TF/s (24k). That is ~52-57%
+of the 20.8 TF/s peak and ~70% of what MLX's own kernels reach in isolation
+(int8 GEMM 15.8, bf16 SDPA 11.5). The q8 pack's compute is a bf16-SDPA /
+int8-GEMM mix; an fp16-operand engine at the measured kernel rates (GEMM
+~19, SDPA ~15.3) is ~1.5x on the DiT before any custom kernel, and the
+remaining gap to peak is another ~1.3x. Baseline mp4s and logs:
+`~/.local/scratch/ltx25/baseline/`.
+
+## 7. Precision gate results (2026-10-01, bf16 pack, `gate/forward_gate.py`, `gate/precision_gate.py`)
+
+Per-forward, identical captured stage-2 inputs (6,144 video tokens, real
+pipeline state), DiT weights + operands cast per run, fp32 as truth:
+
+| DiT dtype | video cos vs fp32 | rel-L2 vs fp32 | audio cos vs fp32 |
+| --- | ---: | ---: | ---: |
+| bf16 (as shipped / as the runner computes) | 0.999049 | 0.0437 | 0.999715 |
+| **fp16** | **0.999989** | **0.0047** | 0.999999 |
+
+fp16 operands are ~10x closer to fp32 than bf16 operands (3 more mantissa
+bits; range was never the issue: residual-stream max over all forwards was
+16.4k against the 65,504 fp16 limit, no NaN/inf, output absmax identical).
+End-to-end (768x512x49 distilled, same seed): bf16 vs fp16 final latents
+cos 0.950 / 29.8 dB, audio 0.9997 -- that spread is trajectory divergence
+through 8 ancestral steps, not a per-forward error (frames are the same
+scene, same fox, sub-pixel differences; `gate/out/sidebyside24.png`).
+**Policy confirmed: fp16 MMA operands, fp32 accumulate/glue, on M1-M4.**
+Per-forward speed by dtype: first attempt invalid (held an fp32 copy of the
+DiT next to the original, 5 GB swap, bf16 "340 s/forward"); clean rerun in
+section 8.
+
+## 8. Where the baseline's forward goes (2026-10-01, bf16 pack, 6,144-token stage-2 forward)
+
+Clean per-forward time is 32.1 s and is **identical for bf16, fp16 and fp32
+weights** (`gate/forward_speed.py`, one process each, no swap). Precise
+per-op profile (`gate/profile_hook2.py`, inputs evaluated before timing):
+
+| op | sec | share |
+| --- | ---: | ---: |
+| FFN proj_out linear (K=16384) x48 | 13.8 | 40% |
+| attention projections (4096x4096) x288 | 6.2 | 18% |
+| FFN proj_in linear x48 | 5.3 | 15% |
+| self-attention sdpa (32 x 6144 x 128) x48 | 3.4 | 10% |
+| all other linears, text/AV cross sdpa, norms, rope, gelu | 3.7 | 11% |
+| untracked glue (AdaLN modulate, residual, gating, reshapes) | 1.0 | 3% |
+
+Linears take 2.5-3.4x longer than the same GEMMs in isolation. Root cause
+(`gate/dtype_probe.py`): **every DiT linear and sdpa receives fp32
+activations.** The AdaLN `scale_shift_table` and the per-token AdaLN
+embedding are fp32; `rms_norm(x_bf16) * (1 + scale_fp32) + shift_fp32`
+promotes the stream to fp32, and it never comes back (nn.Linear with
+fp32 x and bf16 w runs an fp32 GEMM). Measured: proj_out GEMM with fp32 x
+= 286 ms vs 83 ms with bf16/fp16 x (3.4x). So the "best Mac path" runs an
+fp32 DiT by accident on a GPU whose fp16 MMA is 2x the fp32 rate, and the
+q8 pack is faster only because quantized_matmul has its own kernel.
+
+Consequence for section 7: the "bf16 vs fp16" per-forward delta measured
+there came from the runner's **entry casts** (latent, timestep/sigma, text
+embeds cast to the DiT dtype at the model boundary; bf16 ulp at timestep
+~422 is 2.0, fp16 ulp is 0.25), not from MMA operand precision -- the
+operands were fp32 in all three runs. Corrected gate in section 9.
+
+## 9. Corrected precision + speed gate (2026-10-01, identical captured stage-2 inputs, 6,144 tokens, `gate/forward_gate3.py`)
+
+Truth = fp32 weights, fp32 activations, fp32 entry. Repeat of truth = bit-identical (deterministic).
+
+| config | s/forward | video rel-L2 vs truth | video cos | audio rel-L2 |
+| --- | ---: | ---: | ---: | ---: |
+| fp32 everything (truth) | 32.3 | 0 | 1 | 0 |
+| fp16 weights, fp32 operands | 32.3 | 0.00000 (bf16->fp16 weight cast is exact) | 1.000000 | 0 |
+| **fp16 operands (linear + sdpa), fp32 glue = our policy** | **13.7** | **0.0071** | 0.999975 | 0.0011 |
+| bf16 operands, fp32 glue | 17.4 | 0.0350 | 0.999392 | 0.0054 |
+| runner as-is (fp32 operands, bf16 entry casts) | 32.1 | 0.0422 | 0.999113 | 0.0254 |
+
+Reading: on M1-M4 the fp16-operand path is 2.36x the baseline's forward
+with zero custom kernels, and its deviation from fp32 is 6x smaller than
+the baseline's own (the baseline's error is its bf16 entry cast of
+timestep/latents, not its GEMMs). bf16 operands are 5x less accurate than
+fp16 and 27% slower. **Decision confirmed: fp16 MMA operands, fp32
+accumulate and glue, fp32 model boundary (timestep, sigma, latents, text
+embeds). No quantization on M1-M4.** Baseline packs run bf16 weights that
+convert to fp16 exactly, so the official bf16 checkpoint is the weight
+source with no conversion loss.
+
+## 10. Ranked optimization opportunities on M1 Ultra (2026-10-01 close of investigation)
+
+fp16-operand forward, 6,144 tokens, precise profile (`LTX_OPCAST=fp16`,
+16.6 s sync-inflated / 13.7 s clean; physics at measured kernel ceilings
+~11.4 s, at 100% ALU ~10 s):
+
+| op | sec | share | ceiling | note |
+| --- | ---: | ---: | --- | --- |
+| FFN proj_out GEMM (K=16384) x48 | 4.07 | 24.5% | ~2.0 s | MLX GEMM hits 10 TF/s at K=16384 vs 19 at K=4096: tile/split-K problem, custom kernel target #1 |
+| attention projections 4096^2 x288 | 3.59 | 21.6% | ~3.3 s | at 18.7 TF/s already |
+| FFN proj_in GEMM x48 | 2.25 | 13.5% | ~2.1 s | at 19 TF/s already |
+| self-attn sdpa 32x6144x128 x48 | 1.96 | 11.8% | ~1.5 s | 15.1 -> ~19 TF/s with a flash kernel; grows to ~40% of FLOPs at 24k tokens |
+| AV/text cross projections + sdpa | ~1.9 | 11% | ~1.7 s | small |
+| norms, rope, gelu, gating, AdaLN, casts (tracked small ops + untracked) | ~2.8 | 17% | ~1.0 s | fusion target: rmsnorm+modulate+cast, gated-attention epilogue, rope-in-projection |
+
+End-to-end, 768x512x121 distilled, same seed, this box:
+
+| config | wall | vs bf16 baseline | vs q8 baseline |
+| --- | ---: | ---: | ---: |
+| baseline bf16 pack (as shipped) | 202.4 s | 1.00 | |
+| baseline q8 pack (its recommended config) | 116.9 s | 1.73x | 1.00 |
+| **baseline + our precision policy shimmed in (no kernels)** | **100.4 s** | **2.02x** | **1.16x** |
+| projected: our engine, same policy + kernel waves + 2x VAE | ~73 s (est.) | ~2.8x | ~1.6x |
+
+The 100.4 s splits: Gemma load+encode 8 s, DiT load 3 s, stage 1 8 x 3.5 s
+= 28 s, stage 2 3 x 13.4 s = 40 s, conv VAE decode 17.6 s, misc ~4 s.
+
+Ranked levers (M1 Ultra, output-preserving):
+1. **Precision path** (fp16 operands, fp32 glue, fp32 boundary): 2.36x on
+   the DiT, measured; strictly more accurate than the baseline. Table stakes
+   for the engine; no kernel work.
+2. **Conv3d VAE decode**: 17.6 s / 100 s at 768x512, 84 s / 505 s at
+   1536x1024, 53 GB peak. Draw Things' implicit-GEMM conv3d is 2.4x on
+   M1-M4 and MLX's conv3d is a per-frame Winograd decomposition. Largest
+   absolute lever at HD; also the memory lever (untiled decode killed the
+   baseline at HD).
+3. **Large-K GEMM** (FFN proj_out): ~2 s/forward, 15% of the DiT.
+4. **Flash attention** D128 fp16 with fp32 statistics + gated epilogue:
+   ~0.5 s/forward at 6k, ~12% of the forward at 24k tokens.
+5. **Glue fusion**: ~1-1.5 s/forward (8-10%).
+6. **Fixed costs**: Gemma-4 encode 8 s/prompt (resident fp16 encoder,
+   ~3 s), model load 3 s (mmap, residency set), audio path.
+7. **Dev pipeline**: 4-way guidance batch already gives M=24k GEMMs; the
+   same forward-level gains apply (606.9 s baseline -> ~375 s projected).
+
+Output-changing tier (opt-in profile flags, measured separately):
+TeaCache/FBCache (1.5-2x on step count), spatial tiling (baseline's
+`--tile-spatial 2`: 24k-token forward 111 -> 81 s), sparse attention at
+HD. M5 adds the int8 W8A8 GEMM path (1.6-1.9x on ~70% of the forward).
+
+Honest ceiling: the M1 Ultra DiT at fp16 is within ~1.2x of its measured
+kernel ceiling once the precision path is in. The remaining big absolute
+wins are the VAE, HD attention, and the opt-in tiers.
+
+## 11. Reference: QuixiAI/h3.c (antirez MiniMax-H3 engine, Eric's fork; clone at `~/.local/scratch/ltx25/ref/h3.c`)
+
+Metal side is mostly MPSGraph: DiT attention = MPSGraph SDPA (no flash
+kernel), conv3d/VAEs = MPSGraph fp32, M1-M4 GEMMs = MPSGraph matmul. Own
+kernels: fused gate+residual+RMSNorm+AdaLN (per-token modulation table via
+row_map), rotate-half RoPE in the QKV epilogue, GGUF span decoders +
+simdgroup-bf16 GEMM (~5x slower than bf16 on M5), M5-only TensorOps bf16 and
+int8 GEMMs (per-row activation scales, per-channel weight scales, grouped-K
+FC2). bf16 everywhere with fp32 reductions/accumulators; no fp16 path;
+validated on M3 Max / M5 Max only. perf/ docs in the fork are the CUDA
+campaign. Transfers: AdaLN fusion pattern + modulation tables, M5 int8 GEMM
+structure, command-buffer overlap, arena aliasing, mmap no-copy weights,
+two-slot SSD streamer, bench/test harness discipline. Does not transfer:
+attention, VAE (transformer decoder there, causal conv3d here), SwiGLU
+epilogue. Eric's fork commits: GGUF in-place decoding, studio UI, CUDA
+backend, perf docs (2026-08-12..25).
+
+## 12. Architecture decision (2026-10-02)
+
+Subsystem of SlimServe (Sean's call), brought up in SlimServe first, then
+kernels upstreamed to QuixiCore-Metal as a separate PR (the standing
+flow). Host recommended: Python orchestration on MLX with custom kernels in
+QuixiCore-Metal via its MLX binding (MLX GEMM at ~90% / SDPA at ~73% of
+peak measured here; the 2.36x precision lever needs no kernels; vllm-mlx
+env already exists). Alternatives considered: torch-MPS host (slow linear
+path, residency/alloc-churn pain from the LLM retrospective), C/Metal
+engine a la h3.c (months of loader/encoder/VAE/mux work before first frame;
+h3 still ended on MPSGraph for attention and conv). Awaiting Sean's go.
