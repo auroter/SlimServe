@@ -258,9 +258,10 @@ class VideoVAE:
     ENC = (("res", 4), ("down", (1, 2, 2)), ("res", 6), ("down", (2, 1, 1)), ("res", 4),
            ("down", (2, 2, 2)), ("res", 2), ("down", (2, 2, 2)), ("res", 2))
 
-    def __init__(self, root: Path | None = None, dtype: mx.Dtype = G):
+    def __init__(self, root: Path | None = None, dtype: mx.Dtype = G, stream: mx.Dtype | None = None):
         self.path = checkpoints.path_of("video-vae", root)
-        self.dtype = dtype
+        self.dtype = dtype  # conv operands (weights and conv inputs)
+        self.stream = stream or dtype  # activations between convs: norm, SiLU, residual
         self.w: dict[str, mx.array] = {}
         self.config: dict[str, Any] = {}
 
@@ -294,7 +295,8 @@ class VideoVAE:
         return latent.astype(G) * self.std + self.mean
 
     def _conv(self, name: str, x: mx.array, causal: bool) -> mx.array:
-        return conv3d(x, self.w[name + ".conv.weight"], self.w[name + ".conv.bias"], causal, name)
+        y = conv3d(x.astype(self.dtype), self.w[name + ".conv.weight"], self.w[name + ".conv.bias"], causal, name)
+        return y.astype(self.stream)
 
     def _res(self, p: str, n: int, x: mx.array, causal: bool) -> mx.array:
         for i in range(n):
@@ -309,7 +311,7 @@ class VideoVAE:
         activations are released before the next (larger) one; values are
         unchanged.
         """
-        x = self.denormalize(latent).transpose(0, 2, 3, 4, 1).astype(self.dtype)
+        x = self.denormalize(latent).transpose(0, 2, 3, 4, 1).astype(self.stream)
         x = self._conv("decoder.conv_in", x, False)
         for i, (kind, arg) in enumerate(self.DEC):
             p = f"decoder.up_blocks.{i}"

@@ -79,6 +79,60 @@ class Denoiser:
         return x0_from_velocity(vx, v, t if vt is None else vt), x0_from_velocity(ax, a, t if at is None else at)
 
 
+class GuidedDenoiser:
+    """Dev-model x0 with CFG + STG + modality guidance.
+
+    The four passes (conditional, negative prompt, self-attention skipped on
+    the STG blocks, audio<->video cross-attention skipped everywhere) run as
+    one batch of four: the same FLOPs as four forwards, with every GEMM at 4x
+    the rows.
+    """
+
+    PASSES = 4
+
+    def __init__(self, dit: LTX25DiT, cond: tuple[mx.array, mx.array], negative: tuple[mx.array, mx.array],
+                 video: sampling.Guidance, audio: sampling.Guidance, batched: bool = True):
+        self.dit, self.video_g, self.audio_g, self.batched = dit, video, audio, batched
+        self.video_text = mx.concatenate([cond[0], negative[0], cond[0], cond[0]], axis=0)
+        self.audio_text = mx.concatenate([cond[1], negative[1], cond[1], cond[1]], axis=0)
+        keep_stg = mx.array([1.0, 1.0, 0.0, 1.0])
+        keep_mod = mx.array([1.0, 1.0, 1.0, 0.0])
+        self.stg: dict[tuple[str, int], mx.array] = {}
+        for blk in video.stg_blocks:
+            self.stg[("video_self", blk)] = keep_stg
+        for blk in audio.stg_blocks:
+            self.stg[("audio_self", blk)] = keep_stg
+        for blk in range(dit.cfg.num_layers):
+            self.stg[("a2v", blk)] = keep_mod
+            self.stg[("v2a", blk)] = keep_mod
+
+    def _forward(self, video: LatentState, audio: LatentState, vx, ax, sigma: float, rows: slice):
+        n = len(range(*rows.indices(self.PASSES)))
+        rep = lambda x: None if x is None else mx.repeat(x, n, axis=0)  # noqa: E731
+        t = mx.full((n,), sigma, dtype=G)
+        vt = None if video.uniform else rep((video.denoise_mask * sigma).squeeze(-1))
+        at = None if audio.uniform else rep((audio.denoise_mask * sigma).squeeze(-1))
+        v, a = self.dit(
+            rep(vx), rep(ax), t, self.video_text[rows], self.audio_text[rows],
+            rep(video.positions), rep(audio.positions),
+            video_keyframes_mask=rep(video.keyframes_mask), video_timesteps=vt, audio_timesteps=at,
+            video_attention_mask=video.attention_mask, audio_attention_mask=audio.attention_mask,
+            stg={k: m[rows] for k, m in self.stg.items()},
+        )
+        return (x0_from_velocity(rep(vx), v, t if vt is None else vt),
+                x0_from_velocity(rep(ax), a, t if at is None else at))
+
+    def __call__(self, video: LatentState, audio: LatentState, vx: mx.array, ax: mx.array, sigma: float):
+        if self.batched:
+            v0, a0 = self._forward(video, audio, vx, ax, sigma, slice(0, 4))
+        else:
+            parts = [self._forward(video, audio, vx, ax, sigma, slice(i, i + 1)) for i in range(4)]
+            v0 = mx.concatenate([p[0] for p in parts], axis=0)
+            a0 = mx.concatenate([p[1] for p in parts], axis=0)
+        return (self.video_g.combine(v0[0:1], v0[1:2], v0[2:3], v0[3:4]),
+                self.audio_g.combine(a0[0:1], a0[1:2], a0[2:3], a0[3:4]))
+
+
 class LTX25Engine:
     """Resident components plus the pipelines that run on them."""
 
@@ -94,6 +148,7 @@ class LTX25Engine:
         self.vae = None
         self.upscaler = None
         self.audio = None
+        self.distilled_lora = None
 
     # ---- components -------------------------------------------------------
     def load_text(self):
@@ -147,6 +202,23 @@ class LTX25Engine:
         free = total - mx.get_active_memory() - OS_RESERVE_BYTES
         return int(max(4 << 30, min(free, total // 2)))
 
+    @staticmethod
+    def _stepper(tm: Timings, on_step):
+        def stepper(stage: str):
+            t_last = [time.perf_counter()]
+
+            def cb(i: int, sigma: float) -> None:
+                mx.synchronize()
+                now = time.perf_counter()
+                tm.steps.append((stage, i, now - t_last[0]))
+                t_last[0] = now
+                if on_step:
+                    on_step(stage, i, sigma)
+
+            return cb
+
+        return stepper
+
     # ---- distilled --------------------------------------------------------
     def distilled(
         self,
@@ -180,18 +252,7 @@ class LTX25Engine:
         audio_t = sampling.audio_token_count(num_frames, fps)
         apos = sampling.audio_positions(audio_t)
 
-        def stepper(stage: str):
-            t_last = [time.perf_counter()]
-
-            def cb(i: int, sigma: float) -> None:
-                mx.synchronize()
-                now = time.perf_counter()
-                tm.steps.append((stage, i, now - t_last[0]))
-                t_last[0] = now
-                if on_step:
-                    on_step(stage, i, sigma)
-
-            return cb
+        stepper = self._stepper(tm, on_step)
 
         # Stage 1: half resolution, from pure noise, ancestral Euler.
         with tm.span("stage1"):
@@ -222,6 +283,85 @@ class LTX25Engine:
                 denoise, video, audio, sampling.STAGE_2_DISTILLED_SIGMAS, on_step=stepper("stage2"))
 
         return Result(sampling.unpatchify(v2, (f, h2, w2)), a2, num_frames, height, width, fps, tm)
+
+    # ---- dev --------------------------------------------------------------
+    def load_distilled_lora(self):
+        if self.distilled_lora is None:
+            from slimserve.video.ltx25.lora import Lora
+
+            self.distilled_lora = Lora("distilled-lora", self.root).load()
+        return self.distilled_lora
+
+    def dev(
+        self,
+        prompt: str,
+        height: int = 1024,
+        width: int = 1536,
+        num_frames: int = 121,
+        fps: float = 24.0,
+        seed: int = 42,
+        negative_prompt: str | None = None,
+        steps: int = 30,
+        video_guidance: sampling.Guidance = sampling.Guidance(cfg=3.0),
+        audio_guidance: sampling.Guidance = sampling.Guidance(cfg=7.0),
+        batched: bool = True,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+    ) -> Result:
+        """Lightricks' TI2VidTwoStagesPipeline: guided dev stage 1 at half
+        resolution, 2x latent upscale, 3-step stage 2 with the distilled LoRA
+        and no guidance. Audio is taken from stage 1, as upstream."""
+        if self.variant != "dev":
+            raise ValueError("the dev pipeline needs LTX25Engine(variant='dev')")
+        tm = Timings()
+        with tm.span("text"):
+            text = self.load_text()
+            cond = text.encode(prompt)[:2]
+            neg = text.encode(sampling.DEFAULT_NEGATIVE_PROMPT if negative_prompt is None else negative_prompt)[:2]
+            mx.eval(cond, neg)
+            if not keep_text:
+                self.unload_text()
+        with tm.span("load"):
+            dit = self.load_dit()
+            vae = self.load_vae()
+            upscaler = self.load_upscaler()
+            lora = self.load_distilled_lora()
+
+        height, width = sampling.snap_dimensions(height, width, two_stage=True)
+        f, h1, w1 = sampling.video_latent_shape(num_frames, height // 2, width // 2)
+        audio_t = sampling.audio_token_count(num_frames, fps)
+        apos = sampling.audio_positions(audio_t)
+        stepper = self._stepper(tm, on_step)
+
+        with tm.span("stage1"):
+            video = sampling.noised_state(
+                (1, f * h1 * w1, 128), sampling.video_positions(f, h1, w1, fps), seed,
+                tokens_per_frame=h1 * w1, bf16_noise=self.bf16_noise)
+            audio = sampling.noised_state((1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise)
+            guided = GuidedDenoiser(dit, cond, neg, video_guidance, audio_guidance, batched)
+            v1, a1 = sampling.euler_loop(
+                guided, video, audio, sampling.ltx2_schedule(steps, f * h1 * w1), on_step=stepper("stage1"))
+
+        with tm.span("upscale"):
+            up = vae.normalize(upscaler(vae.denormalize(sampling.unpatchify(v1, (f, h1, w1)))))
+            mx.eval(up)
+
+        with tm.span("stage2"):
+            h2, w2 = h1 * 2, w1 * 2
+            s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
+            video = sampling.noised_state(
+                (1, f * h2 * w2, 128), sampling.video_positions(f, h2, w2, fps), seed + 2, sigma=s0,
+                initial=sampling.patchify(up), tokens_per_frame=h2 * w2, bf16_noise=self.bf16_noise)
+            audio = sampling.noised_state(
+                (1, audio_t, 128), apos, seed + 2, sigma=s0, initial=a1, bf16_noise=self.bf16_noise)
+            lora.attach(dit)
+            try:
+                v2, _ = sampling.euler_loop(
+                    Denoiser(dit, *cond), video, audio, sampling.STAGE_2_DISTILLED_SIGMAS, on_step=stepper("stage2"))
+            finally:
+                lora.detach(dit)
+
+        return Result(sampling.unpatchify(v2, (f, h2, w2)), a1, num_frames, height, width, fps, tm)
 
     # ---- decode -----------------------------------------------------------
     def render(self, result: Result, path: str | Path, seed: int = 42) -> Path:

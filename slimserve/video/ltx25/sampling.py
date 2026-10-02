@@ -197,3 +197,54 @@ def euler_ancestral_loop(
 
 def with_latent(state: LatentState, latent: mx.array) -> LatentState:
     return replace(state, latent=latent)
+
+
+# ---- dev (guided) ---------------------------------------------------------
+DEFAULT_NEGATIVE_PROMPT = (
+    "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, "
+    "grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, "
+    "deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, "
+    "wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of "
+    "field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent "
+    "lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny "
+    "valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, "
+    "mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, "
+    "off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward "
+    "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, "
+    "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
+)
+
+
+def ltx2_schedule(steps: int, num_tokens: int, base_shift: float = 0.95, max_shift: float = 2.05,
+                  terminal: float = 0.1) -> list[float]:
+    """Token-count-shifted schedule (LinearQuadratic family), stretched so the last non-zero sigma is `terminal`."""
+    import math
+
+    import numpy as np
+
+    sigmas = np.linspace(1.0, 0.0, steps + 1)
+    slope = (max_shift - base_shift) / (4096 - 1024)
+    shift = num_tokens * slope + base_shift - slope * 1024
+    nz = sigmas != 0
+    sigmas[nz] = math.exp(shift) / (math.exp(shift) + (1.0 / sigmas[nz] - 1.0))
+    one_minus = 1.0 - sigmas[nz]
+    scale = one_minus[-1] / (1.0 - terminal)
+    if scale != 0:
+        sigmas[nz] = 1.0 - one_minus / scale
+    return sigmas.tolist()
+
+
+@dataclass(frozen=True)
+class Guidance:
+    cfg: float = 3.0
+    stg: float = 1.0
+    modality: float = 3.0
+    rescale: float = 0.7
+    stg_blocks: tuple[int, ...] = (28,)
+
+    def combine(self, cond: mx.array, uncond: mx.array, perturbed: mx.array, isolated: mx.array) -> mx.array:
+        pred = cond + (self.cfg - 1) * (cond - uncond) + self.stg * (cond - perturbed) + (self.modality - 1) * (cond - isolated)
+        if self.rescale:
+            factor = mx.sqrt(mx.var(cond)) / (mx.sqrt(mx.var(pred)) + 1e-8)
+            pred = pred * (self.rescale * factor + (1 - self.rescale))
+        return pred
