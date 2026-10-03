@@ -635,3 +635,22 @@ worked around; `n7_metal_kernel_race.py`, `n7_mlx_2e31_split.py`):
 Validated: the 10 s 1216x640 clip's decode is deterministic across runs and
 within 36-38 dB of the conv decoder on every frame (no frame under 20 dB;
 before the fixes the last 12 frames were garbage).
+
+## 19. Demo renders at the recommended settings (2026-10-02, for the PR, pending review)
+
+Prompt `~/.local/scratch/ltx25/demo/prompt_v3.txt` (cathedral, blue service
+door, two cat-headed alchemists, pinball arcade; three named cuts), 1216x640,
+241 frames (10 s; the largest 10 s size inside the 24,576-token envelope),
+seed 7, diffusion decoder, cold process through `slimserve <id> -p`:
+
+| mode | wall | stage 1 | stage 2 | decode | notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| distilled (prompt v2) | 475 s | 92.6 | 195.1 | 167.2 | sharp; alchemists came out as men with cat ears |
+| DFR | 730 s | 125.7 | 426.0 (3 x 142 s at ~37k tokens) | 158.0 | best adherence: cat faces, floor mural; identity bleed (her hair on the alchemists, a robe on her in the arcade) |
+| dev, 30 steps | 1495 s | 1116.2 | 219.3 | 137.6 | cat faces; rendered the last cut as 0.75 s of black and framed the arcade shot like a screen |
+
+Decoder output verified per frame against the conv decoder (36-38 dB
+everywhere; the pre-fix tail was 15 dB). The remaining flaws are generation
+and prompt behaviour, not engine faults; the prompt's identity bleed is the
+next thing to iterate (contrasting traits for the alchemists, re-describe
+her at each cut).
