@@ -3770,7 +3770,8 @@
             "num_frames": 121,
             "fps": 24.0,
             "max_video_tokens": 24576,
-            "served_model_name": "LTX-2.5"
+            "decoder": "diffusion",
+        "served_model_name": "LTX-2.5"
           },
           "notes": [
             "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
@@ -3785,7 +3786,7 @@
       "title": "LTX-2.5 dev (two-stage, guided) on Apple Silicon",
       "source": "ltx25",
       "gpus": 1,
-      "summary": "Audio+video generation with Lightricks' TI2VidTwoStagesPipeline: 30 guided steps (CFG 3.0 video / 7.0 audio, STG 1.0 on block 28, modality 3.0, rescale 0.7) at half resolution, 2x latent upscale, 3 steps with the distilled LoRA. The quality path: 768x512x121 in 343 s cold on an M1 Ultra (the fastest prior Mac path: 607 s).",
+      "summary": "Audio+video generation with Lightricks' TI2VidTwoStagesPipeline: 30 guided steps (CFG 3.0 video / 7.0 audio, STG 1.0 on block 29, modality 3.0, rescale 0.7) at half resolution, 2x latent upscale, 3 steps with the distilled LoRA. The quality path: 768x512x121 in 343 s cold on an M1 Ultra (the fastest prior Mac path: 607 s).",
       "speculative": false,
       "variants": {
         "metal": {
@@ -3798,12 +3799,13 @@
             "num_frames": 121,
             "fps": 24.0,
             "max_video_tokens": 24576,
-            "served_model_name": "LTX-2.5"
+            "decoder": "diffusion",
+        "served_model_name": "LTX-2.5"
           },
           "notes": [
             "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
             "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
-            "The four guidance passes of a step run as one batch; the STG pass is forked from the conditional pass at block 28 and the conditional-text passes share their text K/V (exact). One guided step matches the reference pass by pass on identical inputs (rel-L2 <= 0.0064, the reference's own bf16 error).",
+            "The four guidance passes of a step run as one batch; the STG pass is forked from the conditional pass at block 29 and the conditional-text passes share their text K/V (exact). One guided step matches the reference pass by pass on identical inputs (rel-L2 <= 0.0064, the reference's own bf16 error).",
             "The distilled LoRA (rank 450) is a runtime low-rank term in stage 2: +22% per forward on 3 forwards, 8.3 GiB instead of a second 39 GiB transformer, exact detach. negative_prompt is accepted; the default is Lightricks' DEFAULT_NEGATIVE_PROMPT."
           ]
         }
@@ -3826,7 +3828,8 @@
             "num_frames": 121,
             "fps": 24.0,
             "max_video_tokens": 24576,
-            "served_model_name": "LTX-2.5"
+            "decoder": "diffusion",
+        "served_model_name": "LTX-2.5"
           },
           "notes": [
             "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",

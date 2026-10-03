@@ -115,6 +115,12 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         "fps": fps,
         "seed": int(body.get("seed", 42)),
     }
+    decoder = str(body.get("decoder", cfg.get("decoder", "diffusion")))
+    if decoder not in ("diffusion", "conv"):
+        raise BadRequest(
+            "decoder must be 'diffusion' (default, sharper) or 'conv' (faster)"
+        )
+    params["decoder"] = decoder
     if "negative_prompt" in body:
         if cfg["pipeline"] != "dev":
             raise BadRequest(
@@ -164,6 +170,8 @@ class VideoService:
         engine.load_vae()
         engine.load_upscaler()
         engine.load_audio()
+        if self.cfg.get("decoder", "diffusion") == "diffusion":
+            engine.load_diffvae()
         if pipeline == "dev":
             engine.load_distilled_lora()
         elif pipeline == "dfr":
@@ -204,10 +212,11 @@ class VideoService:
         def on_step(stage: str, index: int, sigma: float) -> None:
             job.progress = {"stage": stage, "step": index + 1}
 
+        decoder = p.pop("decoder", None)
         result = getattr(engine, self.cfg["pipeline"])(prompt, on_step=on_step, **p)
         job.progress = {"stage": "decode"}
         path = self.output_dir / f"{job.id}.mp4"
-        engine.render(result, path, seed=p["seed"])
+        engine.render(result, path, seed=p["seed"], decoder=decoder)
         job.path = path
         tm = result.timings
         job.timings = {

@@ -57,7 +57,7 @@ DiT, same kernels:
 | id | pipeline (upstream class) | stage 1 | stage 2 | role |
 | --- | --- | --- | --- | --- |
 | `ltx25-distilled` | DistilledPipeline | 8 ancestral steps, half res, CFG 1 | 2x latent upscale, 3 steps, distilled LoRA | fast / iterate |
-| `ltx25-dev` | TI2VidTwoStages | 30 steps x 4 guided passes (CFG 3.0, STG 1.0 on block 28, modality 3.0), half res | same | quality |
+| `ltx25-dev` | TI2VidTwoStages | 30 steps x 4 guided passes (CFG 3.0, STG 1.0 on block 29, modality 3.0), half res | same | quality |
 | `ltx25-dfr` | DFRPipeline | distilled + 5 generated keyframe slots | upscale, spatial-detailing epilogue with the official IC-LoRA (strength 0.5), optional temporal rounds (+8 steps each) | production (Lightricks' label) |
 
 Dev vs distilled is the user's choice (test an idea vs render the final);

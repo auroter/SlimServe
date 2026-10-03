@@ -41,7 +41,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     from slimserve.video.ltx25.pipeline import LTX25Engine
 
     body = {"prompt": args.prompt}
-    for key in ("size", "seconds", "seed", "negative_prompt"):
+    for key in ("size", "seconds", "seed", "negative_prompt", "decoder"):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
     try:
@@ -55,13 +55,14 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         root=cfg["root"], variant="dev" if cfg["pipeline"] == "dev" else "distilled"
     )
     prompt = params.pop("prompt")
+    decoder = params.pop("decoder")
     result = getattr(engine, cfg["pipeline"])(
         prompt,
         keep_text=False,
         on_step=lambda stage, i, s: term.note(f"{stage} step {i + 1}"),
         **params,
     )
-    engine.render(result, out, seed=params["seed"])
+    engine.render(result, out, seed=params["seed"], decoder=decoder)
     spans = ", ".join(f"{k} {v:.1f}s" for k, v in result.timings.spans.items())
     term.ok(
         f"{out}  {params['width']}x{params['height']}x{params['num_frames']}  "

@@ -115,6 +115,14 @@ def test_request_outside_the_envelope_is_refused(body):
         server.normalize_request(body, CFG)
 
 
+def test_decoder_defaults_to_diffusion_and_accepts_conv():
+    assert server.normalize_request({"prompt": "x"}, CFG)["decoder"] == "diffusion"
+    req = {"prompt": "x", "decoder": "conv"}
+    assert server.normalize_request(req, CFG)["decoder"] == "conv"
+    with pytest.raises(server.BadRequest):
+        server.normalize_request({"prompt": "x", "decoder": "fast"}, CFG)
+
+
 def test_negative_prompt_reaches_the_dev_pipeline():
     params = server.normalize_request(
         {"prompt": "x", "negative_prompt": "blurry"}, {**CFG, "pipeline": "dev"}
@@ -150,7 +158,8 @@ class _FakeEngine:
 
         return _Result()
 
-    def render(self, result, path, seed=42):
+    def render(self, result, path, seed=42, decoder=None):
+        self.decoders = getattr(self, "decoders", []) + [decoder]
         path.write_bytes(b"mp4")
         return path
 

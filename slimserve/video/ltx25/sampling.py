@@ -272,7 +272,9 @@ class Guidance:
     stg: float = 1.0
     modality: float = 3.0
     rescale: float = 0.7
-    stg_blocks: tuple[int, ...] = (28,)
+    # Upstream LTX-2.5 constants.py: stg_blocks=[29] (0-based). The Mac baseline
+    # still carries 2.3's [28].
+    stg_blocks: tuple[int, ...] = (29,)
 
     def combine(
         self, cond: mx.array, uncond: mx.array, perturbed: mx.array, isolated: mx.array

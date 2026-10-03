@@ -83,6 +83,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     video.add_argument("--seed", type=int, help="random seed (default 42)")
     video.add_argument("--negative-prompt", help="dev pipeline only")
+    video.add_argument(
+        "--decoder",
+        choices=["diffusion", "conv"],
+        help=(
+            "video decoder: diffusion (default, sharper) "
+            "or conv (about 4x faster decode)"
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -334,7 +342,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.serve and args.prompt:
-        parser.error("--prompt runs one conversation and cannot be combined with --serve")
+        parser.error(
+            "--prompt runs one conversation and cannot be combined with --serve"
+        )
 
     if args.help:
         _help()

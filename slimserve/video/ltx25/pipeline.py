@@ -218,6 +218,7 @@ class LTX25Engine:
         root: Path | None = None,
         variant: str = "distilled",
         bf16_noise: bool = False,
+        decoder: str = "diffusion",
     ):
         self.root = root or checkpoints.model_root()
         # Metal memory is wired: it cannot be compressed or swapped, and MLX's
@@ -234,6 +235,8 @@ class LTX25Engine:
         self.audio = None
         self.distilled_lora = None
         self.detail_lora = None
+        self.diffvae = None
+        self.decoder = decoder
 
     # ---- components -------------------------------------------------------
     def load_text(self):
@@ -656,27 +659,61 @@ class LTX25Engine:
         )
 
     # ---- decode -----------------------------------------------------------
-    def render(self, result: Result, path: str | Path, seed: int = 42) -> Path:
+    def load_diffvae(self):
+        if self.diffvae is None:
+            from slimserve.video.ltx25.diffvae import DiffusionVAE
+
+            self.diffvae = DiffusionVAE(self.root).load()
+        return self.diffvae
+
+    def render(
+        self,
+        result: Result,
+        path: str | Path,
+        seed: int = 42,
+        decoder: str | None = None,
+    ) -> Path:
+        """Decode and mux. `decoder`: "diffusion" (Lightricks' default: sharper
+        faces, textures and text; ~4x the decode time) or "conv"."""
         from slimserve.video.ltx25 import mux
 
+        decoder = decoder or self.decoder
         tm = result.timings
         with tm.span("vae_decode"):
             from slimserve.video.ltx25 import vae as vae_mod
 
-            vae = self.load_vae()
-            # An untiled decode is exact and fastest. If the resident text
-            # encoder is what stands in the way, release it (4.8 s to reload)
-            # rather than blend tiles.
-            if (
-                vae_mod.estimate_peak_bytes(result.video_latent.shape, None)
-                > self.decode_budget()
-            ):
-                self.unload_text()
-            frames = vae.decode(
-                result.video_latent,
-                frame_rate=result.fps,
-                budget_bytes=self.decode_budget(),
-            )
+            if decoder == "diffusion":
+                from slimserve.video.ltx25 import diffvae as diff_mod
+
+                need = diff_mod.estimate_peak_bytes(result.video_latent.shape)
+                if need > self.decode_budget():
+                    self.unload_text()
+                if need > self.decode_budget():
+                    raise MemoryError(
+                        f"the diffusion decoder needs ~{need >> 30} GiB "
+                        "for this clip and "
+                        f"{self.decode_budget() >> 30} GiB are free "
+                        "next to the resident models; "
+                        "use decoder=conv or a smaller clip"
+                    )
+                pixels = self.load_diffvae().decode_raw(result.video_latent, seed=seed)
+                frames = vae_mod.to_uint8(pixels)
+                del pixels
+            else:
+                vae = self.load_vae()
+                # An untiled decode is exact and fastest. If the resident text
+                # encoder is what stands in the way, release it (4.8 s to
+                # reload) rather than blend tiles.
+                if (
+                    vae_mod.estimate_peak_bytes(result.video_latent.shape, None)
+                    > self.decode_budget()
+                ):
+                    self.unload_text()
+                frames = vae.decode(
+                    result.video_latent,
+                    frame_rate=result.fps,
+                    budget_bytes=self.decode_budget(),
+                )
         with tm.span("audio_decode"):
             waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
         with tm.span("mux"):
