@@ -31,6 +31,8 @@ an attention kernel, ~1.5% short / ~5% HD). User and design documentation:
 | 768x512x121 | DFR | 170.9 s | 125 s |
 | 1536x1024x121 | distilled | 504.9 s tiled | 343 s untiled |
 
+Done since: the diffusion VAE decoder (default now, Metal neighborhood-attention
+kernel, ledger section 18), STG block 29, a recommended-workflow audit.
 Not done: I2V conditioning, DFR temporal rounds and second spatial epilogue,
 duration head, prompt enhancer, res_2s, the opt-in tier, any hand-written
 Metal kernel (measured headroom on M1-M4 is at most ~10% of a forward; see

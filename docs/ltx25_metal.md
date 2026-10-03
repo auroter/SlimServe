@@ -39,7 +39,9 @@ GET    /health, /v1/models
 ```
 
 `"wait": true` holds the POST open until the clip is done. `negative_prompt`
-is accepted by `ltx25-dev` only. Width and height are multiples of 64, frame
+is accepted by `ltx25-dev` only. `decoder` is `diffusion` (default, Lightricks'
+recommended decoder: sharper faces, textures and text) or `conv` (about 4x
+faster decode); the CLI flag is `--decoder`. Width and height are multiples of 64, frame
 counts are 8k + 1. Requests larger than the profile's validated clip
 (1536x1024x121, 24,576 latent tokens) are refused with a 400: that envelope is
 what was measured to fit in memory. There is one GPU, so requests run one at
@@ -55,12 +57,14 @@ a cold process, prompt to mp4, including model loads.
 
 | clip | pipeline | baseline q8 | baseline bf16 | SlimServe | vs q8 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 768x512x121 | distilled | 116.9 s | 202.4 s | **86 s** cold, **71 s** resident | 1.36x |
+| 768x512x121 | distilled, conv decoder | 116.9 s | 202.4 s | **86 s** cold, **71 s** resident | 1.36x |
 | 768x512x121 | dev, 30 steps | 606.9 s | | **343 s** | 1.77x |
 | 768x512x121 | DFR | 170.9 s | | **125 s** | 1.37x |
 | 1536x1024x121 | distilled | 504.9 s (tiled attention and decode; untiled dies in decode) | | **343 s**, untiled | 1.47x |
 
-SlimServe runs the unquantized official weights; the q8 baseline is an 8-bit
+The baseline rows use its conv decoder; with the diffusion decoder (now the
+default, ledger section 18) add about 23 s to a 768x512 clip and 127 s to an
+HD one. SlimServe runs the unquantized official weights; the q8 baseline is an 8-bit
 pack. Per-forward accuracy against an fp32 run of the same weights on
 identical inputs: SlimServe rel-L2 0.0069, the baseline as shipped 0.042.
 Evidence, per-op profiles and every intermediate number are in
@@ -93,13 +97,18 @@ Evidence, per-op profiles and every intermediate number are in
 6. **Runtime adapters.** The rank-450 distilled LoRA and the detailing
    IC-LoRA are applied as low-rank terms next to the base GEMM. No second
    39 GiB transformer, no reload between stages, exact detach.
-7. **Shape-aware convolutions.** MLX's conv3d runs 1024-channel layers on
+7. **Diffusion decoder with a Metal neighborhood-attention kernel.** The
+   recommended decoder's 3-D neighborhood attention has no fast MLX op; the
+   baseline's formulation took 69 s for 49 frames. One Metal kernel (eight
+   lanes per query, fp32 online softmax) decodes the same in 9 s, exact to
+   1e-7 against a reference, and the 121-frame clip in 30 s.
+8. **Shape-aware convolutions.** MLX's conv3d runs 1024-channel layers on
    small grids at 1.5 TF/s; those run as per-tap split-K GEMMs instead (the
    upscaler 2.5 to 0.45 s), chosen per shape by a persisted measurement.
-8. **Compiled filters.** The vocoder's 12-tap anti-aliasing filters are
+9. **Compiled filters.** The vocoder's 12-tap anti-aliasing filters are
    compiled multiply-add chains instead of 200 dispatch-bound convolutions
    (audio 2.5 to 0.36 s).
-9. **Text path.** Gemma-4 12B runs on the prompt's real tokens only (padding
+10. **Text path.** Gemma-4 12B runs on the prompt's real tokens only (padding
    is masked and replaced by registers in the connector either way): 0.85 s
    per prompt.
 
@@ -151,6 +160,5 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
   the conditioning path is not wired).
 - DFR temporal rounds and the second spatial epilogue; the duration head;
   the prompt enhancer; the res_2s sampler (HQ pipeline).
-- The diffusion VAE decoder (the conv decoder is the profile default).
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
   hardware and are separate profile records when they exist.
