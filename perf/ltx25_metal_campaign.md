@@ -531,3 +531,35 @@ Everything beyond this changes the output and is opt-in: fp16 VAE decode
 step counts. The campaign's output-preserving work on M1 Ultra is at its
 epsilon except for the attention kernel, which is recorded as the open
 item with its expected value.
+
+## 17. The measured MMA ceiling, and the exact dev-guidance restructure (2026-10-02)
+
+**Ceiling** (`n4_mma_peak.py`: fp16 `simdgroup_multiply_accumulate` with all
+operands in registers, no memory traffic, 32,768 simdgroups):
+
+| | TF/s |
+| --- | ---: |
+| fp16 MMA, register-resident | **19.4** |
+| fp32 MMA, register-resident | 17.5 |
+| MLX fp16 GEMM (section 13) | 18.5-19.3 |
+| MLX SDPA D128 (section 13) | 15.1-15.4 |
+
+So the spec's 20.8 is not reachable; MLX's GEMM is at 95-99% of the real
+ceiling and attention at 78%. That is the quantitative basis of "custom
+kernels buy a few percent": GEMMs are 77% of the transformer's FLOPs with
+1-5% headroom, attention 14% (6k tokens) to 40% (24k) with 21% headroom,
+giving at most ~3% (short) to ~8% (HD) of a forward for a perfect attention
+kernel. New fact: fp32 MMA is nearly as fast as fp16 on M1 Ultra, so a
+custom kernel can accumulate in fp32 at no MMA cost; the fp32 GEMM slowness
+the baseline suffered is operand bandwidth, not the MMA.
+
+**Exact dev restructure** (`dit.py: text_rows, share_from`;
+`pipeline.GuidedDenoiser`): the STG pass is the conditional pass until the
+first STG block (28 of 48), so it is forked from the conditional hidden state
+there instead of recomputed; and the three conditional-text passes project
+the text K/V once per distinct text row. Per guided step at 1,536 tokens:
+10.86 -> 10.41 (shared text) -> **9.13 s** (fork), rel-L2 2.8e-3 to the
+unshared result (GEMM row-count kernel selection; fp16 level), and the
+guided step still matches the baseline at 0.0072 (`n5_guided_step.py`).
+Dev 768x512x121 end to end: 406 -> **343 s** cold; frame 60 identical to
+the previous clip by eye (`dev_after/side.png`).

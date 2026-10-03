@@ -56,7 +56,7 @@ a cold process, prompt to mp4, including model loads.
 | clip | pipeline | baseline q8 | baseline bf16 | SlimServe | vs q8 |
 | --- | --- | ---: | ---: | ---: | ---: |
 | 768x512x121 | distilled | 116.9 s | 202.4 s | **86 s** cold, **71 s** resident | 1.36x |
-| 768x512x121 | dev, 30 steps | 606.9 s | | **406 s** | 1.49x |
+| 768x512x121 | dev, 30 steps | 606.9 s | | **343 s** | 1.77x |
 | 768x512x121 | DFR | 170.9 s | | **125 s** | 1.37x |
 | 1536x1024x121 | distilled | 504.9 s (tiled attention and decode; untiled dies in decode) | | **343 s**, untiled | 1.47x |
 
@@ -86,8 +86,10 @@ Evidence, per-op profiles and every intermediate number are in
    convolution runs in temporal slabs, with the activation and padding done
    inside the slab. Exact output; the 121-frame decode went from about 60 GiB
    to 10 GiB and HD decodes untiled in 34 s at 27 GiB.
-5. **Batched guidance.** The dev pipeline's four passes per step run as one
-   batch of four (2.75 s per pass instead of 3.07 s).
+5. **Batched, de-duplicated guidance.** The dev pipeline's four passes per
+   step run as one batch; the STG pass is forked from the conditional pass at
+   block 28 instead of recomputed, and the three conditional-text passes
+   share their text key/value projections. 10.9 to 9.1 s per step, exact.
 6. **Runtime adapters.** The rank-450 distilled LoRA and the detailing
    IC-LoRA are applied as low-rank terms next to the base GEMM. No second
    39 GiB transformer, no reload between stages, exact detach.
@@ -101,9 +103,9 @@ Evidence, per-op profiles and every intermediate number are in
    is masked and replaced by registers in the connector either way): 0.85 s
    per prompt.
 
-Where it stands against the hardware: the transformer forward runs at about
-84% of the M1 Ultra's fp16 peak (20.8 TF/s). MLX's own GEMM and attention
-kernels are within 10-25% of that peak, so what is left on this chip is
+Where it stands against the hardware: the M1 Ultra's measured fp16 MMA
+ceiling is 19.4 TF/s (register-resident, section 17 of the ledger). MLX's
+GEMM runs at 95-99% of it and its attention at 78%, so what is left on this chip is
 small; the larger remaining wins are opt-in (step caching, sparse attention)
 and the M5's int8 path. See the ledger's kernel sections for what was tried.
 

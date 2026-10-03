@@ -19,7 +19,7 @@ in git history on main. Companion documents, read them in this order:
 Done and gated: N0 loader, N1 forward, N2 distilled end to end, the
 output-preserving kernel-wave items that paid (split-K, fused glue, slab
 VAE), N5 dev and DFR (default configuration), N6 profiles + CLI + serving.
-Numbers: ledger sections 13, 15 and 16 (16 = the remaining-headroom
+Numbers: ledger sections 13, 15, 16 and 17 (16 = the remaining-headroom
 accounting: output-preserving work on M1 Ultra is at its ~1% epsilon except
 an attention kernel, ~1.5% short / ~5% HD). User and design documentation:
 `docs/ltx25_metal.md`.
@@ -27,7 +27,7 @@ an attention kernel, ~1.5% short / ~5% HD). User and design documentation:
 | clip | pipeline | baseline q8 | ours |
 | --- | --- | ---: | ---: |
 | 768x512x121 | distilled | 116.9 s | 86 s cold, 71 s resident |
-| 768x512x121 | dev 30 steps | 606.9 s | 406 s |
+| 768x512x121 | dev 30 steps | 606.9 s | 343 s |
 | 768x512x121 | DFR | 170.9 s | 125 s |
 | 1536x1024x121 | distilled | 504.9 s tiled | 343 s untiled |
 

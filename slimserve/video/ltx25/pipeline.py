@@ -130,12 +130,13 @@ class GuidedDenoiser:
         batched: bool = True,
     ):
         self.dit, self.video_g, self.audio_g, self.batched = dit, video, audio, batched
-        self.video_text = mx.concatenate(
-            [cond[0], negative[0], cond[0], cond[0]], axis=0
-        )
-        self.audio_text = mx.concatenate(
-            [cond[1], negative[1], cond[1], cond[1]], axis=0
-        )
+        # Distinct text rows (conditional, negative); row map cond, neg, stg, mod.
+        self.video_text = mx.concatenate([cond[0], negative[0]], axis=0)
+        self.audio_text = mx.concatenate([cond[1], negative[1]], axis=0)
+        self.text_rows = mx.array([0, 1, 0, 0])
+        # The STG pass equals the conditional pass until the first STG block.
+        first_stg = min(video.stg_blocks + audio.stg_blocks) if batched else None
+        self.share = (first_stg, 0, 2) if first_stg else None
         keep_stg = mx.array([1.0, 1.0, 0.0, 1.0])
         keep_mod = mx.array([1.0, 1.0, 1.0, 0.0])
         self.stg: dict[tuple[str, int], mx.array] = {}
@@ -151,6 +152,15 @@ class GuidedDenoiser:
         self, video: LatentState, audio: LatentState, vx, ax, sigma: float, rows: slice
     ):
         n = len(range(*rows.indices(self.PASSES)))
+        if n == self.PASSES:  # distinct text rows, mapped per batch row
+            vtext, atext, trows = self.video_text, self.audio_text, self.text_rows
+        else:
+            sel = self.text_rows[rows]
+            vtext, atext, trows = (
+                mx.take(self.video_text, sel, axis=0),
+                mx.take(self.audio_text, sel, axis=0),
+                None,
+            )
         rep = lambda x: None if x is None else mx.repeat(x, n, axis=0)  # noqa: E731
         t = mx.full((n,), sigma, dtype=G)
         vt = None if video.uniform else rep((video.denoise_mask * sigma).squeeze(-1))
@@ -159,8 +169,8 @@ class GuidedDenoiser:
             rep(vx),
             rep(ax),
             t,
-            self.video_text[rows],
-            self.audio_text[rows],
+            vtext,
+            atext,
             rep(video.positions),
             rep(audio.positions),
             video_keyframes_mask=rep(video.keyframes_mask),
@@ -169,6 +179,8 @@ class GuidedDenoiser:
             video_attention_mask=video.attention_mask,
             audio_attention_mask=audio.attention_mask,
             stg={k: m[rows] for k, m in self.stg.items()},
+            text_rows=trows,
+            share_from=self.share if n == self.PASSES else None,
         )
         return (
             x0_from_velocity(rep(vx), v, t if vt is None else vt),

@@ -142,6 +142,28 @@ def _head_gate(out: mx.array, logits: mx.array) -> mx.array:
     return out * (2.0 * mx.sigmoid(logits)).transpose(0, 2, 1)[..., None]
 
 
+def _rows(x: mx.array, reps: mx.array | None) -> mx.array:
+    return x if reps is None else mx.take(x, reps, axis=0)
+
+
+def _select_rows(inputs: dict, rows: list[int], batch: int) -> dict:
+    """The same inputs restricted to batch rows `rows` (arrays whose leading
+    axis is the batch; text stays as its distinct rows, `text_rows` is
+    re-indexed; stg masks are sliced)."""
+    idx = mx.array(rows)
+    out = {}
+    for key, val in inputs.items():
+        if key in ("video_text", "audio_text") or val is None:
+            out[key] = val
+        elif key == "stg":
+            out[key] = {k: mx.take(m, idx) for k, m in val.items()}
+        elif isinstance(val, mx.array) and val.ndim >= 1 and val.shape[0] == batch:
+            out[key] = mx.take(val, idx, axis=0)
+        else:
+            out[key] = val
+    return out
+
+
 class Modulation:
     """One AdaLN head's output: (rows, P, dim) fp32, optionally per-token.
 
@@ -258,8 +280,14 @@ class LTX25DiT:
         rope_k: tuple[mx.array, mx.array] | None = None,
         mask: mx.array | None = None,
         skip: mx.array | None = None,
+        ctx_rows: mx.array | None = None,
     ) -> mx.array:
-        """x, ctx are fp16. Returns fp16 (B, N, out_dim)."""
+        """x, ctx are fp16. Returns fp16 (B, N, out_dim).
+
+        `ctx` may hold only the distinct context rows, with `ctx_rows` mapping
+        each batch row to one of them: K and V are projected once per distinct
+        row and gathered (the dev pipeline's three conditional-text passes).
+        """
         w = self.w
         heads = w[p + ".to_gate_logits.weight"].shape[0]
         b = x.shape[0]
@@ -273,8 +301,10 @@ class LTX25DiT:
         v = self.lin(p + ".to_v", kv)
         hd = q.shape[-1] // heads
         q = q.reshape(b, -1, heads, hd).transpose(0, 2, 1, 3)
-        k = k.reshape(b, -1, heads, hd).transpose(0, 2, 1, 3)
-        v = v.reshape(b, -1, heads, hd).transpose(0, 2, 1, 3)
+        k = k.reshape(kv.shape[0], -1, heads, hd).transpose(0, 2, 1, 3)
+        v = v.reshape(kv.shape[0], -1, heads, hd).transpose(0, 2, 1, 3)
+        if ctx_rows is not None:
+            k, v = mx.take(k, ctx_rows, axis=0), mx.take(v, ctx_rows, axis=0)
         if rope_q is not None:
             q = apply_rope(q, *rope_q)
             k = apply_rope(k, *(rope_k or rope_q))
@@ -339,9 +369,16 @@ class LTX25DiT:
             x = _modulate(self._norm(v), vm.get(7, vt[7]), vm.get(6, vt[6]))
             pt, pm = w[p + ".prompt_scale_shift_table"], s["video_prompt_mod"]
             text = (
-                s["video_text"] * (1.0 + pm.get(1, pt[1])) + pm.get(0, pt[0])
+                s["video_text"] * (1.0 + _rows(pm.get(1, pt[1]), s["text_reps"]))
+                + _rows(pm.get(0, pt[0]), s["text_reps"])
             ).astype(F)
-            y = self._attn(p + ".attn2", x, ctx=text, mask=s["video_cross_mask"])
+            y = self._attn(
+                p + ".attn2",
+                x,
+                ctx=text,
+                mask=s["video_cross_mask"],
+                ctx_rows=s["text_rows"],
+            )
             v = _gated_residual(v, y, vm.get(8, vt[8]))
 
         # 4. audio text cross-attention
@@ -349,9 +386,10 @@ class LTX25DiT:
             x = _modulate(self._norm(a), am.get(7, at[7]), am.get(6, at[6]))
             pt, pm = w[p + ".audio_prompt_scale_shift_table"], s["audio_prompt_mod"]
             text = (
-                s["audio_text"] * (1.0 + pm.get(1, pt[1])) + pm.get(0, pt[0])
+                s["audio_text"] * (1.0 + _rows(pm.get(1, pt[1]), s["text_reps"]))
+                + _rows(pm.get(0, pt[0]), s["text_reps"])
             ).astype(F)
-            y = self._attn(p + ".audio_attn2", x, ctx=text)
+            y = self._attn(p + ".audio_attn2", x, ctx=text, ctx_rows=s["text_rows"])
             a = _gated_residual(a, y, am.get(8, at[8]))
 
         # 5-6. audio<->video cross attention; both directions read the same norms.
@@ -415,12 +453,92 @@ class LTX25DiT:
         audio_attention_mask: mx.array | None = None,
         video_cross_attention_mask: mx.array | None = None,
         stg: dict[tuple[str, int], mx.array] | None = None,
+        text_rows: mx.array | None = None,
+        share_from: tuple[int, int, int] | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Velocity prediction. All inputs fp32; returns fp32 (video, audio).
 
         `stg` maps (kind, block) -> (B,) keep-mask (1 keep, 0 skip) with kind in
-        video_self / audio_self / a2v / v2a.
+        video_self / audio_self / a2v / v2a. `text_rows` lets `video_text` /
+        `audio_text` carry only their distinct rows, indexed per batch row.
+        `share_from = (block, src, dst)`: batch row `dst` is identical to row
+        `src` until `block` (an STG pass skips attention only from that block
+        on), so rows other than `dst` run blocks 0..block-1 and `dst` is
+        forked from `src`'s hidden state there. Exact up to GEMM row-count
+        kernel selection.
         """
+        inputs = dict(
+            video_latent=video_latent,
+            audio_latent=audio_latent,
+            timestep=timestep,
+            video_text=video_text,
+            audio_text=audio_text,
+            video_positions=video_positions,
+            audio_positions=audio_positions,
+            video_keyframes_mask=video_keyframes_mask,
+            video_timesteps=video_timesteps,
+            audio_timesteps=audio_timesteps,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
+            video_attention_mask=video_attention_mask,
+            audio_attention_mask=audio_attention_mask,
+            video_cross_attention_mask=video_cross_attention_mask,
+            stg=stg,
+            text_rows=text_rows,
+        )
+        first = 0
+        v = a = None
+        if share_from is not None:
+            fork_block, src, dst = share_from
+            b = video_latent.shape[0]
+            keep = [r for r in range(b) if r != dst]
+            v, a, state, _, _ = self._prepare(**_select_rows(inputs, keep, b))
+            for i in range(fork_block):
+                v, a = self._block(i, v, a, state)
+                if self.eval_every and (i + 1) % self.eval_every == 0:
+                    mx.async_eval(v, a)
+            src_pos = keep.index(src)
+            v = mx.concatenate([v[:dst], v[src_pos : src_pos + 1], v[dst:]], axis=0)
+            a = mx.concatenate([a[:dst], a[src_pos : src_pos + 1], a[dst:]], axis=0)
+            first = fork_block
+        v0, a0, state, video_emb, audio_emb = self._prepare(**inputs)
+        if v is None:
+            v, a = v0, a0
+        w = self.w
+        for i in range(first, self.cfg.num_layers):
+            v, a = self._block(i, v, a, state)
+            # Bound each Metal command buffer (GPU watchdog) and the live graph
+            # without stalling: the GPU runs this group while Python builds the
+            # next one.
+            if self.eval_every and (i + 1) % self.eval_every == 0:
+                mx.async_eval(v, a)
+
+        return (
+            self._out(v, video_emb, w["scale_shift_table"], "proj_out"),
+            self._out(a, audio_emb, w["audio_scale_shift_table"], "audio_proj_out"),
+        )
+
+    def _prepare(
+        self,
+        video_latent,
+        audio_latent,
+        timestep,
+        video_text,
+        audio_text,
+        video_positions,
+        audio_positions,
+        video_keyframes_mask=None,
+        video_timesteps=None,
+        audio_timesteps=None,
+        video_sigma=None,
+        audio_sigma=None,
+        video_attention_mask=None,
+        audio_attention_mask=None,
+        video_cross_attention_mask=None,
+        stg=None,
+        text_rows=None,
+    ):
+        """Patchify, AdaLN heads, RoPE tables: everything the block loop reads."""
         cfg, w = self.cfg, self.w
         vd, ad = cfg.video_dim, cfg.audio_dim
         timestep = timestep.astype(G)
@@ -497,6 +615,16 @@ class LTX25DiT:
             "audio_mask": audio_attention_mask,
             "video_cross_mask": video_cross_attention_mask,
             "stg": stg,
+            "text_rows": text_rows,
+            # one batch row standing for each distinct text row, for the prompt AdaLN
+            "text_reps": None
+            if text_rows is None
+            else mx.array(
+                [
+                    list(np.array(text_rows)).index(u)
+                    for u in range(int(text_rows.max()) + 1)
+                ]
+            ),
         }
         mx.eval(
             state["video_rope"],
@@ -504,19 +632,7 @@ class LTX25DiT:
             state["video_cross_rope"],
             state["audio_cross_rope"],
         )
-
-        for i in range(cfg.num_layers):
-            v, a = self._block(i, v, a, state)
-            # Bound each Metal command buffer (GPU watchdog) and the live graph
-            # without stalling: the GPU runs this group while Python builds the
-            # next one.
-            if self.eval_every and (i + 1) % self.eval_every == 0:
-                mx.async_eval(v, a)
-
-        return (
-            self._out(v, video_emb, w["scale_shift_table"], "proj_out"),
-            self._out(a, audio_emb, w["audio_scale_shift_table"], "audio_proj_out"),
-        )
+        return v, a, state, video_emb, audio_emb
 
     def _out(
         self, x: mx.array, emb: Modulation, table: mx.array, proj: str
