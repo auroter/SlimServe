@@ -563,3 +563,75 @@ unshared result (GEMM row-count kernel selection; fp16 level), and the
 guided step still matches the baseline at 0.0072 (`n5_guided_step.py`).
 Dev 768x512x121 end to end: 406 -> **343 s** cold; frame 60 identical to
 the previous clip by eye (`dev_after/side.png`).
+
+## 18. Recommended workflow audit, the diffusion VAE decoder, and two MLX defects (2026-10-02)
+
+**Audit against Lightricks' recommendations** (model card, LTX-2 repo
+`utils/constants.py` and pipelines, the prompting guides; URLs in the
+research file). Matching already: stage-1 768x512 -> 1536x1024, 121 frames,
+24 fps, the sigma tables, CFG 3/7, STG 1, modality 3, rescale 0.7, the DFR
+canvas and detailing strength 0.5, prompt enhancement off by default.
+Deviations found and fixed: (1) STG block: upstream LTX-2.5 uses 29 (0-based);
+the Mac baseline and therefore we used 2.3's 28; now 29. (2) Decoder:
+upstream's default is the diffusion VAE decoder ("sharper faces, textures and
+on-screen text"); the baseline and we used the conv decoder. Ported, now the
+default. (3) Prompting: one present-tense paragraph under ~200 words, sounds
+tied to visible sources, named cuts with re-established shots, no signage;
+the demo prompt was rewritten to it. Note that "matches the baseline" was never
+"matches Lightricks": the baseline carries at least the STG deviation.
+
+**Diffusion decoder** (`diffvae.py`): four deterministic neighborhood-attention
+stages (3x7x7, 3x7x7, 3x5x5, 3x5x5; 2048/1024/512/512 channels) with
+pixel-shuffle upsamples, then 8 diffusion blocks at pixel/4 (256 channels,
+11x11x11 windows, AdaLN from t, stage-4 feature as context, upstream's 4 haloed
+W slabs) running one x0 step from pure noise. Parity vs the baseline's port in
+fp32 (`n7_diffvae_parity.py`): every tapped stage rel-L2 4e-7 to 3e-6, pixels
+7e-7 / 93.0 dB. Precision: fp16 operands + fp32 stream 65.4 dB, fp16 operands
++ fp16 stream **64.5 dB, max 1 level** (default; upstream runs it all in bf16,
+which is coarser).
+
+Neighborhood attention is a Metal kernel (`na3d`, `mx.fast.metal_kernel`):
+one (query, head) per 8 lanes, each lane 8 dims, fp32 online softmax, exact
+NATTEN clamping. vs the reference formulation: fp32 1e-7, fp16 6e-5.
+
+| kernel variant (stage-5 slab 121x128x58, 4 heads, 11^3) | TF/s |
+| --- | ---: |
+| one thread per (query, head) | 0.6 |
+| **8 lanes per query, shuffle reduce** | **3.0** |
+| 4 / 2 / 1 lanes | 2.5 / 1.4 / 0.5 |
+| threadgroup-staged key rows (32 queries) | 2.7 |
+| row-batched scores before the softmax update | 1.6 (score array spills) |
+
+Latency-bound rather than memory-bound; the simple 8-lane kernel stays. The
+baseline's block-gather SDPA formulation is ~8x slower end to end.
+
+| decode | baseline conv | ours conv | baseline diffusion | ours diffusion |
+| --- | ---: | ---: | ---: | ---: |
+| 768x512x49 | 6.3 s | 3.9 s | 69.3 s (bf16) / 40.1 s (fp32) | **9.0 s**, 7.5 GiB |
+| 768x512x121 | 18.1 s | 7.1 s | | **30 s**, 16 GiB |
+| 1536x1024x121 | 83.8 s tiled | 29.9 s | | **157 s**, 35 GiB |
+| 1216x640x241 (10 s) | | 47 s | | 142 s |
+
+Memory discipline that got there: the MLP's 4x hidden state in the operand
+dtype and in temporal chunks (block peak 29.9 -> 11.1 GiB at 49 frames);
+stage 5 keeps its residual stream as resident temporal chunks (HD peak 76 ->
+52 GiB), fp16 stream (-> 35 GiB); stage-4/5 attention in exact token-budgeted
+temporal chunks (full halo, slabs never shorter than the window).
+
+**Two MLX 0.32.2 defects, found on the 10 s clip** (both reproduced and
+worked around; `n7_metal_kernel_race.py`, `n7_mlx_2e31_split.py`):
+
+1. A `metal_kernel` launched behind in-flight MLX ops read incomplete inputs
+   (4/5 runs NaN on the stage-4 volume); `mx.eval` on the inputs did not
+   prevent it, `mx.synchronize()` before the launch did (0/5); a second
+   synchronize after the launch was needed for the full decode. Cost ~1 ms
+   per call. With Metal API validation enabled the race never appears.
+2. `mx.split` (and slicing) of an array past 2^31 elements returns wrong data
+   for the tail; the GEMM and rms_norm producing it are correct. Hit by the
+   fused QKV projection of stage 4 (2.4 G elements) and the stage-5 context
+   (3.0 G). Fix: three projections, context per chunk, and `_lin` refuses
+   outputs past 2^31 so the next case fails loudly.
+
+Validated: the 10 s 1216x640 clip's decode is deterministic across runs and
+within 36-38 dB of the conv decoder on every frame (no frame under 20 dB;
+before the fixes the last 12 frames were garbage).
