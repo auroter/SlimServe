@@ -35,7 +35,8 @@ Not done: I2V conditioning, DFR temporal rounds and second spatial epilogue,
 duration head, prompt enhancer, res_2s, the opt-in tier, any hand-written
 Metal kernel (measured headroom on M1-M4 is at most ~10% of a forward; see
 ledger section 15), N7 (nothing to upstream yet), the dev-vs-DFR quality A/B,
-HD runs of dev and DFR, a PR. The branch is local only (not pushed).
+HD runs of dev and DFR. Draft PR #86 on QuixiAI/SlimServe from fork branch
+auroter:ltx25-metal (opened 2026-10-02; description carries the result tables).
 
 How to run anything heavy: `perf/ltx25_harness/gpu_run.py --need-gb N -- <cmd>`
 with `PYTHONPATH=<worktree>`. Environments: the engine and its tests run in
