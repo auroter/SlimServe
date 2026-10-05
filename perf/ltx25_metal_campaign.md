@@ -790,3 +790,9 @@ no antialias) and centre-cropped to each stage's own pixel size, mapped to
 1 - strength in both stages (`VideoConditionByLatentIndex`,
 `image_conditionings_for_chunk`). 13 CPU tests cover the geometry, the
 request field and the mask arithmetic.
+
+I2V trial (`i2v_beat1_1536.mp4`, distilled, start frame = frame 60 of
+`beat1c_1536.mp4`, seed 11): 483.0 s (image 2.4 s). The clip continues the
+still: same character, hall and light, the walk and pull-out carry on. Identity
+across clips is therefore available by chaining the last frame of one clip into
+the next.

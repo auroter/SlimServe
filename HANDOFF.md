@@ -14,7 +14,7 @@ in git history on main. Companion documents, read them in this order:
 4. `perf/ltx25_harness/`: the measurement scripts that produced the ledger.
 5. `perf/results/2026-10-01-ltx25-baseline/`: raw logs and frames.
 
-## Status (2026-10-02, end of the bring-up session)
+## Status (2026-10-05)
 
 Done and gated: N0 loader, N1 forward, N2 distilled end to end, the
 output-preserving kernel-wave items that paid (split-K, fused glue, slab
@@ -32,13 +32,27 @@ an attention kernel, ~1.5% short / ~5% HD). User and design documentation:
 | 1536x1024x121 | distilled | 504.9 s tiled | 343 s untiled |
 
 Done since: the diffusion VAE decoder (default now, Metal neighborhood-attention
-kernel, ledger section 18), a recommended-workflow audit; section 20 audited the code against Lightricks' source and fixed the missing BOS token, ancestral stage 2, STG block 28 and three dev deviations.
-Not done: I2V conditioning, DFR temporal rounds and second spatial epilogue,
-duration head, prompt enhancer, res_2s, the opt-in tier, any hand-written
-Metal kernel (measured headroom on M1-M4 is at most ~10% of a forward; see
-ledger section 15), N7 (nothing to upstream yet), the dev-vs-DFR quality A/B,
-HD runs of dev and DFR. Draft PR #86 on QuixiAI/SlimServe from fork branch
-auroter:ltx25-metal (opened 2026-10-02; description carries the result tables).
+kernel, ledger section 18); section 20 audited the code against Lightricks'
+source (`~/.local/scratch/ltx25/upstream`) and fixed the missing Gemma BOS
+token, ancestral stage 2, STG block 28 and three dev deviations; section 21
+added the keyframe-aware diffusion decode for DFR (joint NA Metal kernel,
+parity 4e-7 vs upstream's torch reference), I2V first-frame conditioning (CLI
+`--image`, API `image`), and re-validated dev and DFR at the default size.
+Standing numbers at 1536x1024x121 after that: distilled 478 s, DFR 807 s
+(keyframe decode), dev 1540 s, I2V distilled 483 s. Quality is only judged at
+the default size (stage 1 must run at 768x512; section 20) and the parity
+reference is upstream, never the dgrauet port (it drops BOS).
+Not done: DFR temporal rounds and second spatial epilogue, duration head,
+prompt enhancer, res_2s, the opt-in tier, any hand-written Metal GEMM
+(measured headroom on M1-M4 is at most ~10% of a forward; see ledger section
+15), N7 (candidates: na3d / na3d_joint kernels, split-K dispatch, slab conv
+driver), HD runs of dev and DFR beyond the default size, a full keyframe-decode
+parity against upstream's torch decoder (only the kernel is parity-checked; the
+stream plumbing is a code port). Draft PR #86 on QuixiAI/SlimServe from fork
+branch auroter:ltx25-metal (opened 2026-10-02; description carries the result
+tables). Demo clip for the PR: not chosen yet; candidates in
+`~/.local/scratch/ltx25/demo/v4/` (`beat1c_1536`, `beat1d_dfr_kf_1536`,
+`i2v_beat1_1536`), user review pending.
 
 How to run anything heavy: `perf/ltx25_harness/gpu_run.py --need-gb N -- <cmd>`
 with `PYTHONPATH=<worktree>`. Environments: the engine and its tests run in
