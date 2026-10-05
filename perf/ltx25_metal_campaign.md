@@ -654,3 +654,63 @@ everywhere; the pre-fix tail was 15 dB). The remaining flaws are generation
 and prompt behaviour, not engine faults; the prompt's identity bleed is the
 next thing to iterate (contrasting traits for the alchemists, re-describe
 her at each cut).
+
+## 20. Audit against Lightricks' source: the missing BOS token and six more deviations (2026-10-05)
+
+The three demo renders of section 19 looked unlike the model's published
+output (people not lifelike), which is the signature of a conditioning or
+sampler mismatch rather than a kernel fault. Section 18's audit was against
+the model card and constants only; every numeric parity gate in this ledger
+was against the dgrauet Mac port, so anything the port gets wrong we matched
+exactly. This pass compared `text.py`, `sampling.py`, `pipeline.py`, `dit.py`,
+`vae.py` and `checkpoints.py` line by line against Lightricks/LTX-2 HEAD
+9ec55f9 (`~/.local/scratch/ltx25/upstream`, `ltx-core` + `ltx-pipelines`)
+with the port as the third column. Three read-only passes (text, sampling and
+guidance, transformer and VAE); no renders until the comparison was complete.
+
+| # | item | upstream | ours (and the port) | reach |
+| --- | --- | --- | --- | --- |
+| 1 | `<bos>` | `LTXGemmaTokenizer` prepends id 2 explicitly ("Gemma 4 does not [emit BOS], so we prepend"); head truncation to 1024 | raw `tokenizers` encode, the bundled post-processor adds nothing: **no BOS, ever**; tail truncation. Same in the port | every mode, every prompt |
+| 2 | stage-2 sampler | ancestral Euler on 2.5 checkpoints (`ANCESTRAL_SAMPLER_SINCE_VERSION = (2, 5)`, noise seed + 20000) | plain Euler; the port quotes an upstream docstring that no longer exists | distilled, DFR |
+| 3 | STG block | `_PARAMS_SINCE_VERSION` gives a 2.5 checkpoint `LTX_2_4_PARAMS`: `stg_blocks=[28]`; `[29]` is the 2.0 dataclass default | 29 (section 18's change; the port had 28) | dev |
+| 4 | dev sigma shift | `scheduler.execute(steps)` with no latent: shift fixed at the 4096-token anchor, 2.05 | token-count dependent (2.78 at 1024x1536). Same in the port | dev |
+| 5 | dev stage-2 audio | `freeze_audio=True`: clean stage-1 audio, sigma 0 for its tokens, prompt AdaLN and cross gates | re-noised at 0.909 and co-denoised, result discarded | dev |
+| 6 | negative prompt | begins `has_subtitles, has_blurbox, transition from black, transition to black, speech_ending_short, …` | those five tags missing. Same in the port | dev |
+| 7 | connector q/k RMSNorm eps | 1e-6 | 1e-5 (the port's `nn.RMSNorm` default) | all, negligible |
+
+Empirical check of (1), no model load: encoding "A young woman walks through
+a cathedral." with the checkpoint's tokenizer gives `[236776, 3184, …]`;
+`<bos>` is id 2 and the post-processor is `TemplateProcessing` with
+`special_tokens: {}`. Gemma's hidden states depend on BOS at every position
+(it is the attention sink that sets the scale of everything after it) and the
+188160 -> 4096 aggregate projection plus the 8-layer connectors were trained on
+BOS-prefixed states, so the DiT received off-distribution text conditioning
+for every clip in this ledger. The text-path parity of section 13 (rel-L2
+0.0003 against the port) could not see it.
+
+Verified as matching upstream, by code reading with quoted lines: both sigma
+tables; Euler and ancestral step formulas; x0 convention; the CFG/STG/modality
+combination and the global-std rescale; the STG value-passthrough mechanism
+and the all-blocks modality skip; guidance values; the batched four-row pass;
+stage-2 re-noise at sigma 0.909; the T2V masks; timestep embedding and the
+AdaLN tables and chunk indexing; per-token timesteps and frozen-modality
+sigma; RoPE (fp64 grid, split layout, front padding, midpoint positions,
+fps scaling, temporal-only cross RoPE); qk RMSNorm placement; gated
+attention; FFN; norms and the output block; keyframe abs-pos embedding;
+patchify and the per-channel latent statistics; the conv decoder (no timestep
+conditioning on 2.5), its block order, padding, depth-to-space, output
+mapping; the diffusion decoder's one x0 step from noise at t=1; weight keys;
+LoRA scaling; which Gemma hidden states are used (embeddings + 48, last one
+final-normed), the per-token RMS over layers, the rescale and the two
+aggregate projections, left padding and positions, the registers, the
+connector architecture; DFR segment layout and LoRA strengths. There are no
+sigma-schedule or LoRA-blend differences. Upstream's official default output
+is 768x512x121 (stage 1 at 384x256); ours is 1536x1024.
+
+Fixes (this commit): `text.py` prepends BOS and truncates from the head,
+connector eps 1e-6; `sampling.py` STG block 28, the full negative prompt,
+`ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET`; `pipeline.py` ancestral stage 2 for
+distilled and DFR, dev schedule at the 4096-token anchor, dev stage 2 with
+frozen audio. Section 18's STG claim is withdrawn. Parity against the port is
+now expected to differ on the text path (by design) and on stage 2; the
+reference for parity from here on is upstream, not the port.

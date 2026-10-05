@@ -32,7 +32,7 @@ an attention kernel, ~1.5% short / ~5% HD). User and design documentation:
 | 1536x1024x121 | distilled | 504.9 s tiled | 343 s untiled |
 
 Done since: the diffusion VAE decoder (default now, Metal neighborhood-attention
-kernel, ledger section 18), STG block 29, a recommended-workflow audit.
+kernel, ledger section 18), a recommended-workflow audit; section 20 audited the code against Lightricks' source and fixed the missing BOS token, ancestral stage 2, STG block 28 and three dev deviations.
 Not done: I2V conditioning, DFR temporal rounds and second spatial epilogue,
 duration head, prompt enhancer, res_2s, the opt-in tier, any hand-written
 Metal kernel (measured headroom on M1-M4 is at most ~10% of a forward; see
@@ -59,7 +59,7 @@ DiT, same kernels:
 | id | pipeline (upstream class) | stage 1 | stage 2 | role |
 | --- | --- | --- | --- | --- |
 | `ltx25-distilled` | DistilledPipeline | 8 ancestral steps, half res, CFG 1 | 2x latent upscale, 3 steps, distilled LoRA | fast / iterate |
-| `ltx25-dev` | TI2VidTwoStages | 30 steps x 4 guided passes (CFG 3.0, STG 1.0 on block 29, modality 3.0), half res | same | quality |
+| `ltx25-dev` | TI2VidTwoStages | 30 steps x 4 guided passes (CFG 3.0, STG 1.0 on block 28, modality 3.0), half res | same | quality |
 | `ltx25-dfr` | DFRPipeline | distilled + 5 generated keyframe slots | upscale, spatial-detailing epilogue with the official IC-LoRA (strength 0.5), optional temporal rounds (+8 steps each) | production (Lightricks' label) |
 
 Dev vs distilled is the user's choice (test an idea vs render the final);

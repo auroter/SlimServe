@@ -29,6 +29,9 @@ DISTILLED_SIGMAS = [
 ]
 STAGE_2_DISTILLED_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 ANCESTRAL_NOISE_SEED_OFFSET = 10000
+# LTX-2.5 checkpoints sample stage 2 with the ancestral loop too (upstream
+# distilled.py ANCESTRAL_SAMPLER_SINCE_VERSION = (2, 5)), from its own offset.
+ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET = 20000
 
 VIDEO_TEMPORAL_SCALE = 8
 VIDEO_SPATIAL_SCALE = 32
@@ -223,6 +226,8 @@ def with_latent(state: LatentState, latent: mx.array) -> LatentState:
 
 # ---- dev (guided) ---------------------------------------------------------
 DEFAULT_NEGATIVE_PROMPT = (
+    "has_subtitles, has_blurbox, transition from black, transition to black, "
+    "speech_ending_short, "
     "blurry, out of focus, overexposed, underexposed, low contrast, washed out "
     "colors, excessive noise, grainy texture, poor lighting, flickering, motion "
     "blur, distorted proportions, unnatural skin tones, deformed facial features, "
@@ -272,9 +277,10 @@ class Guidance:
     stg: float = 1.0
     modality: float = 3.0
     rescale: float = 0.7
-    # Upstream LTX-2.5 constants.py: stg_blocks=[29] (0-based). The Mac baseline
-    # still carries 2.3's [28].
-    stg_blocks: tuple[int, ...] = (29,)
+    # Upstream resolves params by checkpoint version: a 2.5.0 checkpoint gets
+    # LTX_2_4_PARAMS (constants.py _PARAMS_SINCE_VERSION), whose stg_blocks is
+    # [28]. The [29] in the PipelineParams dataclass is the LTX-2.0 default.
+    stg_blocks: tuple[int, ...] = (28,)
 
     def combine(
         self, cond: mx.array, uncond: mx.array, perturbed: mx.array, isolated: mx.array

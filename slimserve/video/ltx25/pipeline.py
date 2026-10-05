@@ -369,7 +369,8 @@ class LTX25Engine:
             up = vae.normalize(upscaler(vae.denormalize(half)))
             mx.eval(up)
 
-        # Stage 2: full resolution refinement from sigma 0.909, plain Euler.
+        # Stage 2: full resolution refinement from sigma 0.909; ancestral too on
+        # 2.5 checkpoints (upstream distilled.py), from its own noise offset.
         with tm.span("stage2"):
             h2, w2 = h1 * 2, w1 * 2
             s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
@@ -390,11 +391,12 @@ class LTX25Engine:
                 initial=a1,
                 bf16_noise=self.bf16_noise,
             )
-            v2, a2 = sampling.euler_loop(
+            v2, a2 = sampling.euler_ancestral_loop(
                 denoise,
                 video,
                 audio,
                 sampling.STAGE_2_DISTILLED_SIGMAS,
+                noise_seed=seed + sampling.ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
                 on_step=stepper("stage2"),
             )
 
@@ -519,11 +521,12 @@ class LTX25Engine:
             )
             lora.attach(dit, detail_strength)
             try:
-                v2, _ = sampling.euler_loop(
+                v2, _ = sampling.euler_ancestral_loop(
                     denoise,
                     video,
                     audio,
                     sampling.STAGE_2_DISTILLED_SIGMAS,
+                    noise_seed=seed + sampling.ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
                     on_step=stepper("stage2"),
                 )
             finally:
@@ -612,7 +615,9 @@ class LTX25Engine:
                 guided,
                 video,
                 audio,
-                sampling.ltx2_schedule(steps, f * h1 * w1),
+                # Upstream calls scheduler.execute(steps) without a latent, so the
+                # shift is the 4096-token anchor (2.05) at every resolution.
+                sampling.ltx2_schedule(steps, 4096),
                 on_step=stepper("stage1"),
             )
 
@@ -634,13 +639,15 @@ class LTX25Engine:
                 tokens_per_frame=h2 * w2,
                 bf16_noise=self.bf16_noise,
             )
-            audio = sampling.noised_state(
-                (1, audio_t, 128),
-                apos,
-                seed + 2,
-                sigma=s0,
-                initial=a1,
-                bf16_noise=self.bf16_noise,
+            # Upstream ti2vid_two_stages.py refines stage 2 with freeze_audio=True:
+            # the stage-1 audio stays clean (sigma 0 for its tokens, its AdaLN and
+            # the cross-attention gates) and is what ships.
+            audio = sampling.LatentState(
+                latent=a1,
+                clean=a1,
+                denoise_mask=mx.zeros((1, audio_t, 1), dtype=G),
+                positions=apos,
+                frozen=True,
             )
             lora.attach(dit)
             try:

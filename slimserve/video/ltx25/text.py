@@ -133,8 +133,22 @@ class TextEncoder:
 
     # ---- pieces -----------------------------------------------------------
     def tokenize(self, prompt: str) -> list[int]:
+        """`<bos>` + prompt, truncated from the head to MAX_TOKENS.
+
+        The bundled Gemma-4 tokenizer's post-processor adds no special tokens,
+        so upstream's LTXGemmaTokenizer prepends BOS itself. Gemma's hidden
+        states depend on it at every position, and the aggregate projection and
+        connectors were trained on BOS-prefixed states; without it the text
+        conditioning is off-distribution (the Mac port has this bug).
+        """
         self.load_tokenizer()
-        return self.tokenizer.encode(prompt.strip()).ids[-MAX_TOKENS:]
+        ids = self.tokenizer.encode(prompt.strip()).ids
+        bos = self.tokenizer.token_to_id("<bos>")
+        if bos is None:
+            raise RuntimeError("tokenizer has no <bos>; the encode path requires it")
+        if not ids or ids[0] != bos:
+            ids = [bos, *ids]
+        return ids[:MAX_TOKENS]
 
     def _lin(self, w: dict[str, mx.array], name: str, x: mx.array) -> mx.array:
         wt, b = w[name + ".weight"], w.get(name + ".bias")
@@ -275,13 +289,13 @@ class TextEncoder:
         while f"{name}.transformer_1d_blocks.{i}.attn1.to_q.weight" in c:
             p = f"{name}.transformer_1d_blocks.{i}"
             z = mx.fast.rms_norm(x, None, 1e-6).astype(op)
-            # mlx nn.RMSNorm default eps (1e-5) is what the runner's connector q/k norms
-            # use
+            # Upstream Attention(norm_eps=1e-6); the Mac port's nn.RMSNorm default
+            # (1e-5) was a port deviation.
             q = mx.fast.rms_norm(
-                self._lin(c, p + ".attn1.to_q", z), c[p + ".attn1.q_norm.weight"], 1e-5
+                self._lin(c, p + ".attn1.to_q", z), c[p + ".attn1.q_norm.weight"], 1e-6
             )
             k = mx.fast.rms_norm(
-                self._lin(c, p + ".attn1.to_k", z), c[p + ".attn1.k_norm.weight"], 1e-5
+                self._lin(c, p + ".attn1.to_k", z), c[p + ".attn1.k_norm.weight"], 1e-6
             )
             v = self._lin(c, p + ".attn1.to_v", z)
             y = mx.fast.scaled_dot_product_attention(
