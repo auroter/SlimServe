@@ -745,3 +745,48 @@ change. Quality judgements are only valid at the default size; smaller sizes
 are for timing, not for looking at. Lightricks' own example prompt uses
 "a Caucasian man", so ethnicity words are in-distribution; the earlier note
 that they are weak was wrong.
+
+## 21. Closing the gaps: keyframe-aware decode, I2V, dev re-validated (2026-10-05)
+
+**Dev at the default size with section 20's fixes** (`demo/v4/beat1d_dev_1536.mp4`,
+1536x1024x121, seed 7): 1540.5 s cold (stage 1 1152.1 s = 30 guided steps at
+6,144 tokens x 4 passes, stage 2 227.7 s, decode 139.2 s). Clean, the most
+photographic of the three modes; STG 28, the anchored shift, the frozen stage-2
+audio and the full negative prompt all in.
+
+**Keyframe-aware diffusion decode** (upstream `keyframes.py`,
+`fallback_na/joint_eager.py`, `joint_triton.py`; DFR always decodes this way).
+The decoder carries a second stream of P keyframe planes (the stage-2 slot
+latents, one pixel frame each; `decoder.type_emb` added before the shared
+`conv_in`) through every stage with shared weights; the streams meet only
+inside one softmax. A video query sees its own window plus the Kh x Kw window
+at its (h, w) on the 2 nearest planes by |t_s(plane) - t| (ties to the lower
+index); a plane query sees its own plane's window plus the same window on its
+2 nearest video frames. Plane times `t_s(f) = (f + (r-1)/2) / r`, `t_s(0) = 0`,
+with r the remaining temporal upsampling (8, 8, 4, 2, 1), so both streams share
+one RoPE origin; planes upsample spatially only (phase-1 shuffle), draw their
+own stage-5 noise, and their pixels are discarded.
+
+The edge rule is different from the plain decode and it matters: upstream's
+joint backends use **centred windows with out-of-volume taps masked**
+("clamp-and-mask, not NATTEN's inward shift", matching their Pallas kernel),
+where the plain decode shifts the window inside. The first joint kernel reused
+the plain rule and missed by rel-L2 0.5; with the centred rule `na3d_joint`
+matches upstream's pure-torch `joint_na3d` (staged standalone at
+`~/.local/scratch/ltx25/n8/ltxkf`, run on CPU) at **rel-L2 4.0e-7 (video) /
+3.5e-7 (planes)**, `n8_joint_na_parity.py`. The kernel is the 8-lane online
+softmax with a second slot loop sharing m/l/acc.
+
+DFR 1536x1024x121 with the keyframe decode (`beat1d_dfr_kf_1536.mp4`):
+806.7 s (stage 1 125.8, stage 2 415.2, decode 246.7 s vs ~170 s plain: the
+plane stream and the joint windows). 5 planes for 121 frames.
+
+**I2V, first-frame conditioning** (`image.py`, `sampling.condition_latent_frame`,
+CLI `--image`, API `image` base64 / data URL, `image_strength`): the still is
+re-compressed as one H.264 frame at CRF 18 (what a 2.5 checkpoint resolves to
+through `LTX_2_4_PARAMS`, not 33), fill-resized (bilinear, align_corners=False,
+no antialias) and centre-cropped to each stage's own pixel size, mapped to
+[-1, 1], VAE-encoded, and written into latent frame 0 with denoise mask
+1 - strength in both stages (`VideoConditionByLatentIndex`,
+`image_conditionings_for_chunk`). 13 CPU tests cover the geometry, the
+request field and the mask arithmetic.
