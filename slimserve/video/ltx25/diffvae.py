@@ -249,6 +249,178 @@ def na3d(
     return out
 
 
+# ---- keyframe-aware (joint) attention --------------------------------------------
+# Upstream keyframes.py / fallback_na/joint_eager.py: a keyframe decode carries a
+# second stream of P "planes" (one pixel frame each) through the whole decoder
+# with fully shared weights. The streams meet only inside one softmax: a video
+# query sees its own Kt x Kh x Kw window plus the Kh x Kw window at its (h, w) on
+# the KEYFRAME_SLOTS nearest planes (by |t_s(plane) - t|, ties to the lower
+# index); a plane query sees the Kh x Kw window on its own plane plus the same
+# window on its nearest video frames. Nearest is independent of Kt.
+KEYFRAME_SLOTS = 2
+
+_NA_JOINT_SOURCE = """
+    // Joint (video + keyframe) NA, upstream joint_eager / joint_triton semantics:
+    // the window is CENTRED on the query and taps outside the volume are masked
+    // ("clamp-and-mask, not NATTEN's inward shift"), unlike the plain decode.
+    // (k, v) is the query's own volume (T frames, Kt window), (kb, vb) a stack of
+    // frames reached through slots[ti * S + s] (-1 = empty), Kh x Kw at (hi, wi).
+    const uint T = shape[0], H = shape[1], W = shape[2], NH = shape[3], S = shape[4];
+    const uint gid = thread_position_in_grid.x;
+    const uint lane = gid % LANES;
+    const uint tid = gid / LANES;
+    const uint total = T * H * W * NH;
+    const bool live = tid < total;
+    const uint head = live ? tid % NH : 0;
+    const uint tok = live ? tid / NH : 0;
+    const int wi = tok % W;
+    const int hi = (tok / W) % H;
+    const int ti = tok / (W * H);
+    const int t_lo = ti - (int)(KT / 2), t_hi = t_lo + (int)KT;
+    const int h_lo = hi - (int)(KH / 2), h_hi = h_lo + (int)KH;
+    const int w_lo = wi - (int)(KW / 2), w_hi = w_lo + (int)KW;
+    const int ta = max(t_lo, 0), tb = min(t_hi, (int)T);
+    const int ha = max(h_lo, 0), hb = min(h_hi, (int)H);
+    const int wa = max(w_lo, 0), wb = min(w_hi, (int)W);
+    const uint stride_tok = NH * HD;
+    const size_t base = (size_t)tid * HD + lane * DL;
+    float qr[DL];
+    for (uint d = 0; d < DL; ++d) qr[d] = (float)q[base + d];
+    float m = -INFINITY, l = 0.0f;
+    float acc[DL];
+    for (uint d = 0; d < DL; ++d) acc[d] = 0.0f;
+    for (int a = ta; a < tb; ++a) {
+        for (int b = ha; b < hb; ++b) {
+            const size_t row = ((size_t)a * H + b) * W;
+            for (int c = wa; c < wb; ++c) {
+                const size_t off = (row + c) * stride_tok + head * HD + lane * DL;
+                float s = 0.0f;
+                for (uint d = 0; d < DL; ++d) s += qr[d] * (float)k[off + d];
+                SHUFFLES                const float m_new = max(m, s);
+                const float corr = exp(m - m_new);
+                const float p = exp(s - m_new);
+                l = l * corr + p;
+                for (uint d = 0; d < DL; ++d)
+                    acc[d] = acc[d] * corr + p * (float)v[off + d];
+                m = m_new;
+            }
+        }
+    }
+    for (uint si = 0; si < S; ++si) {
+        const int pl = slots[ti * S + si];
+        if (pl < 0) continue;
+        for (int b = ha; b < hb; ++b) {
+            const size_t row = ((size_t)pl * H + b) * W;
+            for (int c = wa; c < wb; ++c) {
+                const size_t off = (row + c) * stride_tok + head * HD + lane * DL;
+                float s = 0.0f;
+                for (uint d = 0; d < DL; ++d) s += qr[d] * (float)kb[off + d];
+                SHUFFLES                const float m_new = max(m, s);
+                const float corr = exp(m - m_new);
+                const float p = exp(s - m_new);
+                l = l * corr + p;
+                for (uint d = 0; d < DL; ++d)
+                    acc[d] = acc[d] * corr + p * (float)vb[off + d];
+                m = m_new;
+            }
+        }
+    }
+    if (live) {
+        const float inv = 1.0f / l;
+        for (uint d = 0; d < DL; ++d) out[base + d] = (T_IN)(acc[d] * inv);
+    }
+"""
+
+
+def na3d_joint(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    kb: mx.array,
+    vb: mx.array,
+    slots: mx.array,
+    kernel: Kernel,
+    lanes: int = LANES,
+) -> mx.array:
+    """One softmax over the query's own window in (k, v) (1, T, H, W, heads, hd)
+    and the Kh x Kw window on each slot-indexed frame of (kb, vb)
+    (1, P, H, W, heads, hd); `slots` (T, S) int32, -1 for an empty slot.
+
+    The video pass calls this with the volume as (k, v) and the planes as (kb,
+    vb); the plane pass with the planes as (k, v) under a Kt = 1 kernel and the
+    nearest video frames as (kb, vb)."""
+    _, t, h, w, heads, hd = q.shape
+    key = ("joint", kernel, hd, str(q.dtype), lanes)
+    kern = _NA_KERNELS.get(key)
+    if kern is None:
+        src = _NA_JOINT_SOURCE.replace(
+            "SHUFFLES",
+            "".join(
+                f"s += simd_shuffle_xor(s, {o});\n" for o in (4, 2, 1) if o < lanes
+            ),
+        )
+        for name, val in (
+            ("KT", kernel[0]),
+            ("KH", kernel[1]),
+            ("KW", kernel[2]),
+            ("HD", hd),
+            ("LANES", lanes),
+            ("DL", hd // lanes),
+        ):
+            src = src.replace(name, str(val))
+        dt_tag = "f16" if q.dtype == mx.float16 else "f32"
+        kern = mx.fast.metal_kernel(
+            name=f"na3d_joint_{kernel[0]}x{kernel[1]}x{kernel[2]}_d{hd}_l{lanes}_{dt_tag}",
+            input_names=["q", "k", "v", "kb", "vb", "slots", "shape"],
+            output_names=["out"],
+            source=src,
+        )
+        _NA_KERNELS[key] = kern
+    if slots.ndim != 2 or slots.shape[0] != t:
+        raise ValueError(f"slots {slots.shape} for {t} query frames")
+    total = t * h * w * heads * lanes
+    shape = mx.array([t, h, w, heads, slots.shape[1]], dtype=mx.uint32)
+    mx.synchronize()  # same MLX 0.32.2 launch race as na3d
+    (out,) = kern(
+        inputs=[q, k, v, kb, vb, slots.astype(mx.int32), shape],
+        template=[("T_IN", q.dtype)],
+        grid=((total + 255) // 256 * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[q.shape],
+        output_dtypes=[q.dtype],
+    )
+    mx.eval(out)
+    mx.synchronize()
+    return out
+
+
+def nearest_slots(
+    query_times: np.ndarray, candidate_times: np.ndarray, n: int = KEYFRAME_SLOTS
+) -> np.ndarray:
+    """(Q, n) candidate indices ranked by (|dt|, index); -1 pads when there are
+    fewer than n candidates. Upstream `_nearest_slots` (stable argsort)."""
+    q = np.asarray(query_times, dtype=np.float32)
+    c = np.asarray(candidate_times, dtype=np.float32)
+    out = np.full((len(q), n), -1, dtype=np.int32)
+    if len(c) == 0:
+        return out
+    order = np.argsort(np.abs(q[:, None] - c[None, :]), axis=1, kind="stable")
+    take = min(n, len(c))
+    out[:, :take] = order[:, :take]
+    return out
+
+
+def keyframe_stage_times(pixel_frames: np.ndarray, remaining_stride: int) -> np.ndarray:
+    """Chunk-centre time of each keyframe in a stage's temporal units: a stage
+    whose remaining temporal upsampling is r has cells of r pixel frames except
+    cell 0 (the causal first frame), so t_s(0) = 0 and t_s(f) = (f + (r-1)/2) / r.
+    Video frame j at that stage sits at exactly j, so the two streams share one
+    origin. Upstream `keyframe_stage_times`."""
+    f = np.asarray(pixel_frames, dtype=np.float32)
+    t = (f + (remaining_stride - 1) / 2) / remaining_stride
+    return np.where(f == 0, 0.0, t).astype(np.float32)
+
+
 # ---- model ---------------------------------------------------------------------
 def _rms(x: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
     # fast.rms_norm accumulates in fp32 whatever the input dtype; no casts needed
@@ -407,16 +579,16 @@ class DiffusionVAE:
         y = x.astype(self.operand) @ wt.T
         return (y if b is None else y + b).astype(self.stream)
 
-    def _attn(
+    def _qkv(
         self,
         p: str,
         y: mx.array,
-        kernel: Kernel,
-        w_pos: mx.array | None = None,
         t_pos: mx.array | None = None,
-    ) -> mx.array:
-        """y (1, T, H, W, C) already normalised/modulated
-        -> attention output projected (stream dtype)."""
+        w_pos: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """y (1, T, H, W, C) already normalised/modulated -> q (pre-scaled), k, v
+        (1, T, H, W, heads, hd) in the operand dtype, RoPE applied at `t_pos`
+        (integer frame indices for video, fractional stage times for planes)."""
         cfg = self.cfg
         b, t, h, w, c = y.shape
         heads, hd = c // cfg.head_dim, cfg.head_dim
@@ -440,15 +612,69 @@ class DiffusionVAE:
         k = _axial_rope(k, t_pos, h_pos, w_pos, self.split, self.inv)
         q, k, v = (a.astype(self.operand) for a in (q, k, v))
         mx.eval(q, k, v)  # the fp32 RoPE temporaries die here
+        return q, k, v
+
+    def _attn(
+        self,
+        p: str,
+        y: mx.array,
+        kernel: Kernel,
+        w_pos: mx.array | None = None,
+        t_pos: mx.array | None = None,
+        planes: tuple[mx.array, mx.array] | None = None,
+    ) -> mx.array:
+        """y (1, T, H, W, C) already normalised/modulated
+        -> attention output projected (stream dtype). With `planes` = (plane
+        input (1, P, H, W, C) prepared the same way, plane times) the video
+        queries also see their nearest keyframe planes (joint softmax)."""
+        b, t, h, w, c = y.shape
+        q, k, v = self._qkv(p, y, t_pos, w_pos)
         del y
-        o = (
-            na3d(q, k, v, kernel)
-            if self.attention == "metal"
-            else na3d_mlx(q, k, v, kernel)
-        )
+        if planes is None:
+            o = (
+                na3d(q, k, v, kernel)
+                if self.attention == "metal"
+                else na3d_mlx(q, k, v, kernel)
+            )
+        else:
+            py, times = planes
+            _, kb, vb = self._qkv(p, py, times, w_pos)
+            t_np = np.arange(t) if t_pos is None else np.array(t_pos)
+            slots = mx.array(nearest_slots(t_np, np.array(times)))
+            o = na3d_joint(q, k, v, kb, vb, slots, kernel)
+            del kb, vb
         mx.eval(o)
         del q, k, v
         y = self._lin(p + ".proj", o.reshape(b, t, h, w, c))
+        mx.eval(y)
+        return y
+
+    def _plane_attn(
+        self,
+        p: str,
+        py: mx.array,
+        times: mx.array,
+        frames_of,
+        n_frames: int,
+        kernel: Kernel,
+    ) -> mx.array:
+        """The plane queries' pass: each plane attends to the Kh x Kw window on
+        itself (a Kt = 1 kernel over the plane stack) and on its nearest video
+        frames. `frames_of(indices)` returns those frames' prepared input
+        (1, n, H, W, C) from the pre-attention stream; only the frames some
+        plane points at are projected."""
+        b, n_planes, h, w, c = py.shape
+        slots = nearest_slots(np.array(times), np.arange(n_frames))
+        wanted = np.unique(slots[slots >= 0])
+        remap = {int(f): i for i, f in enumerate(wanted)}
+        local = np.vectorize(lambda s: remap[int(s)] if s >= 0 else -1)(slots)
+        q, k, v = self._qkv(p, py, times)
+        _, kb, vb = self._qkv(p, frames_of(wanted), mx.array(wanted).astype(G))
+        o = na3d_joint(
+            q, k, v, kb, vb, mx.array(local.astype(np.int32)), (1, kernel[1], kernel[2])
+        )
+        del q, k, v, kb, vb
+        y = self._lin(p + ".proj", o.reshape(b, n_planes, h, w, c))
         mx.eval(y)
         return y
 
@@ -468,10 +694,18 @@ class DiffusionVAE:
             yield c0, c1, s0, s1
 
     def _chunked_attention(
-        self, p: str, x: mx.array, kernel: Kernel, pre, w_slabs: bool
+        self,
+        p: str,
+        x: mx.array,
+        kernel: Kernel,
+        pre,
+        w_slabs: bool,
+        planes: tuple[mx.array, mx.array] | None = None,
     ) -> mx.array:
         """Attention over temporal chunks (and upstream's W slabs for stage 5);
-        `pre` maps a slab of x to its normalised/modulated input."""
+        `pre` maps a slab of x to its normalised/modulated input. `planes` =
+        (prepared plane input, plane times) adds the keyframe planes to every
+        video query's softmax."""
         cores = []
         for c0, c1, s0, s1 in self._t_chunks(x, kernel):
             xs = x[:, s0:s1]
@@ -479,8 +713,16 @@ class DiffusionVAE:
             if w_slabs:
                 halo = kernel[2] // 2
                 outs = []
-                for buf, w_pos, n in self._w_slabs(xs, halo):
-                    o = self._attn(p, pre(buf), kernel, w_pos=w_pos, t_pos=t_pos)
+                plane_slabs = (
+                    None
+                    if planes is None
+                    else [buf for buf, _, _ in self._w_slabs(planes[0], halo)]
+                )
+                for i, (buf, w_pos, n) in enumerate(self._w_slabs(xs, halo)):
+                    pl = None if planes is None else (plane_slabs[i], planes[1])
+                    o = self._attn(
+                        p, pre(buf), kernel, w_pos=w_pos, t_pos=t_pos, planes=pl
+                    )
                     del buf
                     o = o[:, c0 - s0 : c1 - s0, :, halo : halo + n]
                     mx.eval(o)
@@ -488,7 +730,9 @@ class DiffusionVAE:
                 core = mx.concatenate(outs, axis=3)
                 del outs
             else:
-                core = self._attn(p, pre(xs), kernel, t_pos=t_pos)[:, c0 - s0 : c1 - s0]
+                core = self._attn(p, pre(xs), kernel, t_pos=t_pos, planes=planes)[
+                    :, c0 - s0 : c1 - s0
+                ]
             mx.eval(core)
             cores.append(core)
         return cores[0] if len(cores) == 1 else mx.concatenate(cores, axis=1)
@@ -507,19 +751,62 @@ class DiffusionVAE:
             outs.append(y)
         return mx.concatenate(outs, axis=1)
 
-    def _det_block(self, p: str, x: mx.array, kernel: Kernel) -> mx.array:
+    def _det_block(
+        self,
+        p: str,
+        x: mx.array,
+        kernel: Kernel,
+        planes: tuple[mx.array, mx.array] | None = None,
+    ) -> mx.array | tuple[mx.array, mx.array]:
+        """Pre-norm NA -> SwiGLU with residuals. With `planes` = (plane stream,
+        plane times) both streams run the block with shared weights and meet in
+        the joint softmax (upstream NABlock.forward_with_keyframes)."""
         n1 = self.w[p + ".norm1.weight"]
-        x = x + self._chunked_attention(
-            p + ".attn", x, kernel, lambda b: _rms(b, n1), w_slabs=False
+        n2 = self.w[p + ".norm2.weight"]
+        if planes is None:
+            x = x + self._chunked_attention(
+                p + ".attn", x, kernel, lambda b: _rms(b, n1), w_slabs=False
+            )
+            x = x + self._swiglu(p + ".mlp", _rms(x, n2))
+            mx.eval(x)
+            return x
+        px, times = planes
+        py = _rms(px, n1)
+        plane_out = self._plane_attn(
+            p + ".attn",
+            py,
+            times,
+            lambda idx: _rms(x[:, mx.array(idx)], n1),
+            x.shape[1],
+            kernel,
         )
-        x = x + self._swiglu(p + ".mlp", _rms(x, self.w[p + ".norm2.weight"]))
-        mx.eval(x)
-        return x
+        x = x + self._chunked_attention(
+            p + ".attn",
+            x,
+            kernel,
+            lambda b: _rms(b, n1),
+            w_slabs=False,
+            planes=(py, times),
+        )
+        px = px + plane_out
+        x = x + self._swiglu(p + ".mlp", _rms(x, n2))
+        px = px + self._swiglu(p + ".mlp", _rms(px, n2), chunks=1)
+        mx.eval(x, px)
+        return x, px
 
     def _upsample(self, i: int, x: mx.array, drop_leading: bool) -> mx.array:
         stride, _ = self.cfg.upsamples[i]
         y = _pixel_shuffle(self._lin(f"decoder.upsamples.{i}.proj", x), stride)
         return y[:, 1:] if (stride[0] == 2 and drop_leading) else y
+
+    def _upsample_planes(self, i: int, px: mx.array) -> mx.array:
+        """Spatial-only upsample of the plane stack (1, P, H, W, C): each plane
+        is its own T = 1 clip, so a temporal stride of 2 yields two frames of
+        which the leading one is dropped (phase 1), keeping P invariant
+        (upstream `upsample_keyframe_planes`)."""
+        stride, _ = self.cfg.upsamples[i]
+        y = _pixel_shuffle(self._lin(f"decoder.upsamples.{i}.proj", px), stride)
+        return y[:, 1::2] if stride[0] == 2 else y
 
     def _w_slabs(self, x: mx.array, halo: int):
         """Upstream build_w_slabs: W_CHUNKS slabs with a `halo` on each side."""
@@ -604,30 +891,62 @@ class DiffusionVAE:
         bounds: list[tuple[int, int]],
         context: list[mx.array],
         mod: list[mx.array],
-    ) -> list[mx.array]:
-        """One stage-5 block over the chunk-resident residual stream."""
+        planes: tuple[mx.array, mx.array, mx.array] | None = None,
+    ) -> list[mx.array] | tuple[list[mx.array], mx.array]:
+        """One stage-5 block over the chunk-resident residual stream. With
+        `planes` = (plane stream, plane context, plane times) the keyframe pixel
+        stream runs the same block (own context injection, joint softmax, shared
+        MLP; upstream forward_combined_with_keyframes)."""
         table = self.w[p + ".scale_shift_table"]
         pm = [m + table[i].reshape(1, 1, 1, 1, -1) for i, m in enumerate(mod)]
         scale_msa, shift_msa, scale_mlp, shift_mlp = pm[0], pm[1], pm[3], pm[4]
         n1, n2 = self.w[p + ".norm1.weight"], self.w[p + ".norm2.weight"]
         kernel = self.cfg.stage5_kernel
         halo_w = kernel[2] // 2
+
+        def pre(b):
+            return _rms(b, n1) * (1 + scale_msa) + shift_msa
+
         # 1. context injection, per chunk
         for i, (c0, c1) in enumerate(bounds):
             chunks[i] = (chunks[i] + self._lin(p + ".context_proj", context[i])).astype(
                 self.stream
             )
             mx.eval(chunks[i])
+        plane_slabs = plane_out = None
+        if planes is not None:
+            px, pctx, times = planes
+            px = (px + self._lin(p + ".context_proj", pctx)).astype(self.stream)
+            py = pre(px)
+            n_frames = bounds[-1][1]
+
+            def frames_of(idx):
+                parts = []
+                for f in idx:
+                    f = int(f)
+                    ci = next(i for i, (c0, c1) in enumerate(bounds) if c0 <= f < c1)
+                    parts.append(
+                        chunks[ci][:, f - bounds[ci][0] : f - bounds[ci][0] + 1]
+                    )
+                return pre(mx.concatenate(parts, axis=1))
+
+            plane_out = self._plane_attn(
+                p + ".attn", py, times, frames_of, n_frames, kernel
+            )
+            plane_slabs = [buf for buf, _, _ in self._w_slabs(py, halo_w)]
         # 2. attention: read slabs from the pre-attention stream, write the new stream
         new = []
         for i, (c0, c1) in enumerate(bounds):
             slab, off, s0 = self._slab(chunks, bounds, i, kernel)
             t_pos = mx.arange(s0, s0 + slab.shape[1]).astype(G)
             outs = []
-            for buf, w_pos, n in self._w_slabs(slab, halo_w):
-                y = _rms(buf, n1) * (1 + scale_msa) + shift_msa
+            for j, (buf, w_pos, n) in enumerate(self._w_slabs(slab, halo_w)):
+                y = pre(buf)
                 del buf
-                o = self._attn(p + ".attn", y, kernel, w_pos=w_pos, t_pos=t_pos)
+                pl = None if planes is None else (plane_slabs[j], times)
+                o = self._attn(
+                    p + ".attn", y, kernel, w_pos=w_pos, t_pos=t_pos, planes=pl
+                )
                 del y
                 o = o[:, off : off + (c1 - c0), :, halo_w : halo_w + n]
                 mx.eval(o)
@@ -644,7 +963,14 @@ class DiffusionVAE:
                 p + ".mlp", _rms(chunks[i], n2) * (1 + scale_mlp) + shift_mlp
             )
             mx.eval(chunks[i])
-        return chunks
+        if planes is None:
+            return chunks
+        px = px + plane_out
+        px = px + self._swiglu(
+            p + ".mlp", _rms(px, n2) * (1 + scale_mlp) + shift_mlp, chunks=1
+        )
+        mx.eval(px)
+        return chunks, px
 
     # ---- decode ----
     def denormalize(self, z: mx.array) -> mx.array:
@@ -681,20 +1007,60 @@ class DiffusionVAE:
             )
         return latent, h_b, w_b
 
-    def stages_1_to_4(self, latent_padded: mx.array, tap=None) -> mx.array:
+    def remaining_time_strides(self) -> tuple[int, ...]:
+        """Temporal upsampling still to come at each stage input, plus 1 for
+        stage 5: (8, 8, 4, 2, 1) for the production ladder."""
+        strides = [st for (st, _, _), _ in self.cfg.upsamples]
+        return tuple(math.prod(strides[i:]) for i in range(len(strides))) + (1,)
+
+    def stages_1_to_4(
+        self,
+        latent_padded: mx.array,
+        tap=None,
+        keyframes: tuple[mx.array, np.ndarray] | None = None,
+    ) -> mx.array | tuple[mx.array, mx.array]:
+        """Deterministic stages. `keyframes` = (plane latents (1, C, P, H, W)
+        padded like the video latent, pixel frame index per plane) runs the
+        dual stream and also returns the planes' stage-4 feature."""
         cfg = self.cfg
         z = self.denormalize(latent_padded)
         z = mx.concatenate(
             [z, mx.repeat(z[:, :, -1:], cfg.ghost_frames, axis=2)], axis=2
         )
         x = self._lin("decoder.conv_in", z.transpose(0, 2, 3, 4, 1))
+        px = frames = None
+        if keyframes is not None:
+            planes, frames = keyframes
+            # the keyframe tag is the only plane-specific weight: added to the
+            # un-normalised latents right before the shared conv_in
+            pz = self.denormalize(planes).transpose(0, 2, 3, 4, 1) + self.w[
+                "decoder.type_emb"
+            ].reshape(1, 1, 1, 1, -1)
+            px = self._lin("decoder.conv_in", pz)
+        remaining = self.remaining_time_strides()
         for s in range(4):
+            times = (
+                None
+                if px is None
+                else mx.array(keyframe_stage_times(frames, remaining[s]))
+            )
             for i in range(cfg.depths[s]):
-                x = self._det_block(f"decoder.det_stages.{s}.{i}", x, cfg.kernels[s])
+                if px is None:
+                    x = self._det_block(
+                        f"decoder.det_stages.{s}.{i}", x, cfg.kernels[s]
+                    )
+                else:
+                    x, px = self._det_block(
+                        f"decoder.det_stages.{s}.{i}", x, cfg.kernels[s], (px, times)
+                    )
             if tap:
                 tap(f"s{s + 1}.out", x)
+                if px is not None:
+                    tap(f"s{s + 1}.planes", px)
             if s < 3:
                 x = self._upsample(s, x, drop_leading=True)
+                if px is not None:
+                    px = self._upsample_planes(s, px)
         # ghost crop: the replicated frames fed stage 1-4's windows and are dropped here
         strides = cfg.cumulative_strides()[3]
         keep = min(
@@ -704,11 +1070,20 @@ class DiffusionVAE:
                 math.ceil(cfg.stage5_kernel[0] / 2),
             ),
         )
-        return x[:, :keep]
+        return x[:, :keep] if px is None else (x[:, :keep], px)
 
     def stage_5(
-        self, x_t: mx.array, feat: mx.array, t: float = 1.0, tap=None
+        self,
+        x_t: mx.array,
+        feat: mx.array,
+        t: float = 1.0,
+        tap=None,
+        keyframes: tuple[mx.array, mx.array, np.ndarray] | None = None,
     ) -> mx.array:
+        """One x0 step. `keyframes` = (plane noise (1, C_out, P, H_px, W_px),
+        plane stage-4 feature, pixel frame index per plane): the keyframe pixel
+        stream runs alongside so the joint attention reads planes at the noise
+        level it was trained on; only the video pixels are returned."""
         cfg = self.cfg
         (st3, _, _), _ = cfg.upsamples[3]
         te = _timestep_embedding(mx.array([t * cfg.timestep_scale]), cfg.t_freq)
@@ -750,16 +1125,34 @@ class DiffusionVAE:
                 raise RuntimeError(f"context chunk {piece.shape} for frames {c0}:{c1}")
             context.append(piece)
         del feat
-        for i in range(cfg.depths[4]):
-            chunks = self._diff_block(
-                f"decoder.diff_blocks.{i}", chunks, bounds, context, mod
+        planes = None
+        if keyframes is not None:
+            p_noise, p_feat, frames = keyframes
+            # plane context: upsample 3 of the planes' stage-4 feature, phase 1
+            pctx = _pixel_shuffle(
+                self._lin("decoder.upsamples.3.proj", p_feat), cfg.upsamples[3][0]
             )
+            pctx = (pctx[:, 1::2] if st3 == 2 else pctx).astype(self.operand)
+            px = self._lin("decoder.conv_in_x_t", _patchify(p_noise, cfg.patch))
+            # at stage 5 the remaining stride is 1: plane times are pixel frames
+            planes = (px, pctx, mx.array(keyframe_stage_times(frames, 1)))
+            mx.eval(px, pctx)
+        for i in range(cfg.depths[4]):
+            if planes is None:
+                chunks = self._diff_block(
+                    f"decoder.diff_blocks.{i}", chunks, bounds, context, mod
+                )
+            else:
+                chunks, px = self._diff_block(
+                    f"decoder.diff_blocks.{i}", chunks, bounds, context, mod, planes
+                )
+                planes = (px, planes[1], planes[2])
             if tap:
                 tap(
                     f"s5.b{i}.out",
                     chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=1),
                 )
-        del context
+        del context, planes
         pixels = []
         for ch in chunks:
             px = _unpatchify(
@@ -773,21 +1166,83 @@ class DiffusionVAE:
             pixels.append(px)
         return pixels[0] if len(pixels) == 1 else mx.concatenate(pixels, axis=2)
 
-    def decode_raw(self, latent: mx.array, seed: int = 0, tap=None) -> mx.array:
+    def _pad_planes(self, planes: mx.array, h_b: int, w_b: int, h: int, w: int):
+        """The spatial padding `_pad_to_floor` gave the video latent, applied to
+        the plane stack (1, C, P, h, w): both streams must share one geometry
+        or every plane is offset from the video."""
+        _, _, _, ph, pw = planes.shape
+        if (ph, pw) != (h, w):
+            raise ValueError(f"plane latents {planes.shape} vs video {(h, w)}")
+        _, h_min, w_min = self.cfg.min_latent_shape()
+        h_need, w_need = max(h_min - h, 0), max(w_min - w, 0)
+        if h_need:
+            planes = mx.concatenate(
+                [
+                    mx.repeat(planes[:, :, :, :1], h_b, 3),
+                    planes,
+                    mx.repeat(planes[:, :, :, -1:], h_need - h_b, 3),
+                ],
+                axis=3,
+            )
+        if w_need:
+            planes = mx.concatenate(
+                [
+                    mx.repeat(planes[..., :1], w_b, 4),
+                    planes,
+                    mx.repeat(planes[..., -1:], w_need - w_b, 4),
+                ],
+                axis=4,
+            )
+        return planes
+
+    def decode_raw(
+        self,
+        latent: mx.array,
+        seed: int = 0,
+        tap=None,
+        keyframes: tuple[mx.array, list[int]] | None = None,
+    ) -> mx.array:
         """Normalized latent (1, 128, F, H, W)
-        -> pixels (1, 3, 8F-7, 32H, 32W) fp32 in ~[-1, 1]."""
+        -> pixels (1, 3, 8F-7, 32H, 32W) fp32 in ~[-1, 1].
+
+        `keyframes` = (normalized plane latents (1, 128, P, H, W), one latent
+        frame per keyframe, each encoded/generated as a standalone one-frame
+        clip; its pixel frame index per plane) runs upstream's keyframe-aware
+        decode (DFR always decodes this way)."""
         self.load()
         cfg = self.cfg
         _, _, f, h, w = latent.shape
         padded, h_b, w_b = self._pad_to_floor(latent.astype(G))
-        feat = self.stages_1_to_4(padded, tap)
+        f_px_total = (f - 1) * cfg.cumulative_strides()[4][0] + 1
+        if keyframes is not None:
+            planes, frames = keyframes
+            frames = np.asarray(frames, dtype=np.int64)
+            if planes.shape[2] != len(frames) or planes.shape[2] == 0:
+                raise ValueError(
+                    f"{planes.shape[2]} planes for {len(frames)} frame indices"
+                )
+            if frames.min() < 0 or frames.max() >= f_px_total:
+                raise ValueError(f"keyframe frames {frames} outside 0..{f_px_total}")
+            planes = self._pad_planes(planes.astype(G), h_b, w_b, h, w)
+            feat, p_feat = self.stages_1_to_4(padded, tap, (planes, frames))
+        else:
+            feat = self.stages_1_to_4(padded, tap)
         t4, h4, w4 = feat.shape[1:4]
         (st, sh, sw), _ = cfg.upsamples[3]
         canvas = (t4 * st - 1, h4 * sh * cfg.patch, w4 * sw * cfg.patch)
         noise = mx.random.normal(
             (1, cfg.out_channels, *canvas), key=mx.random.key(seed + NOISE_SEED_OFFSET)
         )
-        pixels = self.stage_5(noise.astype(self.stream), feat, 1.0, tap)
+        kf = None
+        if keyframes is not None:
+            # the plane stream draws its own noise, after the video's (upstream
+            # draws both from one generator in that order)
+            p_noise = mx.random.normal(
+                (1, cfg.out_channels, len(frames), canvas[1], canvas[2]),
+                key=mx.random.key(seed + NOISE_SEED_OFFSET + 1),
+            )
+            kf = (p_noise.astype(self.stream), p_feat, frames)
+        pixels = self.stage_5(noise.astype(self.stream), feat, 1.0, tap, kf)
         t_scale = cfg.cumulative_strides()[4][0]
         s_scale = cfg.cumulative_strides()[4][1] * cfg.patch
         f_px, h_px, w_px = (f - 1) * t_scale + 1, h * s_scale, w * s_scale

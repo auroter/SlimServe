@@ -68,6 +68,9 @@ class Result:
     width: int
     fps: float
     timings: Timings
+    # DFR: the stage-2 keyframe slots (normalized (1, 128, K, H, W)) and their
+    # pixel frames, for the keyframe-aware diffusion decode
+    keyframes: tuple[mx.array, list[int]] | None = None
 
 
 class Denoiser:
@@ -307,6 +310,44 @@ class LTX25Engine:
 
         return stepper
 
+    # ---- image conditioning (I2V) -------------------------------------------
+    @staticmethod
+    def _prepare_image(image: str | bytes | None):
+        if image is None:
+            return None
+        from slimserve.video.ltx25 import image as image_mod
+
+        return image_mod.prepare_image(image, crf=image_mod.DEFAULT_IMAGE_CRF)
+
+    def _image_latent(self, prepared, h: int, w: int, tm: Timings) -> mx.array | None:
+        """Encode the prepared still at one stage's pixel size (h*32 x w*32)
+        through the conv VAE encoder: normalized (1, 128, 1, h, w). Upstream
+        re-encodes per stage (chunks/conditionings.py image_conditionings_for_chunk
+        at the chunk's _pixel_hw), so both stages are conditioned. Called outside
+        the stage spans: a span resets the peak-memory counter on entry."""
+        if prepared is None:
+            return None
+        from slimserve.video.ltx25 import image as image_mod
+
+        with tm.span("image"):
+            pixels = image_mod.conditioning_frame(prepared, h * 32, w * 32)
+            latent = self.load_vae().encode(pixels)
+            mx.eval(latent)
+            del pixels
+        return latent
+
+    @staticmethod
+    def _condition(
+        video: LatentState, latent: mx.array | None, strength: float
+    ) -> LatentState:
+        """Pin the encoded first frame to latent frame 0 (upstream
+        VideoConditionByLatentIndex, latent_idx 0)."""
+        if latent is None:
+            return video
+        video = sampling.condition_latent_frame(video, latent, strength)
+        mx.eval(video.latent, video.clean, video.denoise_mask)
+        return video
+
     # ---- distilled --------------------------------------------------------
     def distilled(
         self,
@@ -319,7 +360,11 @@ class LTX25Engine:
         text_embeds: tuple[mx.array, mx.array] | None = None,
         keep_text: bool = True,
         on_step: Callable[[str, int, float], None] | None = None,
+        image: str | bytes | None = None,
+        image_strength: float = 1.0,
     ) -> Result:
+        """`image` (a path or encoded image bytes) conditions the first frame
+        (image-to-video) at `image_strength` in both stages."""
         tm = Timings()
         if text_embeds is None:
             with tm.span("text"):
@@ -341,6 +386,8 @@ class LTX25Engine:
         apos = sampling.audio_positions(audio_t)
 
         stepper = self._stepper(tm, on_step)
+        still = self._prepare_image(image)
+        cond1 = self._image_latent(still, h1, w1, tm)
 
         # Stage 1: half resolution, from pure noise, ancestral Euler.
         with tm.span("stage1"):
@@ -351,6 +398,7 @@ class LTX25Engine:
                 tokens_per_frame=h1 * w1,
                 bf16_noise=self.bf16_noise,
             )
+            video = self._condition(video, cond1, image_strength)
             audio = sampling.noised_state(
                 (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
             )
@@ -368,11 +416,12 @@ class LTX25Engine:
             half = sampling.unpatchify(v1, (f, h1, w1))
             up = vae.normalize(upscaler(vae.denormalize(half)))
             mx.eval(up)
+        h2, w2 = h1 * 2, w1 * 2
+        cond2 = self._image_latent(still, h2, w2, tm)
 
         # Stage 2: full resolution refinement from sigma 0.909; ancestral too on
         # 2.5 checkpoints (upstream distilled.py), from its own noise offset.
         with tm.span("stage2"):
-            h2, w2 = h1 * 2, w1 * 2
             s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
             video = sampling.noised_state(
                 (1, f * h2 * w2, 128),
@@ -383,6 +432,7 @@ class LTX25Engine:
                 tokens_per_frame=h2 * w2,
                 bf16_noise=self.bf16_noise,
             )
+            video = self._condition(video, cond2, image_strength)
             audio = sampling.noised_state(
                 (1, audio_t, 128),
                 apos,
@@ -424,11 +474,14 @@ class LTX25Engine:
         text_embeds: tuple[mx.array, mx.array] | None = None,
         keep_text: bool = True,
         on_step: Callable[[str, int, float], None] | None = None,
+        image: str | bytes | None = None,
+        image_strength: float = 1.0,
     ) -> Result:
         """Lightricks' DFRPipeline, default configuration: the distilled flow
         with one generated keyframe slot per 24/32-frame segment in stage 1,
         then a stage 2 that runs under the detailing IC-LoRA with the upscaled
         slots and the half-resolution stage-1 latent as reference tokens.
+        `image` conditions the first frame in both stages (see `distilled`).
         Temporal rounds and the second spatial epilogue are not implemented."""
         if self.variant != "distilled":
             raise ValueError("the DFR pipeline runs on the distilled transformer")
@@ -456,6 +509,8 @@ class LTX25Engine:
         audio_t = sampling.audio_token_count(canvas, fps)
         apos = sampling.audio_positions(audio_t)
         k = len(slot_frames)
+        still = self._prepare_image(image)
+        cond1 = self._image_latent(still, h1, w1, tm)
 
         with tm.span("stage1"):
             video = sampling.noised_state(
@@ -465,6 +520,7 @@ class LTX25Engine:
                 tokens_per_frame=h1 * w1,
                 bf16_noise=self.bf16_noise,
             )
+            video = self._condition(video, cond1, image_strength)
             video, slots = sampling.append_slots(
                 video, slot_frames, h1, w1, cfps, None, 1.0, seed
             )
@@ -489,9 +545,10 @@ class LTX25Engine:
                 )
             )
             mx.eval(up, slots_up)
+        h2, w2 = h1 * 2, w1 * 2
+        cond2 = self._image_latent(still, h2, w2, tm)
 
         with tm.span("stage2"):
-            h2, w2 = h1 * 2, w1 * 2
             s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
             video = sampling.noised_state(
                 (1, f * h2 * w2, 128),
@@ -502,7 +559,8 @@ class LTX25Engine:
                 tokens_per_frame=h2 * w2,
                 bf16_noise=self.bf16_noise,
             )
-            video, _ = sampling.append_slots(
+            video = self._condition(video, cond2, image_strength)
+            video, slots2 = sampling.append_slots(
                 video, slot_frames, h2, w2, cfps, slots_up, s0, seed + 2
             )
             video = sampling.append_reference(
@@ -534,6 +592,14 @@ class LTX25Engine:
 
         keep = (num_frames - 1) // 8 + 1  # trim the canvas padding back off
         latent = sampling.unpatchify(v2[:, : f * h2 * w2], (f, h2, w2))[:, :, :keep]
+        # the denoised slots anchor the decode (upstream DFR always keyframe-
+        # decodes); slots past the trimmed clip are dropped
+        planes = sampling.slots_to_latent(v2, slots2, k, h2, w2)
+        kept = [i for i, fr in enumerate(slot_frames) if fr < num_frames]
+        keyframes = None
+        if kept:
+            keyframes = (planes[:, :, mx.array(kept)], [slot_frames[i] for i in kept])
+            mx.eval(keyframes[0])
         return Result(
             latent,
             a1[:, : sampling.audio_token_count(num_frames, fps)],
@@ -542,6 +608,7 @@ class LTX25Engine:
             width,
             fps,
             tm,
+            keyframes=keyframes,
         )
 
     # ---- dev --------------------------------------------------------------
@@ -567,10 +634,13 @@ class LTX25Engine:
         batched: bool = True,
         keep_text: bool = True,
         on_step: Callable[[str, int, float], None] | None = None,
+        image: str | bytes | None = None,
+        image_strength: float = 1.0,
     ) -> Result:
         """Lightricks' TI2VidTwoStagesPipeline: guided dev stage 1 at half
         resolution, 2x latent upscale, 3-step stage 2 with the distilled LoRA
-        and no guidance. Audio is taken from stage 1, as upstream."""
+        and no guidance. Audio is taken from stage 1, as upstream. `image`
+        conditions the first frame in both stages (see `distilled`)."""
         if self.variant != "dev":
             raise ValueError("the dev pipeline needs LTX25Engine(variant='dev')")
         tm = Timings()
@@ -596,6 +666,8 @@ class LTX25Engine:
         audio_t = sampling.audio_token_count(num_frames, fps)
         apos = sampling.audio_positions(audio_t)
         stepper = self._stepper(tm, on_step)
+        still = self._prepare_image(image)
+        cond1 = self._image_latent(still, h1, w1, tm)
 
         with tm.span("stage1"):
             video = sampling.noised_state(
@@ -605,6 +677,7 @@ class LTX25Engine:
                 tokens_per_frame=h1 * w1,
                 bf16_noise=self.bf16_noise,
             )
+            video = self._condition(video, cond1, image_strength)
             audio = sampling.noised_state(
                 (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
             )
@@ -626,9 +699,10 @@ class LTX25Engine:
                 upscaler(vae.denormalize(sampling.unpatchify(v1, (f, h1, w1))))
             )
             mx.eval(up)
+        h2, w2 = h1 * 2, w1 * 2
+        cond2 = self._image_latent(still, h2, w2, tm)
 
         with tm.span("stage2"):
-            h2, w2 = h1 * 2, w1 * 2
             s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
             video = sampling.noised_state(
                 (1, f * h2 * w2, 128),
@@ -639,6 +713,7 @@ class LTX25Engine:
                 tokens_per_frame=h2 * w2,
                 bf16_noise=self.bf16_noise,
             )
+            video = self._condition(video, cond2, image_strength)
             # Upstream ti2vid_two_stages.py refines stage 2 with freeze_audio=True:
             # the stage-1 audio stays clean (sigma 0 for its tokens, its AdaLN and
             # the cross-attention gates) and is what ships.
@@ -703,7 +778,9 @@ class LTX25Engine:
                         "next to the resident models; "
                         "use decoder=conv or a smaller clip"
                     )
-                pixels = self.load_diffvae().decode_raw(result.video_latent, seed=seed)
+                pixels = self.load_diffvae().decode_raw(
+                    result.video_latent, seed=seed, keyframes=result.keyframes
+                )
                 frames = vae_mod.to_uint8(pixels)
                 del pixels
             else:
