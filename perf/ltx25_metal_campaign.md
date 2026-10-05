@@ -714,3 +714,19 @@ distilled and DFR, dev schedule at the 4096-token anchor, dev stage 2 with
 frozen audio. Section 18's STG claim is withdrawn. Parity against the port is
 now expected to differ on the text path (by design) and on stage 2; the
 reference for parity from here on is upstream, not the port.
+
+**A/B after the fixes** (`~/.local/scratch/ltx25/demo/v4/`, distilled,
+diffusion decoder, seed 7). A single-shot portrait prompt at 768x512x121
+(`prompt_portrait.txt`): all fixes 107.7 s; BOS removed only 105.1 s; plain
+Euler stage 2 only 105.0 s. All three are lifelike; BOS changes prompt
+adherence and tone (dark-blonde hair and warm directional light with it,
+dark brown hair and a flatter image without), the stage-2 sampler is a small
+texture difference on this clip. The section-19 prompt v3 (three cuts, two
+cat-headed alchemists) at 1216x640x241 with all fixes: 465.2 s,
+`distilled_v3prompt_fixed.mp4`. Against the section-19 DFR/dev renders of the
+same prompt: the identity bleed is gone (no hair on the alchemists, she
+keeps her own clothes through the greeting), the alchemists are furred,
+whiskered cats, hands and fabric are correct. So the fixes matter most where
+the conditioning is complex; a simple prompt hid them. The user's own
+observation stands as well: upstream's guidance is one continuous shot per
+prompt, and multi-cut prompts remain the weakest case.
