@@ -705,7 +705,9 @@ final-normed), the per-token RMS over layers, the rescale and the two
 aggregate projections, left padding and positions, the registers, the
 connector architecture; DFR segment layout and LoRA strengths. There are no
 sigma-schedule or LoRA-blend differences. Upstream's official default output
-is 768x512x121 (stage 1 at 384x256); ours is 1536x1024.
+is 1536x1024x121 (`default_2_stage_distilled_arg_parser` sets
+height/width to `stage_2_*`; stage 1 at 768x512), the same as our profile
+default. An earlier draft of this section said 768x512: wrong.
 
 Fixes (this commit): `text.py` prepends BOS and truncates from the head,
 connector eps 1e-6; `sampling.py` STG block 28, the full negative prompt,
@@ -730,3 +732,16 @@ whiskered cats, hands and fabric are correct. So the fixes matter most where
 the conditioning is complex; a simple prompt hid them. The user's own
 observation stands as well: upstream's guidance is one continuous shot per
 prompt, and multi-cut prompts remain the weakest case.
+
+**Stage-1 size is not negotiable** (2026-10-05, later). The 768x512 and
+1216x640 renders above ran stage 1 at 384x256 and 608x320; upstream's
+distilled and DFR defaults are output 1536x1024 with stage 1 at 768x512
+(24x16 latent cells). At 12x8 cells a walking figure is a few cells wide and
+the anatomy and gait come out wrong (`beat1_768.mp4`); a static close-up
+face survives it, which is why the portrait A/B looked fine. The same prompt
+at 1536x1024x121 (`beat1_1536.mp4`, 478.3 s: stage 1 91.9, stage 2 202.0,
+decode 168.9) has correct proportions, a natural stride and the written gaze
+change. Quality judgements are only valid at the default size; smaller sizes
+are for timing, not for looking at. Lightricks' own example prompt uses
+"a Caucasian man", so ethnicity words are in-distribution; the earlier note
+that they are weak was wrong.
