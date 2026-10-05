@@ -44,6 +44,17 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     for key in ("size", "seconds", "seed", "negative_prompt", "decoder"):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
+    if getattr(args, "image", None):
+        try:
+            body["image"] = Path(args.image).expanduser().read_bytes()
+        except OSError as error:
+            term.fail(f"cannot read --image: {error}")
+            return 2
+        if getattr(args, "image_strength", None) is not None:
+            body["image_strength"] = args.image_strength
+    elif getattr(args, "image_strength", None) is not None:
+        term.fail("--image-strength needs --image")
+        return 2
     try:
         params = server.normalize_request(body, cfg)
     except server.BadRequest as error:

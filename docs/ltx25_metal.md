@@ -21,6 +21,7 @@ slimserve ltx25-distilled --dry-run                 # show the resolved plan
 slimserve ltx25-distilled -y                        # fetch weights if needed, then serve on :8000
 slimserve ltx25-dev -p "A red fox trotting through a snowy pine forest at dawn" --output fox.mp4
 slimserve ltx25-dfr -p "..." --size 768x512 --seconds 5 --seed 7
+slimserve ltx25-distilled -p "the fox turns and runs" --image fox.png     # image-to-video
 ```
 
 The weights are gated: the Hugging Face token on the machine must have
@@ -31,7 +32,8 @@ PATH.
 Serving API (a clip takes minutes, so it is job-shaped):
 
 ```
-POST   /v1/videos               {"prompt": "...", "size": "1536x1024", "seconds": 5, "seed": 42}
+POST   /v1/videos               {"prompt": "...", "size": "1536x1024", "seconds": 5, "seed": 42,
+                                 "image": "<base64 or data: URL>", "image_strength": 1.0}
 GET    /v1/videos/<id>          status (queued | in_progress | completed | failed), progress, timings
 GET    /v1/videos/<id>/content  the mp4
 DELETE /v1/videos/<id>
@@ -48,6 +50,41 @@ what was measured to fit in memory. There is one GPU, so requests run one at
 a time in arrival order with the weights resident; up to 16 may wait (then
 429). Finished clips are kept under `$SLIMSERVE_VIDEO_DIR`
 (default `~/.cache/slimserve/videos`), the most recent 32.
+
+### Image-to-video
+
+`image` makes a still the clip's first frame, on every pipeline. The engine
+follows Lightricks' `ltx_pipelines` conditioning path exactly:
+
+- The still is decoded to sRGB (EXIF orientation applied), then re-compressed
+  once as a single H.264 frame (libx264, preset veryfast, yuv420p) at CRF 18
+  and decoded back (upstream `media_io/decode.py preprocess`; CRF 18 is
+  `LTX_2_4_IMAGE_CRF`, the value for 2.4+ checkpoints, not the 2.0-era 33).
+  The model was trained on video frames that carry H.264 compression
+  statistics; a pristine PNG conditions it off-distribution and the first
+  frame then "pops". Odd edges are trimmed to even sizes first, as the codec
+  requires. The round trip runs through the `ffmpeg` binary (as the muxer
+  does), with bilinear chroma scaling on both legs like PyAV's default.
+- It is resized to fill the target (scale = max(H/src_h, W/src_w), ceil'd
+  sizes, bilinear, `align_corners=False`, no antialias), center-cropped and
+  mapped to [-1, 1] by `x / 127.5 - 1` (`resize.py resize_and_center_crop`,
+  `range_map.py normalize_images`).
+- Both stages are conditioned (upstream
+  `chunks/conditionings.py image_conditionings_for_chunk` encodes at each
+  chunk's own pixel size): in stage 1 the still is encoded at the half
+  resolution through the conv VAE encoder, in stage 2 at the full
+  resolution. Each encoding is written into the latent state's clean tokens
+  at latent frame 0 with denoise mask `1 - image_strength`
+  (`ltx_core latent_cond.py _apply_condition_by_latent_index`), and the
+  noised state is `lerp(clean, noised, mask)` so a strength-1 frame starts
+  clean and stays clean through the sampler; the transformer sees per-token
+  timesteps `mask * sigma`. In DFR this happens before the keyframe slots
+  and the reference tokens are appended.
+
+CLI: `--image PATH` and `--image-strength` (0-1, default 1.0). API: `image`
+is the encoded still (PNG, JPEG, ...) as base64, optionally a
+`data:image/png;base64,...` URL, with `image_strength`; undecodable payloads
+are a 400. The encode is timed as the `image` span (both stages summed).
 
 ## Measured (M1 Ultra 64-core GPU, 128 GiB, macOS 15.7.2, seed 42)
 
@@ -151,13 +188,16 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 | `pipeline.py` | `LTX25Engine`: distilled, dev, dfr, render; memory budgeting |
 | `lora.py` | runtime low-rank adapters |
 | `vae.py`, `upscaler.py` | conv VAE (slab conv3d, tiling planner), latent upscalers |
+| `image.py` | image-to-video still: decode, CRF-18 round trip, upstream resize/crop/normalize |
 | `audio.py`, `mux.py` | audio VAE + vocoder + bandwidth extension; ffmpeg mux |
 | `../server.py`, `../cli.py` | the job queue and HTTP API; `slimserve` integration |
 
 ## Not implemented yet
 
-- Image-to-video conditioning (the VAE encoder is ported and parity-checked;
-  the conditioning path is not wired).
+- Image conditioning beyond the first frame (keyframes at other frame
+  indices, video-to-video reference conditioning); the I2V first-frame path
+  is wired but its end-to-end output has not yet been compared against
+  upstream on this machine.
 - DFR temporal rounds and the second spatial epilogue; the duration head;
   the prompt enhancer; the res_2s sampler (HQ pipeline).
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on

@@ -6,19 +6,27 @@ owns the engine (and every MLX call), with the weights resident between
 requests. The API is job-shaped because a clip takes minutes:
 
     POST   /v1/videos                 {"prompt": ..., "size": "1536x1024",
-                                       "seconds": 5, "seed": 42}
+                                       "seconds": 5, "seed": 42,
+                                       "image": <base64 or data: URL>,
+                                       "image_strength": 1.0}
     GET    /v1/videos/<id>            status, progress, timings
     GET    /v1/videos/<id>/content    the mp4 (H.264 + AAC)
     DELETE /v1/videos/<id>
     GET    /v1/models, /health
 
 `"wait": true` in the POST body holds the request open and returns the
-finished job. Requests outside the profile's validated envelope are refused:
-the envelope is what was measured to fit this machine's memory.
+finished job. `image` (image-to-video) is an encoded still (PNG, JPEG, ...)
+as base64, optionally wrapped in a `data:image/...;base64,` URL; it becomes
+the clip's first frame, pinned at `image_strength` (0-1, default 1.0).
+Requests outside the profile's validated envelope are refused: the envelope
+is what was measured to fit this machine's memory.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import io
 import json
 import os
 import queue
@@ -62,6 +70,8 @@ class Job:
             "progress": self.progress,
             **self.params,
         }
+        if isinstance(out.get("image"), (bytes, bytearray)):
+            out["image"] = f"<{len(out['image'])} bytes>"
         if self.completed_at:
             out["completed_at"] = int(self.completed_at)
             out["seconds_elapsed"] = round(
@@ -128,7 +138,51 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
                 "(the distilled flows have no CFG)"
             )
         params["negative_prompt"] = str(body["negative_prompt"])
+    if body.get("image") is not None:
+        params["image"] = decode_image_field(body["image"])
+        strength = body.get("image_strength", 1.0)
+        try:
+            strength = float(strength)
+        except (TypeError, ValueError) as exc:
+            raise BadRequest("image_strength must be a number in [0, 1]") from exc
+        if not 0.0 <= strength <= 1.0:
+            raise BadRequest("image_strength must be a number in [0, 1]")
+        params["image_strength"] = strength
+    elif "image_strength" in body:
+        raise BadRequest("image_strength needs an image")
     return params
+
+
+def decode_image_field(value: Any) -> bytes:
+    """`image`: encoded image bytes as base64, optionally a data: URL; raw bytes
+    (the CLI's file contents) pass through. The bytes are decoded as an image by
+    the engine; here they must at least be a non-empty, valid base64 payload."""
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.startswith("data:"):
+            header, sep, text = text.partition(",")
+            if not sep or ";base64" not in header:
+                raise BadRequest("image data: URL must be base64 encoded")
+        try:
+            data = base64.b64decode(text, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise BadRequest("image must be base64 (optionally a data: URL)") from exc
+    else:
+        raise BadRequest("image must be a base64 string")
+    if not data:
+        raise BadRequest("image is empty")
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as im:
+            im.verify()
+    except ImportError:
+        pass  # the engine's decoder reports it instead
+    except Exception as exc:
+        raise BadRequest(f"image is not a decodable image: {exc}") from exc
+    return data
 
 
 class VideoService:

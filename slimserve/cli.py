@@ -84,6 +84,15 @@ def _parser() -> argparse.ArgumentParser:
     video.add_argument("--seed", type=int, help="random seed (default 42)")
     video.add_argument("--negative-prompt", help="dev pipeline only")
     video.add_argument(
+        "--image",
+        help="image-to-video: a still that becomes the first frame",
+    )
+    video.add_argument(
+        "--image-strength",
+        type=float,
+        help="how strongly --image pins the first frame, 0-1 (default 1.0)",
+    )
+    video.add_argument(
         "--decoder",
         choices=["diffusion", "conv"],
         help=(

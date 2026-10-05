@@ -224,6 +224,45 @@ def with_latent(state: LatentState, latent: mx.array) -> LatentState:
     return replace(state, latent=latent)
 
 
+def condition_latent_frame(
+    state: LatentState,
+    latent: mx.array,
+    strength: float = 1.0,
+    latent_idx: int = 0,
+) -> LatentState:
+    """Upstream VideoConditionByLatentIndex (ltx_core latent_cond.py
+    _apply_condition_by_latent_index): the patchified `latent` (B, C, F', H, W)
+    replaces `clean` on the token span of latent frames [latent_idx, latent_idx
+    + F') and denoise_mask there becomes 1 - strength. The current latent on
+    the span is re-blended (the noiser's lerp(clean, noised, denoise_mask)), so
+    a strength-1 frame starts and stays clean. Apply to the plain video state,
+    before any slots or reference tokens are appended."""
+    tokens = patchify(latent).astype(G)
+    b, count, c = tokens.shape
+    _, _, _, h, w = latent.shape
+    start = latent_idx * h * w
+    stop = start + count
+    if stop > state.latent.shape[1]:
+        raise ValueError(
+            f"conditioning span [{start}, {stop}) exceeds "
+            f"{state.latent.shape[1]} tokens"
+        )
+    tokens = mx.broadcast_to(tokens, (state.latent.shape[0], count, c))
+    clean = mx.concatenate(
+        [state.clean[:, :start], tokens, state.clean[:, stop:]], axis=1
+    )
+    mask = mx.concatenate(
+        [
+            state.denoise_mask[:, :start],
+            mx.full((state.latent.shape[0], count, 1), 1.0 - strength, dtype=G),
+            state.denoise_mask[:, stop:],
+        ],
+        axis=1,
+    )
+    out = replace(state, clean=clean, denoise_mask=mask)
+    return replace(out, latent=blend(state.latent, out))
+
+
 # ---- dev (guided) ---------------------------------------------------------
 DEFAULT_NEGATIVE_PROMPT = (
     "has_subtitles, has_blurbox, transition from black, transition to black, "
