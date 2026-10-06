@@ -829,3 +829,59 @@ stage-2 shapes), amplified by the guidance scales. With this, every stage of
 the engine has been compared against Lightricks' code rather than the port:
 text path by reading (plus the BOS fix), DiT and guider numerically, both
 decoders numerically, the samplers by reading with quoted lines.
+
+## 22. Decoder optimization at the production shape (2026-10-05)
+
+With quality judged only at 1536x1024x121 (section 20), the diffusion decoder
+was 35% of a distilled run (169.6 s of 480). Profile at that shape
+(`n9_diffvae_profile.py`, decoder alone, default MLX limits): 121.8 s, 35 GiB;
+stage 5 93%; the `na3d` kernel 60.6 s = **2.1 TF/s against the 19 TF/s MMA
+ceiling** (11%); ~28 s of projections, norms and RoPE around it; MLP 19 s;
+stages 1-4 8 s.
+
+**Kernel** (`n9_na_kernel_experiment.py`, stage-5 slab 33x256x106, 4 heads x 64,
+11^3): one key/value row load now feeds QW adjacent-in-W queries whose windows
+overlap in all but QW-1 columns.
+
+| variant | ms | TF/s | vs shipped |
+| --- | ---: | ---: | ---: |
+| shipped (8 lanes, 1 query) | 408 | 2.99 | 1.00 |
+| 8 lanes, QW=2 | 317 | 3.85 | **1.29** (bit-identical) |
+| 8 lanes, QW=3 | 898 | 1.36 | 0.45 (register spill) |
+| 4 lanes (16 dims per lane), QW=1 / 2 | 597 / 1938 | 2.04 / 0.63 | 0.68 / 0.21 |
+
+**Halo queries.** Every stage-5 slab carries a 5-frame temporal halo on each
+side and 5 columns of W halo, and the kernel (and the Q projection and RoPE)
+computed those halo positions as queries only to crop them: 43 frames computed
+for 33 kept, 106 columns for 96. Both kernels now take a query block with an
+offset into the key/value slab, and `_qkv` projects Q for the core only.
+
+Decoder alone, 1536x1024x121: **121.8 -> 91.3 s**, peak 35 -> 33 GiB; kernel
+60.6 -> 35.4 s; keyframe decode 106.4 s (joint kernel 41.4 s). All three
+upstream parity gates unchanged (joint kernel 4e-7; plain and keyframe decodes
+120 dB), the rendered clip bit-identical.
+
+**Buffer cache.** In the pipeline the same decode took 124 s, not 91: the
+engine caps MLX's buffer cache at 16 GiB (wired memory next to a 44 GiB DiT),
+and the decoder's working set of *distinct buffer sizes* (three or four
+slab-shape families, each with q/k/v, RoPE temporaries and outputs) is ~40 GiB;
+under the cap nearly every call allocates from the OS. Measured, decoder alone
+with ballast for the resident DiT: cache 16 GiB 113 s, 32 GiB 104 s, 48-96 GiB
+104 s; without ballast and no cap 91 s (the cache reaches 87 GiB, 40 of it
+dead stage-4 giants; clearing the cache between stage 4 and 5 does not help,
+stage 5's own set is the problem). The synchronize brackets around the kernel
+cost nothing (121.5 vs 121.3 s). `render()` now lends the decoder up to 48 GiB
+of cache, parking the text encoder (4.8 s to reload) and then the DiT (6 s)
+when that is what makes room, and restores the 16 GiB cap afterwards.
+
+Distilled 1536x1024x121 end to end: **480.2 -> 406.6 s (-15%)**; decode span
+169.6 -> 96.7 s; frames identical (`beat1d_1536_v3.mp4`).
+
+Remaining in the decoder (of 91 s): kernel 35 s, projections/RoPE 25 s (per
+slab-chunk: 3 projections 22 ms, 2 RMS norms 10 ms, 2 fp32 RoPEs 40 ms, pre()
+with fp32 scale/shift 8 ms; a fused RoPE kernel and fp16 modulation would take
+~5 s off), MLP 20 s (GEMMs with K=256 at ~7.6 TF/s plus the 4x hidden-state
+traffic; ~7 s possible). Each is 1-2% of the distilled wall: at the epsilon.
+A tiled simdgroup-MMA kernel was estimated (section 22 notes in the session):
+the 11^3 window's union over an 8x8 query brick is 2.7x the useful keys, so
+MMA throughput buys ~1.6x on the kernel at best, ~4% of the wall; not pursued.
