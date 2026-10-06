@@ -885,3 +885,6 @@ traffic; ~7 s possible). Each is 1-2% of the distilled wall: at the epsilon.
 A tiled simdgroup-MMA kernel was estimated (section 22 notes in the session):
 the 11^3 window's union over an 8x8 query brick is 2.7x the useful keys, so
 MMA throughput buys ~1.6x on the kernel at best, ~4% of the wall; not pursued.
+
+Resident engine, second clip (`n2_e2e.py --repeat` at 1536x1024x121): 403.8 s
+(text reload 5.2 s, DiT reload 3.8 s from the page cache, decode 97.1 s).

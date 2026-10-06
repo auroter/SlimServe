@@ -38,8 +38,10 @@ token, ancestral stage 2, STG block 28 and three dev deviations; section 21
 added the keyframe-aware diffusion decode for DFR (joint NA Metal kernel,
 parity 4e-7 vs upstream's torch reference), I2V first-frame conditioning (CLI
 `--image`, API `image`), and re-validated dev and DFR at the default size.
-Standing numbers at 1536x1024x121 after that: distilled 478 s, DFR 807 s
-(keyframe decode), dev 1540 s, I2V distilled 483 s. Quality is only judged at
+Standing numbers at 1536x1024x121 after that and the section-22 decoder work
+(QW=2 kernel, core-only queries, 48 GiB decode cache with the DiT parked):
+distilled 406.6 s cold / 403.8 s resident, decode 97 s; DFR and dev measured
+before section 22 at 807 s / 1540 s (their decodes shrink by the same ~70 s). Quality is only judged at
 the default size (stage 1 must run at 768x512; section 20) and the parity
 reference is upstream, never the dgrauet port (it drops BOS).
 Not done: DFR temporal rounds and second spatial epilogue, duration head,
