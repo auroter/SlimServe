@@ -125,15 +125,16 @@ mx.synchronize()
 t_prof = time.perf_counter() - t
 tracked = sum(r[0] for r in acc.values())
 flops_total = sum(r[2] for r in acc.values())
+useful = flops_total / t_clean
+glue = t_prof - tracked
 print(
     f"{variant} {F}x{H}x{W} batch {B}: {F * H * W} video + {n_audio} audio tokens; "
-    f"clean forward {t_clean:.2f} s = {flops_total / t_clean / 1e12:.1f} TF/s useful "
-    f"({100 * flops_total / t_clean / CEIL:.0f}% of the MMA ceiling); profiled {t_prof:.2f} s; "
-    f"tracked {tracked:.2f} s; glue {t_prof - tracked:.2f} s = {100 * (t_prof - tracked) / t_prof:.0f}%"
+    f"clean forward {t_clean:.2f} s = {useful / 1e12:.1f} TF/s useful "
+    f"({100 * useful / CEIL:.0f}% of the MMA ceiling); profiled {t_prof:.2f} s; "
+    f"tracked {tracked:.2f} s; glue {glue:.2f} s = {100 * glue / t_prof:.0f}%"
 )
-print(
-    "| op | calls | s | share | TF/s | of ceiling |\n| --- | ---: | ---: | ---: | ---: | ---: |"
-)
+print("| op | calls | s | share | TF/s | of ceiling |")
+print("| --- | ---: | ---: | ---: | ---: | ---: |")
 groups = collections.defaultdict(lambda: [0.0, 0.0])
 for k, r in sorted(acc.items(), key=lambda kv: -kv[1][0]):
     g = (
