@@ -24,6 +24,12 @@ OS_RESERVE_BYTES = 24 << 30  # never plan Metal memory into the last 24 GiB
 # MLX buffer cache: decode buffers are reused across steps and requests; a
 # 12 GiB cap cost 0.8 s per short decode, 16 GiB 0.5 s, unbounded nothing.
 CACHE_BYTES = 16 << 30
+# The diffusion decoder's working set of distinct buffer sizes (three or four
+# slab-shape families with their q/k/v and RoPE temporaries) is ~40 GiB; under
+# a 16 GiB cache every call allocates from the OS and the decode is 25% slower
+# (ledger section 22). render() lends it this much cache when there is room,
+# parking the DiT (6 s to reload) if that is what makes room.
+DECODE_CACHE_BYTES = 48 << 30
 DEFAULT_VIDEO_GUIDANCE = sampling.Guidance(cfg=3.0)
 DEFAULT_AUDIO_GUIDANCE = sampling.Guidance(cfg=7.0)
 
@@ -284,6 +290,12 @@ class LTX25Engine:
         if self.text is not None:
             self.text.unload()
             self.text = None
+
+    def unload_dit(self) -> None:
+        """Drop the transformer (44 GiB fp16); load_dit() reloads it in ~6 s."""
+        if self.dit is not None:
+            self.dit = None
+            mx.clear_cache()
 
     def decode_budget(self) -> int:
         """Bytes the VAE decode may use: what is left after the resident models
@@ -768,19 +780,36 @@ class LTX25Engine:
                 from slimserve.video.ltx25 import diffvae as diff_mod
 
                 need = diff_mod.estimate_peak_bytes(result.video_latent.shape)
-                if need > self.decode_budget():
+                total = int(mx.device_info()["memory_size"])
+
+                def room() -> int:
+                    return total - int(mx.get_active_memory()) - OS_RESERVE_BYTES - need
+
+                # Make room for the decoder and its buffer cache: first the text
+                # encoder (28 GiB, 4.8 s to reload), then the DiT (44 GiB, 6 s).
+                if room() < DECODE_CACHE_BYTES:
                     self.unload_text()
-                if need > self.decode_budget():
+                if room() < DECODE_CACHE_BYTES:
+                    self.unload_dit()
+                if room() < CACHE_BYTES:
                     raise MemoryError(
                         f"the diffusion decoder needs ~{need >> 30} GiB "
                         "for this clip and "
-                        f"{self.decode_budget() >> 30} GiB are free "
+                        f"{max(room(), 0) >> 30} GiB are free "
                         "next to the resident models; "
                         "use decoder=conv or a smaller clip"
                     )
-                pixels = self.load_diffvae().decode_raw(
-                    result.video_latent, seed=seed, keyframes=result.keyframes
-                )
+                cache = int(min(DECODE_CACHE_BYTES, room()))
+                mx.set_cache_limit(cache)
+                mx.set_memory_limit(total - OS_RESERVE_BYTES - cache)
+                try:
+                    pixels = self.load_diffvae().decode_raw(
+                        result.video_latent, seed=seed, keyframes=result.keyframes
+                    )
+                    mx.eval(pixels)
+                finally:
+                    mx.set_cache_limit(CACHE_BYTES)
+                    mx.set_memory_limit(total - OS_RESERVE_BYTES - CACHE_BYTES)
                 frames = vae_mod.to_uint8(pixels)
                 del pixels
             else:
