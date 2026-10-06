@@ -810,3 +810,22 @@ the noise it draws captured and fed to ours; 3x8x8 latent, 17 frames of
 | plain (no keyframes) | **120.0 dB, max-abs 0** | the first direct check of the plain decoder against upstream rather than the port |
 
 The parity reference for the decoder is now upstream itself, on this machine.
+
+**Transformer and guider parity against upstream, on the CPU**
+(`n8_dit_parity.py`; oracle = `ltx_core`'s `LTXModel` built from the official
+dev transformer in torch fp32 on the CPU, 84 GiB, under the memory guard;
+3x8x12 latent = 288 video tokens + 18 audio tokens, random text context shared
+by both sides, first-frame keyframe mask, sigma 0.7):
+
+| check | ours fp16 operands (production) | ours fp32 operands |
+| --- | ---: | ---: |
+| one velocity forward (dev) | rel-L2 1.6e-3, cos 0.999999 | **5.4e-6** |
+| one guided step: cond / negative / STG block 28 / modality passes batched, CFG 3 (video) 7 (audio), STG 1, modality 3, rescale 0.7, through upstream's `BatchedPerturbationConfig` + `MultiModalGuider` vs our `GuidedDenoiser` (STG fork at the first STG block, shared text K/V) | rel-L2 5.5e-3, cos 0.99998 | **1.9e-5** |
+
+The fp32 numbers are fp32 rounding: transformer, perturbation masks, x0
+conversion and the guidance arithmetic are semantically identical to upstream.
+The production residual is fp16 operand rounding (section 13's 0.0069 at
+stage-2 shapes), amplified by the guidance scales. With this, every stage of
+the engine has been compared against Lightricks' code rather than the port:
+text path by reading (plus the BOS fix), DiT and guider numerically, both
+decoders numerically, the samplers by reading with quoted lines.
