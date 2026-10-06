@@ -912,3 +912,39 @@ least credible path: a hand-written flash-attention kernel would have to beat
 MLX's steel SDPA, when our hand-written GEMM reached 49% of MLX's GEMM. Every
 remaining lever that is larger changes the output (step count, guidance skip,
 fp16 conv VAE, step caching, sparse attention) and belongs to the opt-in tier.
+
+## 23. Remaining-headroom assessment at the production size (2026-10-05)
+
+`n9_forward_profile.py F H W [variant] [batch]` profiles one DiT forward at any
+shape with synthetic tokens (every op evaluated synchronously; the clean
+forward time and the per-op rates against the 19.4 TF/s ceiling are the
+output). 1536x1024x121:
+
+| shape | forward | useful | attention (SDPA) | video GEMMs | other GEMMs | audio GEMMs |
+| --- | ---: | ---: | --- | --- | --- | --- |
+| stage 2, 24,576 tokens | 67.3 s | 16.9 TF/s, 87% | 32.6 s at 79% (6.9 s to the ceiling) | 30.7 s at 94% (1.9 s) | 4.7 s at 87% (0.6 s) | 0.6 s at 13% (0.5 s; 126 rows, launch-bound) |
+| stage 1, 6,144 tokens | 11.4 s | 17.4 TF/s, 90% | 2.4 s at 75% (0.6 s) | 8.4 s at 87% (1.1 s) | 1.5 s at 68% (0.5 s) | 0.6 s at 13% (0.5 s) |
+| dev stage 1, batch 4 (plain batch; the guided step's fork saves ~15% on top) | 44.9 s | 17.7 TF/s, 91% | 9.3 s at 78% (2.1 s) | 30.1 s at 97% (0.8 s) | 4.6 s at 91% (0.4 s) | 0.9 s at 37% |
+
+Glue per block at the stage-2 shape (measured one op at a time, eval'd): norm
++ modulate 2.3 ms x3, gated residual 1.7 x3, q/k norms 0.9 x2, head
+transposes ~1, RoPE 7.1 x2 (86 GB/s: slow), head gate 0.9, GELU 5.3: ~37 ms
+x 48 = 1.8 s per forward (2.7%); bandwidth-optimal would be ~1 s.
+
+As a share of the 407 s distilled wall:
+
+| avenue | gain | feasibility |
+| --- | ---: | --- |
+| attention at the MMA ceiling | 5% distilled, 4% dev, ~7% DFR (38k-token stage 2 is attention-dominated) | MLX's steel SDPA at 78-79%; MFA, the best published M1 flash attention, 62-86%; our hand GEMM reached 49% of MLX's. Not credible by hand. |
+| audio-stream GEMM fusion (q/k/v, cross projections) | ~0.8% | easy |
+| decoder RoPE kernel | 0.6% | easy, 1 fp16 ulp |
+| DiT RoPE pass | 0.4% | easy |
+| decoder modulation in fp16 | ~0.5% | easy, fp16 rounding |
+| glue fusion (norm+modulate, residual+norm) | <= 0.6% | moderate |
+| uniform decoder slab shapes (cache ~15 GiB, DiT stays resident) | 0.9% resident only | moderate |
+| video GEMMs | MLX at 94-97% | nothing |
+
+No single output-preserving avenue is both above the 1% epsilon and
+achievable; the sub-epsilon items sum to ~3%. Everything larger is in the
+opt-in, output-changing tier (step count, guidance skip, fused LoRA for stage
+2 ~1.3% of dev, fp16 conv VAE, step caching, sparse attention).
