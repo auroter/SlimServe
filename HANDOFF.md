@@ -46,9 +46,7 @@ Not done: DFR temporal rounds and second spatial epilogue, duration head,
 prompt enhancer, res_2s, the opt-in tier, any hand-written Metal GEMM
 (measured headroom on M1-M4 is at most ~10% of a forward; see ledger section
 15), N7 (candidates: na3d / na3d_joint kernels, split-K dispatch, slab conv
-driver), HD runs of dev and DFR beyond the default size, a full keyframe-decode
-parity against upstream's torch decoder (only the kernel is parity-checked; the
-stream plumbing is a code port). Draft PR #86 on QuixiAI/SlimServe from fork
+driver), HD runs of dev and DFR beyond the default size, nothing on parity: decoder (both modes, 120 dB), transformer forward and dev guided step (fp32 5e-6 / 2e-5) are all checked against upstream's own code run on this machine's CPU (`n8_*_parity.py`). Draft PR #86 on QuixiAI/SlimServe from fork
 branch auroter:ltx25-metal (opened 2026-10-02; description carries the result
 tables). Demo clip for the PR: not chosen yet; candidates in
 `~/.local/scratch/ltx25/demo/v4/` (`beat1c_1536`, `beat1d_dfr_kf_1536`,
