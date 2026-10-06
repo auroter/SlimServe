@@ -796,3 +796,17 @@ I2V trial (`i2v_beat1_1536.mp4`, distilled, start frame = frame 60 of
 still: same character, hall and light, the walk and pull-out carry on. Identity
 across clips is therefore available by chaining the last frame of one clip into
 the next.
+
+**Whole-decoder parity against upstream, on the CPU** (`n8_keyframe_decode_parity.py`;
+the oracle is Lightricks' `DiffusionVideoDecoder` built from the checkpoint by
+`ltx_core`'s own builder in torch fp32 on the CPU, `CHUNKED_EAGER` mode, with
+the noise it draws captured and fed to ours; 3x8x8 latent, 17 frames of
+256x256, planes at pixel frames 4 and 12; ours fp32 operands and stream):
+
+| decode | PSNR vs upstream | note |
+| --- | ---: | --- |
+| keyframe-aware, first attempt | 67.7 dB | centre of every frame exact; the error sat in the edge columns of the plane frames: the plane pass ran full-width with masked edges while upstream cuts both streams into the same W slabs (replicated halos) |
+| keyframe-aware, slab-wise plane pass | **120.0 dB, max-abs 0** | bit-exact to fp32 rounding on all 17 frames |
+| plain (no keyframes) | **120.0 dB, max-abs 0** | the first direct check of the plain decoder against upstream rather than the port |
+
+The parity reference for the decoder is now upstream itself, on this machine.
