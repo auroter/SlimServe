@@ -10,13 +10,19 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import mlx.core as mx
 
 from slimserve.video.ltx25 import checkpoints, sampling
-from slimserve.video.ltx25.dit import DiTConfig, LTX25DiT, x0_from_velocity
+from slimserve.video.ltx25.dit import (
+    DiTConfig,
+    LTX25DiT,
+    StepCache,
+    attention_tiles,
+    x0_from_velocity,
+)
 from slimserve.video.ltx25.sampling import LatentState
 
 G = mx.float32
@@ -80,10 +86,20 @@ class Result:
 
 
 class Denoiser:
-    """x0 prediction for one sampler step; owns the DiT call contract."""
+    """x0 prediction for one sampler step; owns the DiT call contract.
 
-    def __init__(self, dit: LTX25DiT, video_text: mx.array, audio_text: mx.array):
+    `video_tiles` (dit.attention_tiles) tiles the video self-attention; both
+    it and the sampler's `step_cache` are fast-tier, output-changing options."""
+
+    def __init__(
+        self,
+        dit: LTX25DiT,
+        video_text: mx.array,
+        audio_text: mx.array,
+        video_tiles=None,
+    ):
         self.dit, self.video_text, self.audio_text = dit, video_text, audio_text
+        self.video_tiles = video_tiles
 
     def __call__(
         self,
@@ -92,6 +108,7 @@ class Denoiser:
         vx: mx.array,
         ax: mx.array,
         sigma: float,
+        step_cache: StepCache | None = None,
     ):
         b = vx.shape[0]
         t = mx.full((b,), sigma, dtype=G)
@@ -112,6 +129,8 @@ class Denoiser:
             audio_sigma=mx.zeros((b,), dtype=G) if audio.frozen else None,
             video_attention_mask=video.attention_mask,
             audio_attention_mask=audio.attention_mask,
+            video_tiles=self.video_tiles,
+            step_cache=step_cache,
         )
         return x0_from_velocity(vx, v, t if vt is None else vt), x0_from_velocity(
             ax, a, t if at is None else at
@@ -121,13 +140,12 @@ class Denoiser:
 class GuidedDenoiser:
     """Dev-model x0 with CFG + STG + modality guidance.
 
-    The four passes (conditional, negative prompt, self-attention skipped on
+    Up to four passes (conditional, negative prompt, self-attention skipped on
     the STG blocks, audio<->video cross-attention skipped everywhere) run as
-    one batch of four: the same FLOPs as four forwards, with every GEMM at 4x
-    the rows.
+    one batch: the same FLOPs as the separate forwards, with every GEMM at the
+    batch's rows. A pass whose scale is neutral in both modalities (cfg 1,
+    stg 0, modality 1) is not run at all.
     """
-
-    PASSES = 4
 
     def __init__(
         self,
@@ -137,31 +155,58 @@ class GuidedDenoiser:
         video: sampling.Guidance,
         audio: sampling.Guidance,
         batched: bool = True,
+        video_tiles=None,
     ):
         self.dit, self.video_g, self.audio_g, self.batched = dit, video, audio, batched
-        # Distinct text rows (conditional, negative); row map cond, neg, stg, mod.
-        self.video_text = mx.concatenate([cond[0], negative[0]], axis=0)
-        self.audio_text = mx.concatenate([cond[1], negative[1]], axis=0)
-        self.text_rows = mx.array([0, 1, 0, 0])
+        self.video_tiles = video_tiles
+        kinds = ["cond"]
+        if video.cfg != 1 or audio.cfg != 1:
+            kinds.append("neg")
+        stg_blocks = (video.stg_blocks if video.stg else ()) + (
+            audio.stg_blocks if audio.stg else ()
+        )
+        if stg_blocks:
+            kinds.append("stg")
+        if video.modality != 1 or audio.modality != 1:
+            kinds.append("mod")
+        self.kinds = kinds
+        self.passes = len(kinds)
+        # Distinct text rows (conditional[, negative]); row map per pass.
+        if "neg" in kinds:
+            self.video_text = mx.concatenate([cond[0], negative[0]], axis=0)
+            self.audio_text = mx.concatenate([cond[1], negative[1]], axis=0)
+        else:
+            self.video_text, self.audio_text = cond
+        self.text_rows = mx.array([1 if k == "neg" else 0 for k in kinds])
         # The STG pass equals the conditional pass until the first STG block.
-        first_stg = min(video.stg_blocks + audio.stg_blocks) if batched else None
-        self.share = (first_stg, 0, 2) if first_stg else None
-        keep_stg = mx.array([1.0, 1.0, 0.0, 1.0])
-        keep_mod = mx.array([1.0, 1.0, 1.0, 0.0])
+        self.share = None
+        if "stg" in kinds and batched:
+            self.share = (min(stg_blocks), 0, kinds.index("stg"))
+        keep_stg = mx.array([0.0 if k == "stg" else 1.0 for k in kinds])
+        keep_mod = mx.array([0.0 if k == "mod" else 1.0 for k in kinds])
         self.stg: dict[tuple[str, int], mx.array] = {}
-        for blk in video.stg_blocks:
-            self.stg[("video_self", blk)] = keep_stg
-        for blk in audio.stg_blocks:
-            self.stg[("audio_self", blk)] = keep_stg
-        for blk in range(dit.cfg.num_layers):
-            self.stg[("a2v", blk)] = keep_mod
-            self.stg[("v2a", blk)] = keep_mod
+        if "stg" in kinds:
+            for blk in video.stg_blocks:
+                self.stg[("video_self", blk)] = keep_stg
+            for blk in audio.stg_blocks:
+                self.stg[("audio_self", blk)] = keep_stg
+        if "mod" in kinds:
+            for blk in range(dit.cfg.num_layers):
+                self.stg[("a2v", blk)] = keep_mod
+                self.stg[("v2a", blk)] = keep_mod
 
     def _forward(
-        self, video: LatentState, audio: LatentState, vx, ax, sigma: float, rows: slice
+        self,
+        video: LatentState,
+        audio: LatentState,
+        vx,
+        ax,
+        sigma: float,
+        rows: slice,
+        step_cache: StepCache | None = None,
     ):
-        n = len(range(*rows.indices(self.PASSES)))
-        if n == self.PASSES:  # distinct text rows, mapped per batch row
+        n = len(range(*rows.indices(self.passes)))
+        if n == self.passes:  # distinct text rows, mapped per batch row
             vtext, atext, trows = self.video_text, self.audio_text, self.text_rows
         else:
             sel = self.text_rows[rows]
@@ -189,7 +234,9 @@ class GuidedDenoiser:
             audio_attention_mask=audio.attention_mask,
             stg={k: m[rows] for k, m in self.stg.items()},
             text_rows=trows,
-            share_from=self.share if n == self.PASSES else None,
+            share_from=self.share if n == self.passes else None,
+            video_tiles=self.video_tiles,
+            step_cache=step_cache if n == self.passes else None,
         )
         return (
             x0_from_velocity(rep(vx), v, t if vt is None else vt),
@@ -203,20 +250,91 @@ class GuidedDenoiser:
         vx: mx.array,
         ax: mx.array,
         sigma: float,
+        step_cache: StepCache | None = None,
     ):
         if self.batched:
-            v0, a0 = self._forward(video, audio, vx, ax, sigma, slice(0, 4))
+            v0, a0 = self._forward(
+                video, audio, vx, ax, sigma, slice(0, self.passes), step_cache
+            )
         else:
             parts = [
                 self._forward(video, audio, vx, ax, sigma, slice(i, i + 1))
-                for i in range(4)
+                for i in range(self.passes)
             ]
             v0 = mx.concatenate([p[0] for p in parts], axis=0)
             a0 = mx.concatenate([p[1] for p in parts], axis=0)
+        rows = {k: i for i, k in enumerate(self.kinds)}
+
+        def term(x: mx.array, kind: str) -> mx.array | None:
+            i = rows.get(kind)
+            return None if i is None else x[i : i + 1]
+
         return (
-            self.video_g.combine(v0[0:1], v0[1:2], v0[2:3], v0[3:4]),
-            self.audio_g.combine(a0[0:1], a0[1:2], a0[2:3], a0[3:4]),
+            self.video_g.combine(
+                v0[0:1], term(v0, "neg"), term(v0, "stg"), term(v0, "mod")
+            ),
+            self.audio_g.combine(
+                a0[0:1], term(a0, "neg"), term(a0, "stg"), term(a0, "mod")
+            ),
         )
+
+
+@dataclass(frozen=True)
+class Fast:
+    """The fast tier: output-changing settings a profile may stack on a
+    pipeline. Every field's default is the exact pipeline.
+
+    stage1_sigmas / stage2_sigmas: the distilled (and DFR) schedules; dev
+      stage 2 takes stage2_sigmas, its stage 1 is `steps`.
+    steps: dev stage-1 step count (the reference: 30).
+    guidance: dev Guidance overrides applied to video and audio (a neutral
+      scale drops that pass from the batch: modality 1.0 saves one of four).
+    step_cache: first-block cache threshold (accumulated relative L1 of the
+      block-0 residual; 0 = off). Applied to every sampler loop.
+    attention_tiles: (rows, cols) spatial tiles for the stage-2 video
+      self-attention, keys widened by attention_halo latent cells.
+    """
+
+    stage1_sigmas: tuple[float, ...] | None = None
+    stage2_sigmas: tuple[float, ...] | None = None
+    steps: int | None = None
+    guidance: dict[str, float] | None = None
+    step_cache: float = 0.0
+    attention_tiles: tuple[int, int] | None = None
+    attention_halo: int = 2
+
+    @classmethod
+    def from_config(cls, cfg: dict | None) -> Fast:
+        if not cfg:
+            return cls()
+        out = dict(cfg)
+        for key in ("stage1_sigmas", "stage2_sigmas", "attention_tiles"):
+            if out.get(key) is not None:
+                out[key] = tuple(out[key])
+        unknown = set(out) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"unknown fast settings: {sorted(unknown)}")
+        return cls(**out)
+
+    @property
+    def active(self) -> bool:
+        return self != Fast()
+
+    def cache(self) -> StepCache | None:
+        return StepCache(self.step_cache) if self.step_cache > 0 else None
+
+    def tiles(self, f: int, h: int, w: int, total: int | None = None):
+        if self.attention_tiles is None:
+            return None
+        return attention_tiles(
+            f, h, w, self.attention_tiles, self.attention_halo, total
+        )
+
+    def sigmas1(self, default: list[float]) -> list[float]:
+        return list(self.stage1_sigmas) if self.stage1_sigmas else default
+
+    def sigmas2(self, default: list[float]) -> list[float]:
+        return list(self.stage2_sigmas) if self.stage2_sigmas else default
 
 
 class LTX25Engine:
@@ -374,9 +492,12 @@ class LTX25Engine:
         on_step: Callable[[str, int, float], None] | None = None,
         image: str | bytes | None = None,
         image_strength: float = 1.0,
+        fast: Fast | None = None,
     ) -> Result:
         """`image` (a path or encoded image bytes) conditions the first frame
-        (image-to-video) at `image_strength` in both stages."""
+        (image-to-video) at `image_strength` in both stages. `fast` stacks the
+        output-changing fast tier (see `Fast`)."""
+        fast = fast or Fast()
         tm = Timings()
         if text_embeds is None:
             with tm.span("text"):
@@ -418,9 +539,10 @@ class LTX25Engine:
                 denoise,
                 video,
                 audio,
-                sampling.DISTILLED_SIGMAS,
+                fast.sigmas1(sampling.DISTILLED_SIGMAS),
                 noise_seed=seed + sampling.ANCESTRAL_NOISE_SEED_OFFSET,
                 on_step=stepper("stage1"),
+                step_cache=fast.cache(),
             )
 
         # 2x latent upscale in the VAE's denormalized latent space.
@@ -434,7 +556,11 @@ class LTX25Engine:
         # Stage 2: full resolution refinement from sigma 0.909; ancestral too on
         # 2.5 checkpoints (upstream distilled.py), from its own noise offset.
         with tm.span("stage2"):
-            s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
+            sigmas2 = fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS)
+            s0 = sigmas2[0]
+            denoise = Denoiser(
+                dit, video_text, audio_text, video_tiles=fast.tiles(f, h2, w2)
+            )
             video = sampling.noised_state(
                 (1, f * h2 * w2, 128),
                 sampling.video_positions(f, h2, w2, fps),
@@ -457,9 +583,10 @@ class LTX25Engine:
                 denoise,
                 video,
                 audio,
-                sampling.STAGE_2_DISTILLED_SIGMAS,
+                sigmas2,
                 noise_seed=seed + sampling.ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
                 on_step=stepper("stage2"),
+                step_cache=fast.cache(),
             )
 
         return Result(
@@ -488,15 +615,18 @@ class LTX25Engine:
         on_step: Callable[[str, int, float], None] | None = None,
         image: str | bytes | None = None,
         image_strength: float = 1.0,
+        fast: Fast | None = None,
     ) -> Result:
         """Lightricks' DFRPipeline, default configuration: the distilled flow
         with one generated keyframe slot per 24/32-frame segment in stage 1,
         then a stage 2 that runs under the detailing IC-LoRA with the upscaled
         slots and the half-resolution stage-1 latent as reference tokens.
         `image` conditions the first frame in both stages (see `distilled`).
-        Temporal rounds and the second spatial epilogue are not implemented."""
+        Temporal rounds and the second spatial epilogue are not implemented.
+        `fast` stacks the fast tier (see `Fast`)."""
         if self.variant != "distilled":
             raise ValueError("the DFR pipeline runs on the distilled transformer")
+        fast = fast or Fast()
         tm = Timings()
         if text_embeds is None:
             with tm.span("text"):
@@ -543,9 +673,10 @@ class LTX25Engine:
                 denoise,
                 video,
                 audio,
-                sampling.DISTILLED_SIGMAS,
+                fast.sigmas1(sampling.DISTILLED_SIGMAS),
                 noise_seed=seed + sampling.ANCESTRAL_NOISE_SEED_OFFSET,
                 on_step=stepper("stage1"),
+                step_cache=fast.cache(),
             )
 
         with tm.span("upscale"):
@@ -561,7 +692,8 @@ class LTX25Engine:
         cond2 = self._image_latent(still, h2, w2, tm)
 
         with tm.span("stage2"):
-            s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
+            sigmas2 = fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS)
+            s0 = sigmas2[0]
             video = sampling.noised_state(
                 (1, f * h2 * w2, 128),
                 sampling.video_positions(f, h2, w2, cfps),
@@ -589,15 +721,22 @@ class LTX25Engine:
                 initial=a1,
                 bf16_noise=self.bf16_noise,
             )
+            denoise = Denoiser(
+                dit,
+                video_text,
+                audio_text,
+                video_tiles=fast.tiles(f, h2, w2, video.latent.shape[1]),
+            )
             lora.attach(dit, detail_strength)
             try:
                 v2, _ = sampling.euler_ancestral_loop(
                     denoise,
                     video,
                     audio,
-                    sampling.STAGE_2_DISTILLED_SIGMAS,
+                    sigmas2,
                     noise_seed=seed + sampling.ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
                     on_step=stepper("stage2"),
+                    step_cache=fast.cache(),
                 )
             finally:
                 lora.detach(dit)
@@ -648,13 +787,21 @@ class LTX25Engine:
         on_step: Callable[[str, int, float], None] | None = None,
         image: str | bytes | None = None,
         image_strength: float = 1.0,
+        fast: Fast | None = None,
     ) -> Result:
         """Lightricks' TI2VidTwoStagesPipeline: guided dev stage 1 at half
         resolution, 2x latent upscale, 3-step stage 2 with the distilled LoRA
         and no guidance. Audio is taken from stage 1, as upstream. `image`
-        conditions the first frame in both stages (see `distilled`)."""
+        conditions the first frame in both stages (see `distilled`). `fast`
+        stacks the fast tier (see `Fast`)."""
         if self.variant != "dev":
             raise ValueError("the dev pipeline needs LTX25Engine(variant='dev')")
+        fast = fast or Fast()
+        if fast.steps:
+            steps = fast.steps
+        if fast.guidance:
+            video_guidance = replace(video_guidance, **fast.guidance)
+            audio_guidance = replace(audio_guidance, **fast.guidance)
         tm = Timings()
         with tm.span("text"):
             text = self.load_text()
@@ -704,6 +851,7 @@ class LTX25Engine:
                 # shift is the 4096-token anchor (2.05) at every resolution.
                 sampling.ltx2_schedule(steps, 4096),
                 on_step=stepper("stage1"),
+                step_cache=fast.cache(),
             )
 
         with tm.span("upscale"):
@@ -715,7 +863,8 @@ class LTX25Engine:
         cond2 = self._image_latent(still, h2, w2, tm)
 
         with tm.span("stage2"):
-            s0 = sampling.STAGE_2_DISTILLED_SIGMAS[0]
+            sigmas2 = fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS)
+            s0 = sigmas2[0]
             video = sampling.noised_state(
                 (1, f * h2 * w2, 128),
                 sampling.video_positions(f, h2, w2, fps),
@@ -739,11 +888,12 @@ class LTX25Engine:
             lora.attach(dit)
             try:
                 v2, _ = sampling.euler_loop(
-                    Denoiser(dit, *cond),
+                    Denoiser(dit, *cond, video_tiles=fast.tiles(f, h2, w2)),
                     video,
                     audio,
-                    sampling.STAGE_2_DISTILLED_SIGMAS,
+                    sigmas2,
                     on_step=stepper("stage2"),
+                    step_cache=fast.cache(),
                 )
             finally:
                 lora.detach(dit)

@@ -67,6 +67,9 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     )
     prompt = params.pop("prompt")
     decoder = params.pop("decoder")
+    fast = server.fast_settings(cfg)
+    if fast is not None:
+        params["fast"] = fast
     result = getattr(engine, cfg["pipeline"])(
         prompt,
         keep_text=False,

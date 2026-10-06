@@ -948,3 +948,71 @@ No single output-preserving avenue is both above the 1% epsilon and
 achievable; the sub-epsilon items sum to ~3%. Everything larger is in the
 opt-in, output-changing tier (step count, guidance skip, fused LoRA for stage
 2 ~1.3% of dev, fp16 conv VAE, step caching, sparse attention).
+
+## 24. The fast tier: output-changing profiles on the same engine (2026-10-06)
+
+Decision: a second set of profiles (`ltx25-distilled-fast`, `ltx25-dev-fast`,
+`ltx25-dfr-fast`) that trade exactness for speed, judged by eye and by PSNR
+against the exact pipeline at the production size, never by parity. The exact
+profiles stay the reference (the thing the parity harnesses prove, and what
+the fast ones are measured against). Precedent: section 1 and 10 planned this
+tier; Lightricks ships `distilled` as the lossy variant of `dev`; the baseline
+runner's HD "recommended config" (`--tile-spatial 2`) is already lossy. The
+baseline's TeaCache is disabled for 2.5 packs (its polynomial was fitted on
+2.0), so there is no prior Mac step cache for this checkpoint.
+
+Why not int8 (the question that started this): Apple GPUs before M5 have no
+int8 MMA; MLX's quantized matmul dequantizes to fp16 inside the kernel and wins
+only when bandwidth-bound (M of a few rows). The DiT runs 1.5k-24k rows per
+GEMM; measured int8 GEMM 15.8 TF/s vs fp16 19 (section 6), and the baseline's
+own code with our fp16 policy and no quantization beat its q8 config, 100.4 vs
+116.9 s (section 10). q8 buys memory (22 vs 44 GiB of weights), not speed, on
+this machine.
+
+**Mechanisms** (all pipeline-level flags on the exact engine, so every kernel,
+precision and memory result of the campaign carries over; `pipeline.Fast`,
+profile key `engine.fast`):
+
+- `stage1_sigmas` / `stage2_sigmas`: schedule overrides for the distilled and
+  DFR flows and the dev stage 2 (`steps` for the dev stage 1).
+- `guidance`: dev Guidance overrides applied to both modalities. A neutral
+  scale now drops that pass from the batch (`GuidedDenoiser` builds its row set
+  from the non-neutral terms; `Guidance.combine` takes None for a pass not
+  run), so `modality: 1.0` runs 3 passes instead of 4. Exact for the full
+  configuration (n8 guided step unchanged bit for bit after the restructure).
+- `step_cache`: the first-block cache (FBCache formulation, `dit.StepCache`):
+  every step runs block 0; if the block-0 residual (hidden after block 0 minus
+  the embedded input) has moved less than the threshold in relative L1,
+  accumulated since the last computed step, blocks 1..47 are skipped and that
+  step's residual over block 0 is added to the current block-0 hidden state;
+  the head still runs on the current timestep. The last step of every sampler
+  loop is always computed. One cache per loop; works through the dev guided
+  batch (the STG fork row is inserted before the residual is applied).
+- `attention_tiles` + `attention_halo`: stage-2 video self-attention cut into
+  (rows x cols) spatial tiles over the latent grid, every frame; a tile's
+  queries attend to the keys of its own cells widened by `halo` latent cells
+  (DFR slot and reference tokens are keys of every tile and attend globally).
+  One SDPA call per tile, gathered with `mx.take`. Attention is 32.6 of the
+  67.3 s stage-2 forward at 24,576 tokens (section 23); 2x2 tiles with a
+  2-cell halo keep 30% of the keys (18 of 32 rows x 26 of 48 columns).
+- `decoder: conv` (existing): the conv VAE instead of the diffusion decoder,
+  97 -> ~30 s at 1536x1024x121, 36-38 dB from the diffusion output.
+
+**Method.** `n10_fast_ab.py MODE OUTDIR NAME:JSON ...`: one resident engine,
+the beat1d prompt at 1536x1024x121 seed 7, one lever at a time against the
+exact render of the same run (`exact.npy`, uint8 frames before the mux), then
+the stack. PSNR against exact is the number; the contact sheets and the clips
+(`~/.local/scratch/ltx25/n10/<mode>/`) are the judgement, reviewed by the
+user. A lever stays in a profile only if the clip is not visibly worse.
+
+**Distilled, one lever at a time** (1536x1024x121, seed 7, beat1d, resident
+engine; `n10/distilled/results.tsv`). The exact run of this session: 413.5 s
+(stage 1 95.1, stage 2 202.1, diffusion decode 101.0).
+
+| lever | wall | saved | PSNR vs exact | reading |
+| --- | ---: | ---: | ---: | --- |
+| conv decoder | 336.0 | 77 s (19%) | 35.3 dB (min 30.5) | the known decoder difference; softer fine texture |
+| stage 2: 3 -> 2 steps (0.909, 0.42, 0) | 330.7 | 67 s (16%) | 30.8 dB (min 28.5) | same shot, slightly less mosaic detail at sheet scale |
+| stage 1: 8 -> 5 steps (drop the four sigma 0.975-0.99 steps) | 367.7 | 35 s (9%) | 15.4 dB | a different sample (the near-1 steps fix the composition), clean; not a degradation but not the same clip |
+| step cache 0.10 | 399.3 | 0 | identical | **never fires**: the block-0 residual moves 22-70% between consecutive steps (ancestral re-noising, large sigma jumps); no threshold short of "skip everything" would. Dead on the distilled schedules. |
+| attention tiles 2x2, halo 2 | 338.3 | 63 s (15%, stage 2 202 -> 139) | 23.2 dB (min 21.2) | **visible seam across the face** in the opening close-up (the boundary runs through the frame centre). Rejected at this geometry. |

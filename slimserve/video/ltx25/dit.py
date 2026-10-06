@@ -164,6 +164,92 @@ def _select_rows(inputs: dict, rows: list[int], batch: int) -> dict:
     return out
 
 
+class StepCache:
+    """First-block cache (the FBCache formulation): a sampler step whose block-0
+    residual (hidden after block 0 minus the embedded input) has moved less
+    than `threshold` in relative L1, accumulated since the last computed step,
+    skips blocks 1..N-1 and reuses that step's residual over block 0. Output-
+    changing; one per sampler loop. `force` marks a step that must compute."""
+
+    def __init__(self, threshold: float):
+        self.threshold = float(threshold)
+        self.ref: mx.array | None = None
+        self.resid: tuple[mx.array, mx.array] | None = None
+        self.acc = 0.0
+        self.force = False
+        self.computed = 0
+        self.skipped = 0
+        self.history: list[tuple[float, bool]] = []  # (rel-L1, skipped) per step
+        self._signal: mx.array | None = None
+
+    def hit(self, signal: mx.array) -> bool:
+        self._signal = signal
+        if self.ref is None:
+            return False
+        rel = float(
+            (mx.mean(mx.abs(signal - self.ref)) / mx.mean(mx.abs(self.ref))).item()
+        )
+        skip = not self.force and self.acc + rel < self.threshold
+        self.history.append((rel, skip))
+        if skip:
+            self.acc += rel
+            self.skipped += 1
+        return skip
+
+    def reuse(self, v1: mx.array, a1: mx.array) -> tuple[mx.array, mx.array]:
+        rv, ra = self.resid
+        return v1 + rv, a1 + ra
+
+    def store(self, v1: mx.array, a1: mx.array, v: mx.array, a: mx.array) -> None:
+        self.ref, self.acc, self.computed = self._signal, 0.0, self.computed + 1
+        self.resid = (v - v1, a - a1)
+        mx.eval(self.ref, *self.resid)
+
+
+def attention_tiles(
+    f: int,
+    h: int,
+    w: int,
+    tiles: tuple[int, int],
+    halo: int,
+    total: int | None = None,
+) -> tuple[list[mx.array], list[mx.array], mx.array]:
+    """Index sets for tiled video self-attention: the (f, h, w) token grid is cut
+    into tiles[0] x tiles[1] spatial tiles (every frame); a tile's queries attend
+    to the keys of its own rows and columns widened by `halo` latent cells.
+    Tokens past f*h*w (DFR slots, reference tokens) are keys of every tile and
+    attend to everything. Returns (query indices, key indices) per tile and the
+    permutation that puts the concatenated tile outputs back in token order."""
+    n = f * h * w
+    total = n if total is None else total
+    grid = np.arange(n).reshape(f, h, w)
+    extra = np.arange(n, total)
+    th, tw = tiles
+    hb = [round(i * h / th) for i in range(th + 1)]
+    wb = [round(i * w / tw) for i in range(tw + 1)]
+    queries, keys = [], []
+    for i in range(th):
+        for j in range(tw):
+            q = grid[:, hb[i] : hb[i + 1], wb[j] : wb[j + 1]].reshape(-1)
+            k = grid[
+                :,
+                max(hb[i] - halo, 0) : min(hb[i + 1] + halo, h),
+                max(wb[j] - halo, 0) : min(wb[j + 1] + halo, w),
+            ].reshape(-1)
+            queries.append(q)
+            keys.append(np.concatenate([k, extra]))
+    if len(extra):
+        queries.append(extra)
+        keys.append(np.arange(total))
+    order = np.concatenate(queries)
+    inverse = np.argsort(order).astype(np.int32)
+    return (
+        [mx.array(q.astype(np.int32)) for q in queries],
+        [mx.array(k.astype(np.int32)) for k in keys],
+        mx.array(inverse),
+    )
+
+
 class Modulation:
     """One AdaLN head's output: (rows, P, dim) fp32, optionally per-token.
 
@@ -281,12 +367,15 @@ class LTX25DiT:
         mask: mx.array | None = None,
         skip: mx.array | None = None,
         ctx_rows: mx.array | None = None,
+        tiles: tuple[list[mx.array], list[mx.array], mx.array] | None = None,
     ) -> mx.array:
         """x, ctx are fp16. Returns fp16 (B, N, out_dim).
 
         `ctx` may hold only the distinct context rows, with `ctx_rows` mapping
         each batch row to one of them: K and V are projected once per distinct
         row and gathered (the dev pipeline's three conditional-text passes).
+        `tiles` (from `attention_tiles`) restricts each query tile to its own
+        keys: one attention call per tile, outputs put back in token order.
         """
         w = self.w
         heads = w[p + ".to_gate_logits.weight"].shape[0]
@@ -310,7 +399,22 @@ class LTX25DiT:
             k = apply_rope(k, *(rope_k or rope_q))
         if mask is not None and mask.dtype != mx.bool_:
             mask = mask.astype(F)
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=hd**-0.5, mask=mask)
+        if tiles is not None and mask is None:
+            qi, ki, inverse = tiles
+            parts = [
+                mx.fast.scaled_dot_product_attention(
+                    mx.take(q, i, axis=2),
+                    mx.take(k, j, axis=2),
+                    mx.take(v, j, axis=2),
+                    scale=hd**-0.5,
+                )
+                for i, j in zip(qi, ki)
+            ]
+            out = mx.take(mx.concatenate(parts, axis=2), inverse, axis=2)
+        else:
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=hd**-0.5, mask=mask
+            )
         if skip is not None:  # STG: perturbed samples pass the values through
             out = out * skip + v * (1.0 - skip)
         out = _head_gate(
@@ -349,6 +453,7 @@ class LTX25DiT:
             rope_q=s["video_rope"],
             mask=s["video_mask"],
             skip=None if sk is None else sk.astype(F),
+            tiles=s["video_tiles"],
         )
         v = _gated_residual(v, y, vm.get(2, vt[2]))
 
@@ -455,6 +560,8 @@ class LTX25DiT:
         stg: dict[tuple[str, int], mx.array] | None = None,
         text_rows: mx.array | None = None,
         share_from: tuple[int, int, int] | None = None,
+        video_tiles: tuple[list[mx.array], list[mx.array], mx.array] | None = None,
+        step_cache: StepCache | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Velocity prediction. All inputs fp32; returns fp32 (video, audio).
 
@@ -465,7 +572,9 @@ class LTX25DiT:
         `src` until `block` (an STG pass skips attention only from that block
         on), so rows other than `dst` run blocks 0..block-1 and `dst` is
         forked from `src`'s hidden state there. Exact up to GEMM row-count
-        kernel selection.
+        kernel selection. `video_tiles` and `step_cache` are the fast tier
+        (tiled video self-attention, the first-block step cache); both change
+        the output.
         """
         inputs = dict(
             video_latent=video_latent,
@@ -485,34 +594,52 @@ class LTX25DiT:
             video_cross_attention_mask=video_cross_attention_mask,
             stg=stg,
             text_rows=text_rows,
+            video_tiles=video_tiles,
         )
-        first = 0
-        v = a = None
+        fork_block = self.cfg.num_layers
+        if share_from is not None and share_from[0] == 0:
+            share_from = None
         if share_from is not None:
             fork_block, src, dst = share_from
             b = video_latent.shape[0]
             keep = [r for r in range(b) if r != dst]
             v, a, state, _, _ = self._prepare(**_select_rows(inputs, keep, b))
-            for i in range(fork_block):
-                v, a = self._block(i, v, a, state)
-                if self.eval_every and (i + 1) % self.eval_every == 0:
-                    mx.async_eval(v, a)
             src_pos = keep.index(src)
-            v = mx.concatenate([v[:dst], v[src_pos : src_pos + 1], v[dst:]], axis=0)
-            a = mx.concatenate([a[:dst], a[src_pos : src_pos + 1], a[dst:]], axis=0)
-            first = fork_block
-        v0, a0, state, video_emb, audio_emb = self._prepare(**inputs)
-        if v is None:
-            v, a = v0, a0
-        w = self.w
-        for i in range(first, self.cfg.num_layers):
+
+            def expand(x: mx.array) -> mx.array:  # fork row dst from row src
+                return mx.concatenate(
+                    [x[:dst], x[src_pos : src_pos + 1], x[dst:]], axis=0
+                )
+
+        else:
+            v, a, state, video_emb, audio_emb = self._prepare(**inputs)
+            expand = lambda x: x  # noqa: E731
+        v_in = v
+        v, a = self._block(0, v, a, state)
+        v1 = a1 = None
+        if step_cache is not None:
+            v1, a1 = expand(v), expand(a)
+            if step_cache.hit(v - v_in):
+                v, a = step_cache.reuse(v1, a1)
+                if share_from is not None:
+                    _, _, _, video_emb, audio_emb = self._prepare(**inputs)
+                return self._out_both(v, a, video_emb, audio_emb)
+        for i in range(1, self.cfg.num_layers):
+            if i == fork_block:
+                v, a = expand(v), expand(a)
+                _, _, state, video_emb, audio_emb = self._prepare(**inputs)
             v, a = self._block(i, v, a, state)
             # Bound each Metal command buffer (GPU watchdog) and the live graph
             # without stalling: the GPU runs this group while Python builds the
             # next one.
             if self.eval_every and (i + 1) % self.eval_every == 0:
                 mx.async_eval(v, a)
+        if step_cache is not None:
+            step_cache.store(v1, a1, v, a)
+        return self._out_both(v, a, video_emb, audio_emb)
 
+    def _out_both(self, v, a, video_emb, audio_emb) -> tuple[mx.array, mx.array]:
+        w = self.w
         return (
             self._out(v, video_emb, w["scale_shift_table"], "proj_out"),
             self._out(a, audio_emb, w["audio_scale_shift_table"], "audio_proj_out"),
@@ -537,6 +664,7 @@ class LTX25DiT:
         video_cross_attention_mask=None,
         stg=None,
         text_rows=None,
+        video_tiles=None,
     ):
         """Patchify, AdaLN heads, RoPE tables: everything the block loop reads."""
         cfg, w = self.cfg, self.w
@@ -616,6 +744,7 @@ class LTX25DiT:
             "video_cross_mask": video_cross_attention_mask,
             "stg": stg,
             "text_rows": text_rows,
+            "video_tiles": video_tiles,
             # one batch row standing for each distinct text row, for the prompt AdaLN
             "text_reps": None
             if text_rows is None

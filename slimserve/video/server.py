@@ -153,6 +153,16 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
     return params
 
 
+def fast_settings(cfg: dict[str, Any]):
+    """The profile's fast tier (`engine.fast`), or None for the exact pipeline."""
+    if not cfg.get("fast"):
+        return None
+    from slimserve.video.ltx25.pipeline import Fast
+
+    fast = Fast.from_config(cfg["fast"])
+    return fast if fast.active else None
+
+
 def decode_image_field(value: Any) -> bytes:
     """`image`: encoded image bytes as base64, optionally a data: URL; raw bytes
     (the CLI's file contents) pass through. The bytes are decoded as an image by
@@ -267,6 +277,9 @@ class VideoService:
             job.progress = {"stage": stage, "step": index + 1}
 
         decoder = p.pop("decoder", None)
+        fast = fast_settings(self.cfg)
+        if fast is not None:
+            p["fast"] = fast
         result = getattr(engine, self.cfg["pipeline"])(prompt, on_step=on_step, **p)
         job.progress = {"stage": "decode"}
         path = self.output_dir / f"{job.id}.mp4"

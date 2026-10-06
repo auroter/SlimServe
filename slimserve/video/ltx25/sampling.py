@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import Any
 
 import mlx.core as mx
 
@@ -160,10 +161,17 @@ def euler_loop(
     audio: LatentState,
     sigmas: list[float],
     on_step: Callable[[int, float], None] | None = None,
+    step_cache: Any = None,
 ) -> tuple[mx.array, mx.array]:
+    """`step_cache` (dit.StepCache) is handed to the denoiser each step; its
+    last step is always computed."""
     vx, ax = video.latent, audio.latent
     for i, (s, s_next) in enumerate(zip(sigmas[:-1], sigmas[1:])):
-        v0, a0 = denoise(video, audio, vx, ax, s)
+        if step_cache is not None:
+            step_cache.force = s_next == 0
+            v0, a0 = denoise(video, audio, vx, ax, s, step_cache=step_cache)
+        else:
+            v0, a0 = denoise(video, audio, vx, ax, s)
         v0, a0 = blend(v0, video), blend(a0, audio)
         dt = s_next - s
         vx = vx + (vx - v0) / s * dt
@@ -183,9 +191,10 @@ def euler_ancestral_loop(
     eta: float = 1.0,
     s_noise: float = 1.0,
     on_step: Callable[[int, float], None] | None = None,
+    step_cache: Any = None,
 ) -> tuple[mx.array, mx.array]:
     """Rectified-flow ancestral Euler (alpha = 1 - sigma), one generator, video
-    noise drawn first."""
+    noise drawn first. `step_cache` as in `euler_loop`."""
     vx, ax = video.latent, audio.latent
     mx.random.seed(noise_seed)
 
@@ -202,7 +211,11 @@ def euler_ancestral_loop(
         return nxt
 
     for i, (s, s_next) in enumerate(zip(sigmas[:-1], sigmas[1:])):
-        v0, a0 = denoise(video, audio, vx, ax, s)
+        if step_cache is not None:
+            step_cache.force = s_next == 0
+            v0, a0 = denoise(video, audio, vx, ax, s, step_cache=step_cache)
+        else:
+            v0, a0 = denoise(video, audio, vx, ax, s)
         v0, a0 = blend(v0, video), blend(a0, audio)
         if s_next == 0:
             vx, ax = v0, a0
@@ -322,14 +335,20 @@ class Guidance:
     stg_blocks: tuple[int, ...] = (28,)
 
     def combine(
-        self, cond: mx.array, uncond: mx.array, perturbed: mx.array, isolated: mx.array
+        self,
+        cond: mx.array,
+        uncond: mx.array | None,
+        perturbed: mx.array | None,
+        isolated: mx.array | None,
     ) -> mx.array:
-        pred = (
-            cond
-            + (self.cfg - 1) * (cond - uncond)
-            + self.stg * (cond - perturbed)
-            + (self.modality - 1) * (cond - isolated)
-        )
+        """A pass that is None was not run (its scale is neutral)."""
+        pred = cond
+        if uncond is not None:
+            pred = pred + (self.cfg - 1) * (cond - uncond)
+        if perturbed is not None:
+            pred = pred + self.stg * (cond - perturbed)
+        if isolated is not None:
+            pred = pred + (self.modality - 1) * (cond - isolated)
         if self.rescale:
             factor = mx.sqrt(mx.var(cond)) / (mx.sqrt(mx.var(pred)) + 1e-8)
             pred = pred * (self.rescale * factor + (1 - self.rescale))
