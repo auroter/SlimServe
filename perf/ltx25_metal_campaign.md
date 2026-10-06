@@ -888,3 +888,27 @@ MMA throughput buys ~1.6x on the kernel at best, ~4% of the wall; not pursued.
 
 Resident engine, second clip (`n2_e2e.py --repeat` at 1536x1024x121): 403.8 s
 (text reload 5.2 s, DiT reload 3.8 s from the page cache, decode 97.1 s).
+
+**Measured and not shipped** (2026-10-05, later): MLP variants on one stage-5
+chunk (fused gate+up GEMM, 1/4/8 temporal chunks): all 285-289 ms = 17.8 TF/s,
+already at the GEMM ceiling; the 19.6 s the profiler attributes to the MLP
+includes the lazily evaluated fp32 modulation pass. A fused Metal RoPE kernel
+(one thread per token-head, fp32 math, fp16 out): 16.7 vs 25.9 ms per call on
+the 43x256x106 slab, i.e. ~2.3 s per decode (0.6% of the distilled wall) at
+the cost of 1 fp16 ulp against the compiled path (Metal's cos/sin); below the
+epsilon and output-changing, not shipped. The simdgroup-MMA NA kernel idea:
+the best hand-written simdgroup GEMM of this campaign reached 9.2 TF/s
+(section 17) and the 11^3 window's union over an 8x8 query brick is 2.7x the
+useful keys, so the useful rate would be ~3.4 TF/s against the shipped
+kernel's 3.85; withdrawn.
+
+**Campaign position after section 22.** Output-preserving avenues on the
+M1 Ultra, as a share of the 1536x1024x121 distilled wall (407 s): decoder
+RoPE 0.6%, decoder modulation in fp16 ~0.5%, decoder MLP ~0 (at ceiling),
+NA kernel rewrite ~0, DiT GEMM 0 (95-99% of the MMA ceiling), DiT attention
+(MLX SDPA at 78% of the ceiling) ~1.5% here and up to ~5% at DFR's 37k-token
+stage 2 - the one item still nominally above the epsilon, and the one with the
+least credible path: a hand-written flash-attention kernel would have to beat
+MLX's steel SDPA, when our hand-written GEMM reached 49% of MLX's GEMM. Every
+remaining lever that is larger changes the output (step count, guidance skip,
+fp16 conv VAE, step caching, sparse attention) and belongs to the opt-in tier.
