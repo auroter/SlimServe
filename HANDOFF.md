@@ -14,7 +14,7 @@ in git history on main. Companion documents, read them in this order:
 4. `perf/ltx25_harness/`: the measurement scripts that produced the ledger.
 5. `perf/results/2026-10-01-ltx25-baseline/`: raw logs and frames.
 
-## Status (2026-10-05)
+## Status (2026-10-06)
 
 Done and gated: N0 loader, N1 forward, N2 distilled end to end, the
 output-preserving kernel-wave items that paid (split-K, fused glue, slab
@@ -44,6 +44,15 @@ distilled 406.6 s cold / 403.8 s resident, decode 97 s; DFR and dev measured
 before section 22 at 807 s / 1540 s (their decodes shrink by the same ~70 s). Quality is only judged at
 the default size (stage 1 must run at 768x512; section 20) and the parity
 reference is upstream, never the dgrauet port (it drops BOS).
+The fast tier (ledger section 24, 2026-10-06): three more profiles,
+`ltx25-distilled-fast` / `ltx25-dev-fast` / `ltx25-dfr-fast`, the same
+engine with output-changing settings (`engine.fast` -> `pipeline.Fast`:
+schedule overrides, dropped guidance passes, the first-block step cache,
+tiled stage-2 attention; plus the conv decoder). Measured one lever at a
+time and stacked at 1536x1024x121 against the exact pipeline (PSNR + contact
+sheets, clips in `~/.local/scratch/ltx25/n10/` for the user's review):
+distilled 413 -> 278 s, dev 1513 -> 644 s, DFR 681 -> 421 s. The exact
+profiles stay the reference; never tune them by the fast tier's method.
 Not done: DFR temporal rounds and second spatial epilogue, duration head,
 prompt enhancer, res_2s, the opt-in tier, any hand-written Metal GEMM
 (measured headroom on M1-M4 is at most ~10% of a forward; see ledger section
@@ -75,6 +84,7 @@ DiT, same kernels:
 | `ltx25-distilled` | DistilledPipeline | 8 ancestral steps, half res, CFG 1 | 2x latent upscale, 3 steps, distilled LoRA | fast / iterate |
 | `ltx25-dev` | TI2VidTwoStages | 30 steps x 4 guided passes (CFG 3.0, STG 1.0 on block 28, modality 3.0), half res | same | quality |
 | `ltx25-dfr` | DFRPipeline | distilled + 5 generated keyframe slots | upscale, spatial-detailing epilogue with the official IC-LoRA (strength 0.5), optional temporal rounds (+8 steps each) | production (Lightricks' label) |
+| `ltx25-*-fast` | the same three | output-changing settings stacked on (section 24 of the ledger) | | iterate, judged by eye |
 
 Dev vs distilled is the user's choice (test an idea vs render the final);
 never pick one on speed grounds. DFR must be supported. Default output

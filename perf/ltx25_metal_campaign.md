@@ -1016,3 +1016,65 @@ engine; `n10/distilled/results.tsv`). The exact run of this session: 413.5 s
 | stage 1: 8 -> 5 steps (drop the four sigma 0.975-0.99 steps) | 367.7 | 35 s (9%) | 15.4 dB | a different sample (the near-1 steps fix the composition), clean; not a degradation but not the same clip |
 | step cache 0.10 | 399.3 | 0 | identical | **never fires**: the block-0 residual moves 22-70% between consecutive steps (ancestral re-noising, large sigma jumps); no threshold short of "skip everything" would. Dead on the distilled schedules. |
 | attention tiles 2x2, halo 2 | 338.3 | 63 s (15%, stage 2 202 -> 139) | 23.2 dB (min 21.2) | **visible seam across the face** in the opening close-up (the boundary runs through the frame centre). Rejected at this geometry. |
+
+**Dev, one lever at a time** (same clip; `n10/dev/results.tsv`). Exact this
+session: 1513.4 s (stage 1 1156.1 = 30 guided steps x 4 passes, stage 2 228.3,
+decode 102.5).
+
+| lever | wall | saved | PSNR vs exact | reading |
+| --- | ---: | ---: | ---: | --- |
+| modality guidance off (3 passes) | 1180.2 | 333 s (22%) | 22.4 dB | same shot, clean; what it costs is audio-video alignment, which only listening judges |
+| 30 -> 20 steps | 1129.3 | 384 s (25%) | 22.5 dB | same shot, same quality at sheet scale |
+| step cache 0.10 | 1099.8 | 414 s (27%) | 21.8 dB | 11 of 30 stage-1 steps skipped (rel-L1 0.06-0.12 per step from step 4 on, alternating skip/compute under the accumulator); stage 2 never skips (0.5-0.65 per step). Clean. |
+| attention tiles 2x2, halo 2 | 1454.0 | 59 s (4%; stage 2 only) | 23.9 dB | the same seam through the face. Rejected. |
+
+The three dev levers act on different things (passes, steps, repeated steps)
+and should compose; the stack is measured below.
+
+**DFR, one lever at a time** (`n10/dfr/results.tsv`). Exact this session:
+680.7 s (stage 1 127.6, stage 2 418.2 at ~38k tokens, keyframe decode 119.4).
+
+| lever | wall | saved | PSNR vs exact | reading |
+| --- | ---: | ---: | ---: | --- |
+| stage 2: 3 -> 2 steps | 527.1 | 154 s (23%) | 32.8 dB | same shot |
+| step cache 0.10 | 664.0 | 0 | identical | never fires (0.22-0.67 per step), as distilled |
+| attention tiles 2x2, halo 2 | 607.9 | 59 s (9%; stage 2 418 -> 359) | 28.5 dB | **no seam** here, checked at full resolution on the opening close-up (`tiles_face_cmp.png`): the clean half-resolution reference tokens and the slot planes are keys of every tile and anchor it. Tiling is usable on DFR only. |
+
+**Distilled stacks.** A = conv decoder + 2-step stage 2: **277.9 s** (exact
+413.5; 1.49x), 29.6 dB, the same shot. B = A + 5-step stage 1: **229.3 s**
+(1.80x), clean, a different composition (15.4 dB, as the lever alone). The
+profile ships A; B is the documented opt-in (`fast.stage1_sigmas`), because
+one prompt is not evidence that the four near-sigma-1 steps the distillation
+was trained with can go in general.
+Tiling retried gently on distilled, 1x2 tiles with a 6-cell halo (the key
+set is 66% of the frame): 365.3 s, 31 s saved (stage 2 202 -> 171), 24.8 dB,
+no seam at full resolution on the close-up (`tiles12h6_face_cmp.png`). Kept
+as an opt-in, not in the profile: 8% for a seam risk that one prompt cannot
+rule out.
+
+**Dev stacks.** A = modality off + 20 steps + step cache 0.10 + conv decoder:
+**730.4 s** (exact 1513.4; 2.07x), 21.2 dB, the same shot. With 20 steps the
+per-step moves are larger and the cache skips 4 of 20 (the levers overlap:
+fewer steps leaves less for the cache). B = A + 2-step stage 2: **644.2 s**
+(2.35x), 21.4 dB, the same shot. The profile ships B.
+
+**DFR stacks.** A = conv decoder + 2-step stage 2: **455.2 s** (exact 680.7;
+1.50x), 28.4 dB min. B = A + 2x2 tiled stage-2 attention (halo 2): **421.0 s**
+(1.62x), 27.1 dB, the same shot, no seam. The profile ships B.
+
+**The fast profiles** (`ltx25-*-fast`, `engine.fast` + `decoder: conv`),
+1536x1024x121, M1 Ultra, resident engine:
+
+| profile | exact | fast | vs exact | vs the baseline runner |
+| --- | ---: | ---: | ---: | --- |
+| `ltx25-distilled-fast` | 413.5 s | **277.9 s** (229 s with the opt-in 5-step stage 1) | 1.49x (1.80x) | 505 s tiled (its lossy HD config): 1.8x (2.2x) |
+| `ltx25-dev-fast` | 1513.4 s | **644.2 s** | 2.35x | cannot run HD |
+| `ltx25-dfr-fast` | 680.7 s | **421.0 s** | 1.62x | not measured at HD |
+
+What did not make it, with the reason: the step cache on the ancestral
+schedules (never fires), tiled attention on distilled and dev (seams through
+faces; the 1x2/halo-6 geometry passed one prompt and is an opt-in), the
+5-step distilled stage 1 (a different sample, not a worse one; opt-in). All
+levers stay available through `engine.fast` for anyone who wants them.
+Artifacts: `~/.local/scratch/ltx25/n10/{distilled,dev,dfr}/` (mp4, uint8
+frames, contact sheets, `results.tsv`); the clips are for the user's review.

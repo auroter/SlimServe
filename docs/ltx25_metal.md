@@ -22,6 +22,7 @@ slimserve ltx25-distilled -y                        # fetch weights if needed, t
 slimserve ltx25-dev -p "A red fox trotting through a snowy pine forest at dawn" --output fox.mp4
 slimserve ltx25-dfr -p "..." --size 768x512 --seconds 5 --seed 7
 slimserve ltx25-distilled -p "the fox turns and runs" --image fox.png     # image-to-video
+slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
 ```
 
 The weights are gated: the Hugging Face token on the machine must have
@@ -85,6 +86,32 @@ CLI: `--image PATH` and `--image-strength` (0-1, default 1.0). API: `image`
 is the encoded still (PNG, JPEG, ...) as base64, optionally a
 `data:image/png;base64,...` URL, with `image_strength`; undecodable payloads
 are a 400. The encode is timed as the `image` span (both stages summed).
+
+### The fast tier
+
+`ltx25-distilled-fast`, `ltx25-dev-fast` and `ltx25-dfr-fast` are the same
+engine with output-changing settings stacked on: they are for iterating, and
+for anyone who judges a clip by eye rather than against a reference. The
+exact profiles stay the reference the fast ones are measured against. At
+1536x1024x121 on the M1 Ultra (ledger section 24):
+
+| profile | exact | fast | what is on |
+| --- | ---: | ---: | --- |
+| distilled | 413 s | **278 s** (229 s with the opt-in 5-step stage 1) | conv decoder; 2-step stage 2 |
+| dev | 1513 s | **644 s** | 20 steps; 3 guidance passes (modality off); first-block step cache 0.10; 2-step stage 2; conv decoder |
+| DFR | 681 s | **421 s** | 2-step stage 2; 2x2-tiled stage-2 attention; conv decoder |
+
+Every lever was measured alone first, with a PSNR against the exact clip and a
+look at the frames. Kept: fewer refinement steps (30-33 dB, the same shot),
+the conv decoder (35 dB), on dev fewer steps / fewer passes / the step cache
+(21-23 dB each, the same shot at sheet scale), on DFR tiled attention (28 dB,
+no seam: the reference tokens anchor every tile). Rejected: tiled attention
+on distilled and dev (a seam through faces at the frame centre), the step
+cache on the ancestral schedules (the block-0 residual moves 22-70% per step,
+so it never fires), and 5-step distilled stage 1 is left out of the default
+because it changes the composition (a different sample, not a worse one).
+The settings are the profile's `engine.fast` block (`pipeline.Fast`); a
+profile's request envelope and API are otherwise identical.
 
 ## Measured (M1 Ultra 64-core GPU, 128 GiB, macOS 15.7.2, seed 42)
 
@@ -182,10 +209,10 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 | file | contents |
 | --- | --- |
 | `checkpoints.py` | official file set, safetensors headers, load-time dtype policy |
-| `dit.py` | the transformer forward (upstream weight names), split-K, fused glue, LoRA hook, STG masks |
+| `dit.py` | the transformer forward (upstream weight names), split-K, fused glue, LoRA hook, STG masks, first-block step cache, tiled self-attention |
 | `text.py` | Gemma-4 tower, multi-layer feature projection, the two connectors |
 | `sampling.py` | latent state, positions, noise, Euler / ancestral Euler, dev schedule and guider, DFR canvas and slots |
-| `pipeline.py` | `LTX25Engine`: distilled, dev, dfr, render; memory budgeting |
+| `pipeline.py` | `LTX25Engine`: distilled, dev, dfr, render; memory budgeting; `Fast` (the fast tier's settings) |
 | `lora.py` | runtime low-rank adapters |
 | `vae.py`, `upscaler.py` | conv VAE (slab conv3d, tiling planner), latent upscalers |
 | `image.py` | image-to-video still: decode, CRF-18 round trip, upstream resize/crop/normalize |

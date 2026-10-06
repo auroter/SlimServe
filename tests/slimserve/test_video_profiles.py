@@ -13,6 +13,7 @@ from slimserve.registry import files_for, resolve
 from slimserve.video import server
 
 VIDEO_IDS = ("ltx25-distilled", "ltx25-dev", "ltx25-dfr")
+FAST_IDS = ("ltx25-distilled-fast", "ltx25-dev-fast", "ltx25-dfr-fast")
 GIB = 1 << 30
 
 
@@ -27,6 +28,29 @@ def test_video_profiles_resolve_on_metal_only():
         plan = _plan(profile_id)
         assert plan.engine["pipeline"] == profile_id.split("-")[1]
         assert not registry.is_language_model(plan.source)
+
+
+def test_fast_profiles_are_the_exact_profiles_plus_a_fast_block():
+    from slimserve.video.ltx25.pipeline import Fast
+
+    for fast_id in FAST_IDS:
+        exact_id = fast_id[: -len("-fast")]
+        fast, exact = _plan(fast_id).engine, _plan(exact_id).engine
+        assert fast["pipeline"] == exact["pipeline"]
+        assert fast["decoder"] == "conv" and "fast" not in exact
+        settings = server.fast_settings(fast)
+        assert isinstance(settings, Fast) and settings.active
+        assert {k: v for k, v in fast.items() if k not in ("fast", "decoder")} == {
+            k: v for k, v in exact.items() if k != "decoder"
+        }
+        assert registry.describe(fast_id)["platforms"] == ["metal"]
+    assert server.fast_settings(_plan("ltx25-dfr-fast").engine).attention_tiles == (
+        2,
+        2,
+    )
+    assert server.fast_settings(_plan("ltx25-dev-fast").engine).guidance == {
+        "modality": 1.0
+    }
 
 
 def test_video_profiles_carry_no_chat_serving_defaults():
