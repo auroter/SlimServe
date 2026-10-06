@@ -139,74 +139,168 @@ def na3d_mlx(q: mx.array, k: mx.array, v: mx.array, kernel: Kernel) -> mx.array:
 
 _NA_KERNELS: dict[tuple, object] = {}
 
-# lanes per (query, head): each owns HD / LANES dims; loads are 128-byte coalesced
+# lanes per query group: each owns HD / LANES dims; loads are 128-byte coalesced
 LANES = 8
+# adjacent-in-W queries served by one lane group: their windows overlap in all
+# but QW-1 columns, so one key/value row load feeds QW online softmaxes. 2 is
+# 1.29x over 1 at the stage-5 slab; 3 spills registers (ledger section 22).
+QW = 2
 
-_NA_SOURCE = """
-    // LANES lanes per (query token, head); lane j owns dims [j*DL, (j+1)*DL).
-    // q is pre-scaled.
+# Shared prologue: the query grid is (Tq, H, Wq) at offset (TOFF, WOFF) inside
+# the key/value volume (T, H, W), so a slab's halo frames and columns feed the
+# windows without being computed as queries themselves.
+_NA_PROLOGUE = """
     const uint T = shape[0], H = shape[1], W = shape[2], NH = shape[3];
+    const uint Tq = shape[4], Wq = shape[5], TOFF = shape[6], WOFF = shape[7];
     const uint gid = thread_position_in_grid.x;
     const uint lane = gid % LANES;
-    const uint tid = gid / LANES;
-    const uint total = T * H * W * NH;
-    const bool live = tid < total;
-    const uint head = live ? tid % NH : 0;
-    const uint tok = live ? tid / NH : 0;
-    const uint wi = tok % W;
-    const uint hi = (tok / W) % H;
-    const uint ti = tok / (W * H);
-    const int kt = min((int)KT, (int)T);
-    const int kh = min((int)KH, (int)H);
-    const int kw = min((int)KW, (int)W);
-    const int t0 = clamp((int)ti - kt / 2, 0, (int)T - kt);
-    const int h0 = clamp((int)hi - kh / 2, 0, (int)H - kh);
-    const int w0 = clamp((int)wi - kw / 2, 0, (int)W - kw);
+    const uint grp = gid / LANES;
+    const uint groups_w = (Wq + QW - 1) / QW;
+    const uint total = Tq * H * groups_w * NH;
+    const bool live = grp < total;
+    const uint head = live ? grp % NH : 0;
+    const uint g = live ? grp / NH : 0;
+    const uint gw = g % groups_w;
+    const uint hi = (g / groups_w) % H;
+    const uint tq = g / (groups_w * H);
+    const int ti = (int)(tq + TOFF);
     const uint stride_tok = NH * HD;
-    const size_t base = (size_t)tid * HD + lane * DL;
-    float qr[DL];
-    for (uint d = 0; d < DL; ++d) qr[d] = (float)q[base + d];
-    float m = -INFINITY, l = 0.0f;
-    float acc[DL];
-    for (uint d = 0; d < DL; ++d) acc[d] = 0.0f;
-    for (int a = 0; a < kt; ++a) {
-        for (int b = 0; b < kh; ++b) {
-            const size_t row = ((size_t)(t0 + a) * H + (h0 + b)) * W + w0;
-            for (int c = 0; c < kw; ++c) {
-                const size_t off = (row + c) * stride_tok + head * HD + lane * DL;
-                float s = 0.0f;
-                for (uint d = 0; d < DL; ++d) s += qr[d] * (float)k[off + d];
-                SHUFFLES                const float m_new = max(m, s);
-                const float corr = exp(m - m_new);
-                const float p = exp(s - m_new);
-                l = l * corr + p;
-                for (uint d = 0; d < DL; ++d)
-                    acc[d] = acc[d] * corr + p * (float)v[off + d];
-                m = m_new;
-            }
-        }
-    }
-    if (live) {
-        const float inv = 1.0f / l;
-        for (uint d = 0; d < DL; ++d) out[base + d] = (T_IN)(acc[d] * inv);
+    const uint stride_q = NH * HD;
+    float qr[QW][DL];
+    float m[QW], l[QW];
+    float acc[QW][DL];
+    int wi[QW];
+    for (uint i = 0; i < QW; ++i) {
+        const uint wq = min(gw * QW + i, Wq - 1);
+        wi[i] = (int)(wq + WOFF);
+        const size_t qtok = ((size_t)tq * H + hi) * Wq + wq;
+        const size_t qoff = qtok * stride_q + head * HD + lane * DL;
+        for (uint d = 0; d < DL; ++d) qr[i][d] = (float)q[qoff + d];
+        m[i] = -1.0e30f; l[i] = 0.0f;  // finite: a masked first key stays well defined
+        for (uint d = 0; d < DL; ++d) acc[i][d] = 0.0f;
     }
 """
 
+_NA_UPDATE = """
+                float kr[DL], vr[DL];
+                for (uint d = 0; d < DL; ++d) {
+                    kr[d] = (float)KB[off + d]; vr[d] = (float)VB[off + d];
+                }
+                for (uint i = 0; i < QW; ++i) {
+                    float s = 0.0f;
+                    for (uint d = 0; d < DL; ++d) s += qr[i][d] * kr[d];
+                    SHUFFLES
+                    const bool vis = VIS;
+                    const float m_new = vis ? max(m[i], s) : m[i];
+                    const float corr = exp(m[i] - m_new);
+                    const float p = vis ? exp(s - m_new) : 0.0f;
+                    l[i] = l[i] * corr + p;
+                    for (uint d = 0; d < DL; ++d)
+                        acc[i][d] = acc[i][d] * corr + p * vr[d];
+                    m[i] = m_new;
+                }
+"""
 
-def na3d(
-    q: mx.array, k: mx.array, v: mx.array, kernel: Kernel, lanes: int = LANES
-) -> mx.array:
-    """Metal neighborhood attention. q, k, v (1, T, H, W, heads, hd) in fp16 or fp32.
+_NA_EPILOGUE = """
+    if (live) {
+        for (uint i = 0; i < QW; ++i) {
+            const uint wq = gw * QW + i;
+            if (wq >= Wq) break;
+            const size_t qtok = ((size_t)tq * H + hi) * Wq + wq;
+            const size_t base = qtok * stride_q + head * HD + lane * DL;
+            const float inv = 1.0f / l[i];
+            for (uint d = 0; d < DL; ++d) out[base + d] = (T_IN)(acc[i][d] * inv);
+        }
+    }
+"""
 
-    Measured on the stage-5 shape (section 18 of the ledger): 8 lanes per query
-    3.0 TF/s; 1-4 lanes, threadgroup-staged key rows, and row-batched softmax
-    were all slower (the loop is latency-bound, and score arrays spill).
-    """
-    _, t, h, w, heads, hd = q.shape
-    key = (kernel, hd, str(q.dtype), lanes)
+# Plain decode: NATTEN semantics, the window shifted inside the volume.
+_NA_SOURCE = (
+    _NA_PROLOGUE
+    + """
+    const int kt = min((int)KT, (int)T);
+    const int kh = min((int)KH, (int)H);
+    const int kw = min((int)KW, (int)W);
+    const int t0 = clamp(ti - kt / 2, 0, (int)T - kt);
+    const int h0 = clamp((int)hi - kh / 2, 0, (int)H - kh);
+    int w0[QW];
+    for (uint i = 0; i < QW; ++i) w0[i] = clamp(wi[i] - kw / 2, 0, (int)W - kw);
+    const int wlo = w0[0], whi = w0[QW - 1] + kw;
+    for (int a = 0; a < kt; ++a) {
+        for (int b = 0; b < kh; ++b) {
+            const size_t row = ((size_t)(t0 + a) * H + (h0 + b)) * W;
+            for (int c = wlo; c < whi; ++c) {
+                const size_t off = (row + c) * stride_tok + head * HD + lane * DL;
+"""
+    + _NA_UPDATE.replace("KB", "k")
+    .replace("VB", "v")
+    .replace("VIS", "(c >= w0[i]) && (c < w0[i] + kw)")
+    + """
+            }
+        }
+    }
+"""
+    + _NA_EPILOGUE
+)
+
+# Joint (video + keyframe) NA, upstream joint_eager / joint_triton semantics:
+# the window is CENTRED on the query and taps outside the volume are masked
+# ("clamp-and-mask, not NATTEN's inward shift"), unlike the plain decode.
+# (k, v) is the query's own volume (T frames, Kt window), (kb, vb) a stack of
+# frames reached through slots[tq * S + s] (-1 = empty), Kh x Kw at (hi, wi).
+KEYFRAME_SLOTS = 2
+
+_NA_JOINT_SOURCE = (
+    _NA_PROLOGUE
+    + """
+    const uint S = shape[8];
+    const int t_lo = ti - (int)(KT / 2), h_lo = (int)hi - (int)(KH / 2);
+    const int ta = max(t_lo, 0), tb = min(t_lo + (int)KT, (int)T);
+    const int ha = max(h_lo, 0), hb = min(h_lo + (int)KH, (int)H);
+    int wa[QW], wb[QW];
+    for (uint i = 0; i < QW; ++i) {
+        wa[i] = max(wi[i] - (int)(KW / 2), 0);
+        wb[i] = min(wi[i] - (int)(KW / 2) + (int)KW, (int)W);
+    }
+    const int wlo = wa[0], whi = wb[QW - 1];
+    for (int a = ta; a < tb; ++a) {
+        for (int b = ha; b < hb; ++b) {
+            const size_t row = ((size_t)a * H + b) * W;
+            for (int c = wlo; c < whi; ++c) {
+                const size_t off = (row + c) * stride_tok + head * HD + lane * DL;
+"""
+    + _NA_UPDATE.replace("KB", "k")
+    .replace("VB", "v")
+    .replace("VIS", "(c >= wa[i]) && (c < wb[i])")
+    + """
+            }
+        }
+    }
+    for (uint si = 0; si < S; ++si) {
+        const int pl = slots[tq * S + si];
+        if (pl < 0) continue;
+        for (int b = ha; b < hb; ++b) {
+            const size_t row = ((size_t)pl * H + b) * W;
+            for (int c = wlo; c < whi; ++c) {
+                const size_t off = (row + c) * stride_tok + head * HD + lane * DL;
+"""
+    + _NA_UPDATE.replace("KB", "kb")
+    .replace("VB", "vb")
+    .replace("VIS", "(c >= wa[i]) && (c < wb[i])")
+    + """
+            }
+        }
+    }
+"""
+    + _NA_EPILOGUE
+)
+
+
+def _na_kernel(kind: str, kernel: Kernel, hd: int, dtype, lanes: int, qw: int):
+    key = (kind, kernel, hd, str(dtype), lanes, qw)
     kern = _NA_KERNELS.get(key)
     if kern is None:
-        src = _NA_SOURCE.replace(
+        src = (_NA_SOURCE if kind == "plain" else _NA_JOINT_SOURCE).replace(
             "SHUFFLES",
             "".join(
                 f"s += simd_shuffle_xor(s, {o});\n" for o in (4, 2, 1) if o < lanes
@@ -219,25 +313,33 @@ def na3d(
             ("HD", hd),
             ("LANES", lanes),
             ("DL", hd // lanes),
+            ("QW", qw),
         ):
             src = src.replace(name, str(val))
-        dt_tag = "f16" if q.dtype == mx.float16 else "f32"
+        dt_tag = "f16" if dtype == mx.float16 else "f32"
+        names = ["q", "k", "v"] + (["kb", "vb", "slots"] if kind == "joint" else [])
         kern = mx.fast.metal_kernel(
-            name=f"na3d_{kernel[0]}x{kernel[1]}x{kernel[2]}_d{hd}_l{lanes}_{dt_tag}",
-            input_names=["q", "k", "v", "shape"],
+            name=f"na3d_{kind}_{kernel[0]}x{kernel[1]}x{kernel[2]}_d{hd}_l{lanes}_q{qw}_{dt_tag}",
+            input_names=names + ["shape"],
             output_names=["out"],
             source=src,
         )
         _NA_KERNELS[key] = kern
-    total = t * h * w * heads * lanes
-    shape = mx.array([t, h, w, heads], dtype=mx.uint32)
+    return kern
+
+
+def _launch(kern, inputs, q, shape_list, lanes, qw):
+    _, tq, h, wq, heads, _ = q.shape
+    groups = tq * h * ((wq + qw - 1) // qw) * heads
+    total = groups * lanes
+    shape = mx.array(shape_list, dtype=mx.uint32)
     # MLX 0.32.2: a metal_kernel launched behind still-running MLX ops read
     # incomplete inputs 4 times out of 5 on the stage-4 volume of a 10 s clip
     # (NaN output); mx.eval on the inputs did not prevent it, a synchronize
     # does (ledger section 18). Costs a pipeline drain per call, ~1 ms.
     mx.synchronize()
     (out,) = kern(
-        inputs=[q, k, v, shape],
+        inputs=inputs + [shape],
         template=[("T_IN", q.dtype)],
         grid=((total + 255) // 256 * 256, 1, 1),
         threadgroup=(256, 1, 1),
@@ -249,87 +351,28 @@ def na3d(
     return out
 
 
-# ---- keyframe-aware (joint) attention --------------------------------------------
-# Upstream keyframes.py / fallback_na/joint_eager.py: a keyframe decode carries a
-# second stream of P "planes" (one pixel frame each) through the whole decoder
-# with fully shared weights. The streams meet only inside one softmax: a video
-# query sees its own Kt x Kh x Kw window plus the Kh x Kw window at its (h, w) on
-# the KEYFRAME_SLOTS nearest planes (by |t_s(plane) - t|, ties to the lower
-# index); a plane query sees the Kh x Kw window on its own plane plus the same
-# window on its nearest video frames. Nearest is independent of Kt.
-KEYFRAME_SLOTS = 2
+def na3d(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    kernel: Kernel,
+    lanes: int = LANES,
+    qw: int = QW,
+    offset: tuple[int, int] = (0, 0),
+) -> mx.array:
+    """Metal neighborhood attention (NATTEN semantics). k, v (1, T, H, W, heads,
+    hd) in fp16 or fp32; q (1, Tq, H, Wq, heads, hd) is the query block that
+    sits at frame `offset[0]` and column `offset[1]` of the k/v volume (a slab
+    core; the halo frames and columns are keys only).
 
-_NA_JOINT_SOURCE = """
-    // Joint (video + keyframe) NA, upstream joint_eager / joint_triton semantics:
-    // the window is CENTRED on the query and taps outside the volume are masked
-    // ("clamp-and-mask, not NATTEN's inward shift"), unlike the plain decode.
-    // (k, v) is the query's own volume (T frames, Kt window), (kb, vb) a stack of
-    // frames reached through slots[ti * S + s] (-1 = empty), Kh x Kw at (hi, wi).
-    const uint T = shape[0], H = shape[1], W = shape[2], NH = shape[3], S = shape[4];
-    const uint gid = thread_position_in_grid.x;
-    const uint lane = gid % LANES;
-    const uint tid = gid / LANES;
-    const uint total = T * H * W * NH;
-    const bool live = tid < total;
-    const uint head = live ? tid % NH : 0;
-    const uint tok = live ? tid / NH : 0;
-    const int wi = tok % W;
-    const int hi = (tok / W) % H;
-    const int ti = tok / (W * H);
-    const int t_lo = ti - (int)(KT / 2), t_hi = t_lo + (int)KT;
-    const int h_lo = hi - (int)(KH / 2), h_hi = h_lo + (int)KH;
-    const int w_lo = wi - (int)(KW / 2), w_hi = w_lo + (int)KW;
-    const int ta = max(t_lo, 0), tb = min(t_hi, (int)T);
-    const int ha = max(h_lo, 0), hb = min(h_hi, (int)H);
-    const int wa = max(w_lo, 0), wb = min(w_hi, (int)W);
-    const uint stride_tok = NH * HD;
-    const size_t base = (size_t)tid * HD + lane * DL;
-    float qr[DL];
-    for (uint d = 0; d < DL; ++d) qr[d] = (float)q[base + d];
-    float m = -INFINITY, l = 0.0f;
-    float acc[DL];
-    for (uint d = 0; d < DL; ++d) acc[d] = 0.0f;
-    for (int a = ta; a < tb; ++a) {
-        for (int b = ha; b < hb; ++b) {
-            const size_t row = ((size_t)a * H + b) * W;
-            for (int c = wa; c < wb; ++c) {
-                const size_t off = (row + c) * stride_tok + head * HD + lane * DL;
-                float s = 0.0f;
-                for (uint d = 0; d < DL; ++d) s += qr[d] * (float)k[off + d];
-                SHUFFLES                const float m_new = max(m, s);
-                const float corr = exp(m - m_new);
-                const float p = exp(s - m_new);
-                l = l * corr + p;
-                for (uint d = 0; d < DL; ++d)
-                    acc[d] = acc[d] * corr + p * (float)v[off + d];
-                m = m_new;
-            }
-        }
-    }
-    for (uint si = 0; si < S; ++si) {
-        const int pl = slots[ti * S + si];
-        if (pl < 0) continue;
-        for (int b = ha; b < hb; ++b) {
-            const size_t row = ((size_t)pl * H + b) * W;
-            for (int c = wa; c < wb; ++c) {
-                const size_t off = (row + c) * stride_tok + head * HD + lane * DL;
-                float s = 0.0f;
-                for (uint d = 0; d < DL; ++d) s += qr[d] * (float)kb[off + d];
-                SHUFFLES                const float m_new = max(m, s);
-                const float corr = exp(m - m_new);
-                const float p = exp(s - m_new);
-                l = l * corr + p;
-                for (uint d = 0; d < DL; ++d)
-                    acc[d] = acc[d] * corr + p * (float)vb[off + d];
-                m = m_new;
-            }
-        }
-    }
-    if (live) {
-        const float inv = 1.0f / l;
-        for (uint d = 0; d < DL; ++d) out[base + d] = (T_IN)(acc[d] * inv);
-    }
-"""
+    Measured on the stage-5 shape (ledger sections 18 and 22): 8 lanes per
+    query, 2 queries per lane group."""
+    _, t, h, w, heads, hd = k.shape
+    _, tq, hq, wq, _, _ = q.shape
+    if hq != h or tq + offset[0] > t or wq + offset[1] > w:
+        raise ValueError(f"query block {q.shape} at {offset} outside k/v {k.shape}")
+    kern = _na_kernel("plain", kernel, hd, q.dtype, lanes, qw)
+    return _launch(kern, [q, k, v], q, [t, h, w, heads, tq, wq, *offset], lanes, qw)
 
 
 def na3d_joint(
@@ -341,57 +384,32 @@ def na3d_joint(
     slots: mx.array,
     kernel: Kernel,
     lanes: int = LANES,
+    qw: int = QW,
+    offset: tuple[int, int] = (0, 0),
 ) -> mx.array:
     """One softmax over the query's own window in (k, v) (1, T, H, W, heads, hd)
     and the Kh x Kw window on each slot-indexed frame of (kb, vb)
-    (1, P, H, W, heads, hd); `slots` (T, S) int32, -1 for an empty slot.
+    (1, P, H, W, heads, hd); `slots` (Tq, S) int32 per query frame, -1 for an
+    empty slot. `q` and `offset` as in `na3d`.
 
     The video pass calls this with the volume as (k, v) and the planes as (kb,
     vb); the plane pass with the planes as (k, v) under a Kt = 1 kernel and the
     nearest video frames as (kb, vb)."""
-    _, t, h, w, heads, hd = q.shape
-    key = ("joint", kernel, hd, str(q.dtype), lanes)
-    kern = _NA_KERNELS.get(key)
-    if kern is None:
-        src = _NA_JOINT_SOURCE.replace(
-            "SHUFFLES",
-            "".join(
-                f"s += simd_shuffle_xor(s, {o});\n" for o in (4, 2, 1) if o < lanes
-            ),
-        )
-        for name, val in (
-            ("KT", kernel[0]),
-            ("KH", kernel[1]),
-            ("KW", kernel[2]),
-            ("HD", hd),
-            ("LANES", lanes),
-            ("DL", hd // lanes),
-        ):
-            src = src.replace(name, str(val))
-        dt_tag = "f16" if q.dtype == mx.float16 else "f32"
-        kern = mx.fast.metal_kernel(
-            name=f"na3d_joint_{kernel[0]}x{kernel[1]}x{kernel[2]}_d{hd}_l{lanes}_{dt_tag}",
-            input_names=["q", "k", "v", "kb", "vb", "slots", "shape"],
-            output_names=["out"],
-            source=src,
-        )
-        _NA_KERNELS[key] = kern
-    if slots.ndim != 2 or slots.shape[0] != t:
-        raise ValueError(f"slots {slots.shape} for {t} query frames")
-    total = t * h * w * heads * lanes
-    shape = mx.array([t, h, w, heads, slots.shape[1]], dtype=mx.uint32)
-    mx.synchronize()  # same MLX 0.32.2 launch race as na3d
-    (out,) = kern(
-        inputs=[q, k, v, kb, vb, slots.astype(mx.int32), shape],
-        template=[("T_IN", q.dtype)],
-        grid=((total + 255) // 256 * 256, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[q.shape],
-        output_dtypes=[q.dtype],
+    _, t, h, w, heads, hd = k.shape
+    _, tq, hq, wq, _, _ = q.shape
+    if hq != h or tq + offset[0] > t or wq + offset[1] > w:
+        raise ValueError(f"query block {q.shape} at {offset} outside k/v {k.shape}")
+    if slots.ndim != 2 or slots.shape[0] != tq:
+        raise ValueError(f"slots {slots.shape} for {tq} query frames")
+    kern = _na_kernel("joint", kernel, hd, q.dtype, lanes, qw)
+    return _launch(
+        kern,
+        [q, k, v, kb, vb, slots.astype(mx.int32)],
+        q,
+        [t, h, w, heads, tq, wq, *offset, slots.shape[1]],
+        lanes,
+        qw,
     )
-    mx.eval(out)
-    mx.synchronize()
-    return out
 
 
 def nearest_slots(
@@ -585,31 +603,43 @@ class DiffusionVAE:
         y: mx.array,
         t_pos: mx.array | None = None,
         w_pos: mx.array | None = None,
+        core: tuple[int, int, int, int] | None = None,
     ) -> tuple[mx.array, mx.array, mx.array]:
         """y (1, T, H, W, C) already normalised/modulated -> q (pre-scaled), k, v
         (1, T, H, W, heads, hd) in the operand dtype, RoPE applied at `t_pos`
-        (integer frame indices for video, fractional stage times for planes)."""
+        (integer frame indices for video, fractional stage times for planes).
+        With `core` = (t0, t1, w0, w1) q is projected for that block only (the
+        slab's halo frames and columns are keys, never queries)."""
         cfg = self.cfg
         b, t, h, w, c = y.shape
         heads, hd = c // cfg.head_dim, cfg.head_dim
-        # three projections rather than one split: the fused output passes 2^31
-        # elements on long clips, where mx.split returns garbage for the tail
         wq, bq = self.w[p + ".qkv.weight"], self.w[p + ".qkv.bias"]
-        yo = y.astype(self.operand)
-        q, k, v = (
-            (yo @ wq[i * c : (i + 1) * c].T + bq[i * c : (i + 1) * c])
-            .astype(self.stream)
-            .reshape(b, t, h, w, heads, hd)
-            for i in range(3)
-        )
-        del yo
-        q = _rms(q, self.w[p + ".q_norm.weight"]) * hd**-0.5
-        k = _rms(k, self.w[p + ".k_norm.weight"])
         t_pos = mx.arange(t).astype(G) if t_pos is None else t_pos
         h_pos = mx.arange(h).astype(G)
         w_pos = mx.arange(w).astype(G) if w_pos is None else w_pos
-        q = _axial_rope(q, t_pos, h_pos, w_pos, self.split, self.inv)
+
+        def project(i: int, src: mx.array) -> mx.array:
+            # one projection per output rather than one split: the fused output
+            # passes 2^31 elements on long clips, where mx.split returns garbage
+            return (
+                (
+                    src.astype(self.operand) @ wq[i * c : (i + 1) * c].T
+                    + bq[i * c : (i + 1) * c]
+                )
+                .astype(self.stream)
+                .reshape(b, src.shape[1], h, src.shape[3], heads, hd)
+            )
+
+        if core is None:
+            yq, tq_pos, wq_pos = y, t_pos, w_pos
+        else:
+            t0, t1, w0, w1 = core
+            yq, tq_pos, wq_pos = y[:, t0:t1, :, w0:w1], t_pos[t0:t1], w_pos[w0:w1]
+        q = _rms(project(0, yq), self.w[p + ".q_norm.weight"]) * hd**-0.5
+        q = _axial_rope(q, tq_pos, h_pos, wq_pos, self.split, self.inv)
+        k = _rms(project(1, y), self.w[p + ".k_norm.weight"])
         k = _axial_rope(k, t_pos, h_pos, w_pos, self.split, self.inv)
+        v = project(2, y)
         q, k, v = (a.astype(self.operand) for a in (q, k, v))
         mx.eval(q, k, v)  # the fp32 RoPE temporaries die here
         return q, k, v
@@ -622,30 +652,32 @@ class DiffusionVAE:
         w_pos: mx.array | None = None,
         t_pos: mx.array | None = None,
         planes: tuple[mx.array, mx.array] | None = None,
+        core: tuple[int, int, int, int] | None = None,
     ) -> mx.array:
-        """y (1, T, H, W, C) already normalised/modulated
-        -> attention output projected (stream dtype). With `planes` = (plane
-        input (1, P, H, W, C) prepared the same way, plane times) the video
-        queries also see their nearest keyframe planes (joint softmax)."""
+        """y (1, T, H, W, C) already normalised/modulated -> attention output
+        projected (stream dtype), for the `core` = (t0, t1, w0, w1) query block
+        only (default: all of y). With `planes` = (plane input (1, P, H, W, C)
+        prepared the same way, plane times) the video queries also see their
+        nearest keyframe planes (joint softmax)."""
         b, t, h, w, c = y.shape
-        q, k, v = self._qkv(p, y, t_pos, w_pos)
+        t0, t1, w0, w1 = core if core is not None else (0, t, 0, w)
+        q, k, v = self._qkv(p, y, t_pos, w_pos, core)
         del y
         if planes is None:
-            o = (
-                na3d(q, k, v, kernel)
-                if self.attention == "metal"
-                else na3d_mlx(q, k, v, kernel)
-            )
+            if self.attention == "metal":
+                o = na3d(q, k, v, kernel, offset=(t0, w0))
+            else:
+                o = na3d_mlx(q, k, v, kernel)[:, t0:t1, :, w0:w1]
         else:
             py, times = planes
             _, kb, vb = self._qkv(p, py, times, w_pos)
             t_np = np.arange(t) if t_pos is None else np.array(t_pos)
-            slots = mx.array(nearest_slots(t_np, np.array(times)))
-            o = na3d_joint(q, k, v, kb, vb, slots, kernel)
+            slots = mx.array(nearest_slots(t_np[t0:t1], np.array(times)))
+            o = na3d_joint(q, k, v, kb, vb, slots, kernel, offset=(t0, w0))
             del kb, vb
         mx.eval(o)
         del q, k, v
-        y = self._lin(p + ".proj", o.reshape(b, t, h, w, c))
+        y = self._lin(p + ".proj", o.reshape(b, t1 - t0, h, w1 - w0, c))
         mx.eval(y)
         return y
 
@@ -743,18 +775,28 @@ class DiffusionVAE:
                 for i, (buf, w_pos, n) in enumerate(self._w_slabs(xs, halo)):
                     pl = None if planes is None else (plane_slabs[i], planes[1])
                     o = self._attn(
-                        p, pre(buf), kernel, w_pos=w_pos, t_pos=t_pos, planes=pl
+                        p,
+                        pre(buf),
+                        kernel,
+                        w_pos=w_pos,
+                        t_pos=t_pos,
+                        planes=pl,
+                        core=(c0 - s0, c1 - s0, halo, halo + n),
                     )
                     del buf
-                    o = o[:, c0 - s0 : c1 - s0, :, halo : halo + n]
                     mx.eval(o)
                     outs.append(o)
                 core = mx.concatenate(outs, axis=3)
                 del outs
             else:
-                core = self._attn(p, pre(xs), kernel, t_pos=t_pos, planes=planes)[
-                    :, c0 - s0 : c1 - s0
-                ]
+                core = self._attn(
+                    p,
+                    pre(xs),
+                    kernel,
+                    t_pos=t_pos,
+                    planes=planes,
+                    core=(c0 - s0, c1 - s0, 0, xs.shape[3]),
+                )
             mx.eval(core)
             cores.append(core)
         return cores[0] if len(cores) == 1 else mx.concatenate(cores, axis=1)
@@ -967,10 +1009,15 @@ class DiffusionVAE:
                 del buf
                 pl = None if planes is None else (plane_slabs[j], times)
                 o = self._attn(
-                    p + ".attn", y, kernel, w_pos=w_pos, t_pos=t_pos, planes=pl
+                    p + ".attn",
+                    y,
+                    kernel,
+                    w_pos=w_pos,
+                    t_pos=t_pos,
+                    planes=pl,
+                    core=(off, off + (c1 - c0), halo_w, halo_w + n),
                 )
                 del y
-                o = o[:, off : off + (c1 - c0), :, halo_w : halo_w + n]
                 mx.eval(o)
                 outs.append(o)
             del slab
