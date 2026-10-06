@@ -657,23 +657,45 @@ class DiffusionVAE:
         frames_of,
         n_frames: int,
         kernel: Kernel,
+        w_slabs: bool = False,
     ) -> mx.array:
         """The plane queries' pass: each plane attends to the Kh x Kw window on
         itself (a Kt = 1 kernel over the plane stack) and on its nearest video
         frames. `frames_of(indices)` returns those frames' prepared input
         (1, n, H, W, C) from the pre-attention stream; only the frames some
-        plane points at are projected."""
+        plane points at are projected. With `w_slabs` (stage 5) both streams
+        are cut into upstream's W slabs, as chunked/attn.py does, so plane
+        queries at the volume edge see the same replicated halo the video does."""
         b, n_planes, h, w, c = py.shape
         slots = nearest_slots(np.array(times), np.arange(n_frames))
         wanted = np.unique(slots[slots >= 0])
         remap = {int(f): i for i, f in enumerate(wanted)}
-        local = np.vectorize(lambda s: remap[int(s)] if s >= 0 else -1)(slots)
-        q, k, v = self._qkv(p, py, times)
-        _, kb, vb = self._qkv(p, frames_of(wanted), mx.array(wanted).astype(G))
-        o = na3d_joint(
-            q, k, v, kb, vb, mx.array(local.astype(np.int32)), (1, kernel[1], kernel[2])
+        local = mx.array(
+            np.vectorize(lambda s: remap[int(s)] if s >= 0 else -1)(slots).astype(
+                np.int32
+            )
         )
-        del q, k, v, kb, vb
+        fy, ft = frames_of(wanted), mx.array(wanted).astype(G)
+        k1 = (1, kernel[1], kernel[2])
+
+        def one(pbuf, fbuf, w_pos):
+            q, k, v = self._qkv(p, pbuf, times, w_pos)
+            _, kb, vb = self._qkv(p, fbuf, ft, w_pos)
+            o = na3d_joint(q, k, v, kb, vb, local, k1)
+            del q, k, v, kb, vb
+            return o
+
+        if not w_slabs:
+            o = one(py, fy, None)
+        else:
+            halo = kernel[2] // 2
+            frame_slabs = [buf for buf, _, _ in self._w_slabs(fy, halo)]
+            outs = []
+            for j, (pbuf, w_pos, n) in enumerate(self._w_slabs(py, halo)):
+                oj = one(pbuf, frame_slabs[j], w_pos)[:, :, :, halo : halo + n]
+                mx.eval(oj)
+                outs.append(oj)
+            o = mx.concatenate(outs, axis=3)
         y = self._lin(p + ".proj", o.reshape(b, n_planes, h, w, c))
         mx.eval(y)
         return y
@@ -931,7 +953,7 @@ class DiffusionVAE:
                 return pre(mx.concatenate(parts, axis=1))
 
             plane_out = self._plane_attn(
-                p + ".attn", py, times, frames_of, n_frames, kernel
+                p + ".attn", py, times, frames_of, n_frames, kernel, w_slabs=True
             )
             plane_slabs = [buf for buf, _, _ in self._w_slabs(py, halo_w)]
         # 2. attention: read slabs from the pre-attention stream, write the new stream
