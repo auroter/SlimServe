@@ -1250,5 +1250,10 @@ loop's default); ours seeds both streams from the request seed.
 
 Smoke: 512x320x33 in 131 s (stage 1 88 s = 15 steps x 2 evaluations x 3
 passes, stage 2 18 s), a coherent clip. Profile `ltx25-hq` (the dev file set).
-Not yet measured at 1536x1024x121; expected around 2 x 15 / 30 of dev's
-stage 1 plus the LoRA's +22%: ~1400 s.
+1536x1024x121 (beat1d, seed 7, `n11/hq_beat1d_1536.mp4`): **1901.7 s**:
+stage 1 1249.3 s (15 steps x 2 evaluations x 3 passes, with the LoRA), stage 2
+534.6 s (3 steps x 2 evaluations + the terminal x0 = 7 forwards at 24.5k
+tokens, with the LoRA), decode 98 s. Slower than dev's 1513 s: res_2s halves
+the steps but doubles the evaluations, the LoRA adds its +22% to both stages,
+and stage 2 runs 7 forwards instead of 3. A clean clip with the prompt's
+elements in it.

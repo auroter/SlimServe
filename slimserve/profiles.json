@@ -3943,7 +3943,7 @@
       "title": "LTX-2.5 HQ (two-stage, res_2s) on Apple Silicon",
       "source": "ltx25",
       "gpus": 1,
-      "summary": "Audio+video generation with Lightricks' TI2VidTwoStagesHQPipeline: the dev transformer with the distilled LoRA at 0.25 for 15 guided res_2s steps (CFG 3.0 video / 7.0 audio, no STG, modality 3.0, rescale 0.45 / 1.0) at half resolution, 2x latent upscale, 3 res_2s steps at full resolution with the LoRA at 0.5 and the audio refined alongside. Lightricks' quality preset at half the dev step count.",
+      "summary": "Audio+video generation with Lightricks' TI2VidTwoStagesHQPipeline: the dev transformer with the distilled LoRA at 0.25 for 15 guided res_2s steps (CFG 3.0 video / 7.0 audio, no STG, modality 3.0, rescale 0.45 / 1.0) at half resolution, 2x latent upscale, 3 res_2s steps at full resolution with the LoRA at 0.5 and the audio refined alongside. Lightricks' quality preset at half the dev step count, each step two evaluations: 1536x1024x121 in 1902 s on an M1 Ultra (dev: 1513 s).",
       "speculative": false,
       "variants": {
         "metal": {

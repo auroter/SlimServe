@@ -118,6 +118,10 @@ exact profiles stay the reference the fast ones are measured against. At
 | dev | 1513 s | **911 s** | 20 steps; first-block step cache 0.10; conv decoder (all four guidance passes kept) |
 | DFR | 681 s | **421 s** | 2-step stage 2; 2x2-tiled stage-2 attention; conv decoder |
 
+`ltx25-hq` (Lightricks' HQ preset, res_2s) takes 1902 s at the same size: half
+the steps of dev but two model evaluations per step and the distilled LoRA
+in both stages.
+
 Every lever was measured alone first, with a PSNR against the exact clip and a
 look at the frames. Kept: fewer refinement steps (30-33 dB, the same shot),
 the conv decoder (35 dB), on dev fewer steps and the step cache
