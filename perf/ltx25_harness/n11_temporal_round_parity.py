@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """N11: one DFR temporal round against upstream's run_one_temporal_round (torch, CPU).
 
   ref  OUT.npz         upstream ltx_pipelines.dfr_stages.run_one_temporal_round on a fixed
@@ -43,7 +44,9 @@ def inputs():
         return r["latent"], planes, r["audio"], r["vtext"], r["atext"]
     rng = np.random.default_rng(11)
     latent = rng.standard_normal((1, 128, F, H, W)).astype(np.float32)
-    planes = {p: rng.standard_normal((1, 128, 1, H, W)).astype(np.float32) for p in PLANES}
+    planes = {
+        p: rng.standard_normal((1, 128, 1, H, W)).astype(np.float32) for p in PLANES
+    }
     n_audio = round(CANVAS / FPS * 25)
     audio = rng.standard_normal((1, 8, n_audio, 16)).astype(np.float32)
     vtext = (rng.standard_normal((1, 1024, 4096)) * 0.5).astype(np.float32)
@@ -56,13 +59,20 @@ def real_inputs():
     prompt) and save the round's inputs for both sides."""
     import mlx.core as mx
 
-    from slimserve.video.ltx25 import pipeline, sampling
+    from slimserve.video.ltx25 import pipeline
 
     eng = pipeline.LTX25Engine(variant="distilled")
     prompt = "A red fox trotting through a snowy pine forest at dawn"
     vtext, atext = eng.load_text().encode(prompt)[:2]
     mx.eval(vtext, atext)
-    res = eng.dfr(prompt, height=H * 32, width=W * 32, num_frames=CANVAS, seed=SEED, text_embeds=(vtext, atext))
+    res = eng.dfr(
+        prompt,
+        height=H * 32,
+        width=W * 32,
+        num_frames=CANVAS,
+        seed=SEED,
+        text_embeds=(vtext, atext),
+    )
     # the untrimmed canvas is the latent (49 frames is a whole canvas) and the
     # planes are the keyframes
     planes, frames = res.keyframes
@@ -76,7 +86,9 @@ def real_inputs():
         audio=np.ascontiguousarray(audio),
         vtext=np.array(vtext),
         atext=np.array(atext),
-        **{f"plane{p}": np.array(planes[:, :, i : i + 1]) for i, p in enumerate(frames)},
+        **{
+            f"plane{p}": np.array(planes[:, :, i : i + 1]) for i, p in enumerate(frames)
+        },
     )
     print("saved", REAL, np.array(res.video_latent).shape, audio.shape)
 
@@ -91,13 +103,16 @@ def ref(out, step0=False):
 
     sys.path[:0] = [f"{UP}/ltx-core/src", f"{UP}/ltx-pipelines/src", STUB]
     import oiio_stub  # noqa: F401
-
     from ltx_core.components.noisers import GaussianNoiser
     from ltx_core.components.patchifiers import VideoLatentPatchifier
     from ltx_core.tools import VideoLatentTools
     from ltx_core.types import VideoLatentShape, VideoPixelShape
     from ltx_pipelines.dfr_stages import run_one_temporal_round
-    from ltx_pipelines.utils.blocks import DiffusionStage, ImageConditioner, VideoUpsampler
+    from ltx_pipelines.utils.blocks import (
+        DiffusionStage,
+        ImageConditioner,
+        VideoUpsampler,
+    )
     from ltx_pipelines.utils.constants import DISTILLED_SIGMAS
 
     latent, planes, audio, vtext, atext = inputs()
@@ -136,7 +151,9 @@ def ref(out, step0=False):
         def dispose(self):
             pass
 
-    DiffusionStage._build_transformer = lambda self, device=None, **kw: _Keep(fp32).eval()
+    DiffusionStage._build_transformer = lambda self, device=None, **kw: _Keep(
+        fp32
+    ).eval()
     # the sampler's latent updates default to bf16 (model_dtype); fp32 reference
     import functools
 
@@ -148,12 +165,18 @@ def ref(out, step0=False):
     )
     upsampler = VideoUpsampler(VAE, TUP, dtype, device)
     conditioner = ImageConditioner(VAE, dtype, device)
-    tools = VideoLatentTools(VideoLatentPatchifier(1), VideoLatentShape(1, 128, F, H, W), FPS)
+    tools = VideoLatentTools(
+        VideoLatentPatchifier(1), VideoLatentShape(1, 128, F, H, W), FPS
+    )
     # the stage returns unpatchified states; create_initial_state patchifies
     video_state = tools.unpatchify(
-        tools.create_initial_state(device, dtype, initial_latent=torch.from_numpy(latent))
+        tools.create_initial_state(
+            device, dtype, initial_latent=torch.from_numpy(latent)
+        )
     )
-    assert tuple(video_state.latent.shape) == (1, 128, F, H, W), video_state.latent.shape
+    assert tuple(video_state.latent.shape) == (1, 128, F, H, W), (
+        video_state.latent.shape
+    )
     keyframes = {p: torch.from_numpy(x) for p, x in planes.items()}
     gen = torch.Generator(device=device).manual_seed(SEED)
     if step0:
@@ -196,7 +219,13 @@ def ref(out, step0=False):
                 image_conditioner=conditioner,
                 video_state=video_state,
                 keyframes=keyframes,
-                video_shape=VideoPixelShape(batch=1, frames=2 * (CANVAS - 1) + 1, height=H * 32, width=W * 32, fps=2 * FPS),
+                video_shape=VideoPixelShape(
+                    batch=1,
+                    frames=2 * (CANVAS - 1) + 1,
+                    height=H * 32,
+                    width=W * 32,
+                    fps=2 * FPS,
+                ),
                 images=[],
                 video_context=torch.from_numpy(vtext),
                 audio_context=torch.from_numpy(atext),
@@ -223,7 +252,9 @@ def ref(out, step0=False):
         out,
         latent=state.latent.float().numpy(),
         plane_positions=np.array(sorted(carry)),
-        planes=np.concatenate([carry[p].float().numpy() for p in sorted(carry)], axis=2),
+        planes=np.concatenate(
+            [carry[p].float().numpy() for p in sorted(carry)], axis=2
+        ),
         **{f"noise{i}": d for i, d in enumerate(drawn)},
     )
 
@@ -246,7 +277,12 @@ class _Replay:
         if tuple(cur.shape) == tuple(shape):
             self.partial = None
             return mx.array(cur)
-        if cur.ndim == 3 and len(shape) == 3 and cur.shape[0] == shape[0] and cur.shape[2] == shape[2]:
+        if (
+            cur.ndim == 3
+            and len(shape) == 3
+            and cur.shape[0] == shape[0]
+            and cur.shape[2] == shape[2]
+        ):
             n = shape[1]
             if n > cur.shape[1]:
                 # upstream noised the frozen audio too (scale 0); ours never draws it
@@ -255,23 +291,29 @@ class _Replay:
             head, rest = cur[:, :n], cur[:, n:]
             self.partial = rest if rest.shape[1] else None
             return mx.array(np.ascontiguousarray(head))
-        if cur.ndim == 4 and len(shape) == 3:  # upstream audio (1, 8, T, 16) -> our (1, T, 128)
+        if (
+            cur.ndim == 4 and len(shape) == 3
+        ):  # upstream audio (1, 8, T, 16) -> our (1, T, 128)
             flat = cur.transpose(0, 2, 1, 3).reshape(1, cur.shape[2], -1)
             self.partial = None
             if tuple(flat.shape) != tuple(shape):
                 raise RuntimeError(f"noise replay: audio {flat.shape} vs ours {shape}")
             return mx.array(np.ascontiguousarray(flat))
-        raise RuntimeError(f"noise replay: ours wants {shape}, upstream drew {cur.shape}")
+        raise RuntimeError(
+            f"noise replay: ours wants {shape}, upstream drew {cur.shape}"
+        )
 
 
 def ours(out, ref_path):
     import mlx.core as mx
 
-    from slimserve.video.ltx25 import checkpoints, pipeline, sampling
+    from slimserve.video.ltx25 import checkpoints, pipeline
     from slimserve.video.ltx25 import dit as dit_mod
 
     dit_mod.F = mx.float32
-    checkpoints.cast_operands.__defaults__ = (mx.float32,) + checkpoints.cast_operands.__defaults__[1:]
+    checkpoints.cast_operands.__defaults__ = (
+        mx.float32,
+    ) + checkpoints.cast_operands.__defaults__[1:]
     latent, planes, audio, vtext, atext = inputs()
     r = np.load(ref_path)
     count = len([k for k in r if k.startswith("noise")])
@@ -306,7 +348,11 @@ def ours(out, ref_path):
     mx.random.normal = real_normal
     mx.eval(stitched)
     if replay.queue or replay.partial is not None:
-        print("WARNING: upstream drew more noise than ours consumed:", len(replay.queue), "left")
+        print(
+            "WARNING: upstream drew more noise than ours consumed:",
+            len(replay.queue),
+            "left",
+        )
     np.savez(
         out,
         latent=np.array(stitched),
@@ -324,7 +370,9 @@ def ours_step0(out, ref_path):
     from slimserve.video.ltx25 import dit as dit_mod
 
     dit_mod.F = mx.float32
-    checkpoints.cast_operands.__defaults__ = (mx.float32,) + checkpoints.cast_operands.__defaults__[1:]
+    checkpoints.cast_operands.__defaults__ = (
+        mx.float32,
+    ) + checkpoints.cast_operands.__defaults__[1:]
     latent, planes, audio, vtext, atext = inputs()
     r = np.load(ref_path)
     count = len([k for k in r if k.startswith("noise")])
@@ -334,7 +382,6 @@ def ours_step0(out, ref_path):
     dit = eng.load_dit()
     vae = eng.load_vae()
     audio_tokens = mx.array(audio.transpose(0, 2, 1, 3).reshape(1, audio.shape[2], -1))
-    captured = {}
 
     steps: list = []
     n_ref = int(r["steps"])
@@ -346,9 +393,15 @@ def ours_step0(out, ref_path):
             mx.eval(v0, a0)
             steps.append(
                 dict(
-                    latent=np.array(vx), clean=np.array(video.clean), mask=np.array(video.denoise_mask),
-                    positions=np.array(video.positions), kf=np.array(video.keyframes_mask),
-                    audio=np.array(ax), audio_positions=np.array(audio.positions), x0=np.array(v0), sigma=sigma,
+                    latent=np.array(vx),
+                    clean=np.array(video.clean),
+                    mask=np.array(video.denoise_mask),
+                    positions=np.array(video.positions),
+                    kf=np.array(video.keyframes_mask),
+                    audio=np.array(ax),
+                    audio_positions=np.array(audio.positions),
+                    x0=np.array(v0),
+                    sigma=sigma,
                 )
             )
             if len(steps) == n_ref:
@@ -373,34 +426,65 @@ def ours_step0(out, ref_path):
     sampling.euler_ancestral_loop = loop
 
     tm = pipeline.Timings()
-    try:
-        eng._temporal_round(1, Probe(dit, mx.array(vtext), mx.array(atext)), vae, mx.array(latent),
-                            {p: mx.array(x) for p, x in planes.items()}, 2 * (CANVAS - 1) + 1, 2 * FPS,
-                            H, W, audio_tokens, CANVAS / FPS, SEED, None, 1.0, tm, None)
-    except _Stop:
-        pass
+    import contextlib
+
+    with contextlib.suppress(_Stop):
+        eng._temporal_round(
+            1,
+            Probe(dit, mx.array(vtext), mx.array(atext)),
+            vae,
+            mx.array(latent),
+            {p: mx.array(x) for p, x in planes.items()},
+            2 * (CANVAS - 1) + 1,
+            2 * FPS,
+            H,
+            W,
+            audio_tokens,
+            CANVAS / FPS,
+            SEED,
+            None,
+            1.0,
+            tm,
+            None,
+        )
     sampling.euler_ancestral_loop = _loop
-    np.savez(out, **{f"s{i}_{k}": v for i, st in enumerate(steps) for k, v in st.items()})
-    rel = lambda a, b: np.linalg.norm(a.astype(np.float64) - b) / max(np.linalg.norm(b), 1e-12)  # noqa: E731
+    np.savez(
+        out, **{f"s{i}_{k}": v for i, st in enumerate(steps) for k, v in st.items()}
+    )
+    rel = lambda a, b: (
+        np.linalg.norm(a.astype(np.float64) - b) / max(np.linalg.norm(b), 1e-12)
+    )  # noqa: E731
     for i, st in enumerate(steps):
-        print(f"step {i} (tile {i // per_tile}) sigma ours {st['sigma']:.4f} ref {float(r[f's{i}_sigma']):.4f}")
+        print(
+            f"step {i} (tile {i // per_tile}) sigma ours {st['sigma']:.4f} ref {float(r[f's{i}_sigma']):.4f}"
+        )
         for k in ("latent", "clean", "mask", "kf", "positions", "audio", "x0"):
             a, b = st[k], r[f"s{i}_{k}"]
             if k == "positions":
-                b = ((b[:, :, :, 0] + b[:, :, :, 1]) / 2.0).transpose(0, 2, 1)  # (B, N, 3) midpoints
+                b = ((b[:, :, :, 0] + b[:, :, :, 1]) / 2.0).transpose(
+                    0, 2, 1
+                )  # (B, N, 3) midpoints
             if a.shape != b.shape:
                 print(f"  {k}: shape ours {a.shape} ref {b.shape}")
                 continue
             n_gen = 448 if i < per_tile else 640
             print(
                 f"  {k}: rel {rel(a, b):.2e} max-abs {np.abs(a - b).max():.3e}"
-                + (f" (gen {rel(a[:, :n_gen], b[:, :n_gen]):.1e}, cond {rel(a[:, n_gen:], b[:, n_gen:]):.1e})" if a.ndim == 3 and a.shape[1] > n_gen else "")
+                + (
+                    f" (gen {rel(a[:, :n_gen], b[:, :n_gen]):.1e}, cond {rel(a[:, n_gen:], b[:, n_gen:]):.1e})"
+                    if a.ndim == 3 and a.shape[1] > n_gen
+                    else ""
+                )
             )
 
 
 def cmp(a, b):
     ra, rb = np.load(a), np.load(b)
-    print("plane positions", ra["plane_positions"].tolist(), rb["plane_positions"].tolist())
+    print(
+        "plane positions",
+        ra["plane_positions"].tolist(),
+        rb["plane_positions"].tolist(),
+    )
     for k in ("latent", "planes"):
         x, y = ra[k].astype(np.float64), rb[k].astype(np.float64)
         print(
@@ -408,7 +492,10 @@ def cmp(a, b):
             f"max-abs {np.abs(x - y).max():.3e}"
         )
         if k == "latent":
-            per = [np.linalg.norm(x[:, :, t] - y[:, :, t]) / np.linalg.norm(x[:, :, t]) for t in range(x.shape[2])]
+            per = [
+                np.linalg.norm(x[:, :, t] - y[:, :, t]) / np.linalg.norm(x[:, :, t])
+                for t in range(x.shape[2])
+            ]
             print("  per cell:", " ".join(f"{p:.1e}" for p in per))
 
 

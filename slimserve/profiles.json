@@ -3938,6 +3938,35 @@
           ]
         }
       }
+    },
+    "ltx25-hq": {
+      "title": "LTX-2.5 HQ (two-stage, res_2s) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Audio+video generation with Lightricks' TI2VidTwoStagesHQPipeline: the dev transformer with the distilled LoRA at 0.25 for 15 guided res_2s steps (CFG 3.0 video / 7.0 audio, no STG, modality 3.0, rescale 0.45 / 1.0) at half resolution, 2x latent upscale, 3 res_2s steps at full resolution with the LoRA at 0.5 and the audio refined alongside. Lightricks' quality preset at half the dev step count.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "hq",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "The res_2s sampler (second-order exponential Runge-Kutta in log-sigma with SDE noise on the step and the substep, anchor refinement on small steps, the terminal step at sigma 0.0011) matches upstream's loop to 2e-5 on a synthetic denoiser (perf/ltx25_harness/n11_res2s_parity.py). The guided passes run as one batch of three (conditional, negative, modality-isolated). The stage-1 schedule follows the latent's token count, as upstream's scheduler does when handed a latent. negative_prompt is accepted; the default is Lightricks' DEFAULT_NEGATIVE_PROMPT. Ledger section 27.",
+            "SDE noise is seeded from the request seed (upstream's HQ pipeline leaves the sampler's noise seed at its default, so its clips vary with the seed only through the initial noise)."
+          ]
+        }
+      }
     }
   }
 }

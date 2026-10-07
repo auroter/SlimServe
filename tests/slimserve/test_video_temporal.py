@@ -137,3 +137,44 @@ def test_spatial_tiles_blend_exactly_as_upstream_does():
     # other keeps its count with the overlap clamped (5 columns, overlap 1)
     small = sampling.spatial_tiles(3, 5, 4, 10)
     assert len(small) == 4 and all((t.h0, t.h1) == (0, 3) for t in small)
+
+
+def test_res2s_coefficients_match_the_exponential_integrator():
+    import math
+
+    a21, b1, b2 = sampling.res2s_coefficients(0.0)  # phi_1(0) = 1, phi_2(0) = 1/2
+    assert np.allclose([a21, b1, b2], [0.5, 0.0, 1.0])
+    h = 0.7
+    phi1 = (math.exp(-h) - 1) / (-h)
+    phi2 = (math.exp(-h) - 1 + h) / (h * h)
+    a21, b1, b2 = sampling.res2s_coefficients(h)
+    assert np.isclose(a21, 0.5 * (math.exp(-h / 2) - 1) / (-h / 2))
+    assert np.isclose(b2, phi2 / 0.5) and np.isclose(b1, phi1 - b2)
+
+
+def test_res2s_loop_ends_on_the_terminal_x0_and_draws_twice_per_modality_per_step():
+    calls = []
+
+    def denoise(video, audio, vx, ax, sigma):
+        calls.append(sigma)
+        return vx * 0.0, ax * 0.0  # x0 = 0 everywhere
+
+    v = sampling.noised_state((1, 6, 4), mx.zeros((1, 6, 3)), 0)
+    a = sampling.noised_state((1, 2, 4), mx.zeros((1, 2, 1)), 1)
+    draws = []
+    real = mx.random.normal
+
+    def normal(shape, *args, **kw):
+        draws.append(tuple(shape))
+        return real(shape, *args, **kw)
+
+    mx.random.normal = normal
+    try:
+        vx, ax = sampling.res2s_loop(denoise, v, a, [1.0, 0.5, 0.0], noise_seed=7)
+        mx.eval(vx, ax)
+    finally:
+        mx.random.normal = real
+    # two steps (1.0 -> 0.5 -> 0.0011) each with a midpoint call, then the terminal call
+    assert len(calls) == 5 and calls[-1] == sampling.RES2S_TERMINAL_SIGMA
+    assert draws.count((1, 6, 4)) == 4 and draws.count((1, 2, 4)) == 4
+    assert np.allclose(np.array(vx), 0.0) and np.allclose(np.array(ax), 0.0)

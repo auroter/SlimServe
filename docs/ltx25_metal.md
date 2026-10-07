@@ -23,6 +23,7 @@ slimserve ltx25-dev -p "A red fox trotting through a snowy pine forest at dawn" 
 slimserve ltx25-dfr -p "..." --size 768x512 --seconds 5 --seed 7
 slimserve ltx25-distilled -p "the fox turns and runs" --image fox.png     # image-to-video
 slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
+slimserve ltx25-hq -p "..."                                               # Lightricks' HQ preset (res_2s)
 ```
 
 The weights are gated: the Hugging Face token on the machine must have
@@ -245,7 +246,6 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
   indices, video-to-video reference conditioning); the I2V first-frame path
   is wired but its end-to-end output has not yet been compared against
   upstream on this machine.
-- The res_2s sampler (HQ pipeline).
 - The prompt enhancer. With the 2.5 Gemma-4 encoder, upstream enhances only
   through a separate generative instruct Gemma (`--prompt-enhancer-gemma-root`,
   e.g. Gemma-4 E2B-it); the LTX fine-tuned 12B tower is not a generative

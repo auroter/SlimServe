@@ -71,7 +71,8 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     out = Path(args.output or f"{cfg['pipeline']}-{params['seed']}.mp4").expanduser()
     started = time.perf_counter()
     engine = LTX25Engine(
-        root=cfg["root"], variant="dev" if cfg["pipeline"] == "dev" else "distilled"
+        root=cfg["root"],
+        variant="dev" if cfg["pipeline"] in ("dev", "hq") else "distilled",
     )
     prompt = params.pop("prompt")
     decoder = params.pop("decoder")

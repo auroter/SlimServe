@@ -39,6 +39,12 @@ CACHE_BYTES = 16 << 30
 DECODE_CACHE_BYTES = 48 << 30
 DEFAULT_VIDEO_GUIDANCE = sampling.Guidance(cfg=3.0)
 DEFAULT_AUDIO_GUIDANCE = sampling.Guidance(cfg=7.0)
+# upstream LTX_2_3_HQ_PARAMS (a plain constant, no per-version override): no STG
+HQ_VIDEO_GUIDANCE = sampling.Guidance(cfg=3.0, stg=0.0, modality=3.0, rescale=0.45)
+HQ_AUDIO_GUIDANCE = sampling.Guidance(cfg=7.0, stg=0.0, modality=3.0, rescale=1.0)
+HQ_STEPS = 15
+HQ_LORA_STAGE_1, HQ_LORA_STAGE_2 = 0.25, 0.5
+RES2S_NOISE_SEED_OFFSET = 40000
 
 
 @dataclass
@@ -1481,6 +1487,146 @@ class LTX25Engine:
         return Result(
             sampling.unpatchify(v2, (f, h2, w2)),
             a1,
+            num_frames,
+            height,
+            width,
+            fps,
+            tm,
+            predicted_seconds=predicted,
+        )
+
+    # ---- hq (res_2s) --------------------------------------------------------
+    def hq(
+        self,
+        prompt: str,
+        height: int = 1024,
+        width: int = 1536,
+        num_frames: int | None = 121,
+        fps: float = 24.0,
+        seed: int = 42,
+        negative_prompt: str | None = None,
+        steps: int = HQ_STEPS,
+        video_guidance: sampling.Guidance = HQ_VIDEO_GUIDANCE,
+        audio_guidance: sampling.Guidance = HQ_AUDIO_GUIDANCE,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+        image: str | bytes | None = None,
+        image_strength: float = 1.0,
+        max_num_frames: int | None = None,
+    ) -> Result:
+        """Lightricks' TI2VidTwoStagesHQPipeline: the dev transformer with the
+        distilled LoRA at 0.25, 15 guided res_2s steps (CFG 3 / 7, no STG,
+        modality 3, rescale 0.45 / 1.0) on the token-count-shifted schedule at
+        half resolution; 2x latent upscale; 3 res_2s steps at full resolution
+        with the LoRA at 0.5, audio re-noised and refined alongside (it ships
+        from stage 2). The SDE noise streams are seeded from the request seed
+        (upstream leaves them at their default seed)."""
+        if self.variant != "dev":
+            raise ValueError("the HQ pipeline needs LTX25Engine(variant='dev')")
+        tm = Timings()
+        with tm.span("text"):
+            text = self.load_text()
+            cond = text.encode(prompt)[:2]
+            neg = text.encode(
+                sampling.DEFAULT_NEGATIVE_PROMPT
+                if negative_prompt is None
+                else negative_prompt
+            )[:2]
+            mx.eval(cond, neg)
+            num_frames, predicted = self.resolve_frames(
+                num_frames, cond[0], cond[1], fps, max_num_frames
+            )
+            if not keep_text:
+                self.unload_text()
+        with tm.span("load"):
+            dit = self.load_dit()
+            vae = self.load_vae()
+            upscaler = self.load_upscaler()
+            lora = self.load_distilled_lora()
+
+        height, width = sampling.snap_dimensions(height, width, two_stage=True)
+        f, h1, w1 = sampling.video_latent_shape(num_frames, height // 2, width // 2)
+        audio_t = sampling.audio_token_count(num_frames, fps)
+        apos = sampling.audio_positions(audio_t)
+        stepper = self._stepper(tm, on_step)
+        still = self._prepare_image(image)
+        cond1 = self._image_latent(still, h1, w1, tm)
+
+        with tm.span("stage1"):
+            video = sampling.noised_state(
+                (1, f * h1 * w1, 128),
+                sampling.video_positions(f, h1, w1, fps),
+                seed,
+                tokens_per_frame=h1 * w1,
+                bf16_noise=self.bf16_noise,
+            )
+            video = self._condition(video, cond1, image_strength)
+            audio = sampling.noised_state(
+                (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
+            )
+            guided = GuidedDenoiser(dit, cond, neg, video_guidance, audio_guidance)
+            lora.attach(dit, HQ_LORA_STAGE_1)
+            try:
+                v1, a1 = sampling.res2s_loop(
+                    guided,
+                    video,
+                    audio,
+                    # upstream hands the scheduler the stage-1 latent: the shift
+                    # follows its token count (the dev pipeline's does not)
+                    sampling.ltx2_schedule(steps, f * h1 * w1),
+                    noise_seed=seed + RES2S_NOISE_SEED_OFFSET,
+                    on_step=stepper("stage1"),
+                )
+                mx.eval(v1, a1)
+            finally:
+                lora.detach(dit)
+
+        with tm.span("upscale"):
+            up = vae.normalize(
+                upscaler(vae.denormalize(sampling.unpatchify(v1, (f, h1, w1))))
+            )
+            mx.eval(up)
+        h2, w2 = h1 * 2, w1 * 2
+        cond2 = self._image_latent(still, h2, w2, tm)
+
+        with tm.span("stage2"):
+            sigmas2 = list(sampling.STAGE_2_DISTILLED_SIGMAS)
+            s0 = sigmas2[0]
+            video = sampling.noised_state(
+                (1, f * h2 * w2, 128),
+                sampling.video_positions(f, h2, w2, fps),
+                seed + 2,
+                sigma=s0,
+                initial=sampling.patchify(up),
+                tokens_per_frame=h2 * w2,
+                bf16_noise=self.bf16_noise,
+            )
+            video = self._condition(video, cond2, image_strength)
+            audio = sampling.noised_state(
+                (1, audio_t, 128),
+                apos,
+                seed + 2,
+                sigma=s0,
+                initial=a1,
+                bf16_noise=self.bf16_noise,
+            )
+            lora.attach(dit, HQ_LORA_STAGE_2)
+            try:
+                v2, a2 = sampling.res2s_loop(
+                    Denoiser(dit, *cond),
+                    video,
+                    audio,
+                    sigmas2,
+                    noise_seed=seed + RES2S_NOISE_SEED_OFFSET + 1,
+                    on_step=stepper("stage2"),
+                )
+                mx.eval(v2, a2)
+            finally:
+                lora.detach(dit)
+
+        return Result(
+            sampling.unpatchify(v2, (f, h2, w2)),
+            a2,
             num_frames,
             height,
             width,

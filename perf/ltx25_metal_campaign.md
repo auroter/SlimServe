@@ -1218,3 +1218,37 @@ uses it. Not parity-checked against upstream's run_spatial_epilogue (its
 VideoDecoder/ImageConditioner/TiledDiffusionModel chain on the CPU is a day
 of its own); its pieces are: the layout (fixtures), the windows (the temporal
 round's code), the IC-LoRA stage (DFR stage 2), the decoders and encoder.
+
+## 27. The HQ pipeline: res_2s (2026-10-07)
+
+`ltx25-hq` = upstream's TI2VidTwoStagesHQPipeline (`pipeline.hq`, dev
+variant): LTX_2_3_HQ_PARAMS is a plain constant (no 2.5 override): 15 steps,
+CFG 3 / 7, STG off, modality 3, rescale 0.45 video / 1.0 audio; the dev
+transformer with the distilled LoRA at 0.25 in stage 1 and 0.5 in stage 2;
+the stage-1 schedule shifted by the stage-1 latent's token count (upstream
+hands the scheduler the latent here, unlike the dev pipeline); stage 2 the
+3 distilled sigmas with the audio re-noised to 0.909 and refined (it ships
+from stage 2). The guided step is the 3-pass batch (no STG term).
+
+**res_2s** (`sampling.res2s_loop`, from utils/res2s.py, samplers.py and
+Res2sDiffusionStep): per step h = -log(sigma_next / sigma); x0 at sigma; the
+midpoint x + h a21 (x0 - x) at sqrt(sigma sigma_next), SDE-noised from the
+substep stream at eta 0.5 (sigma_up = eta sigma_next, alpha_ratio = (1 -
+sigma_next) + sqrt(sigma_next^2 - sigma_up^2), the result blended on the
+mask); when h < 0.5 and sigma > 0.03 the anchor is refined 100 times
+(x_anchor = x_mid - h a21 eps_1, eps_1 = x0 - x_anchor); x0 at the midpoint;
+x_next = anchor + h (b1 eps_1 + b2 eps_2) with a21 = c2 phi_1(-h c2), b2 =
+phi_2(-h) / c2, b1 = phi_1(-h) - b2, c2 = 0.5; SDE noise from the step
+stream at eta; a terminal 0 becomes 0.0011 and the loop ends on that x0. The
+noise is standard normal standardized globally then per batch row. Parity
+(`n11_res2s_parity.py`: both loops around the same synthetic denoiser 0.5
+tanh(xW) + 0.3 x, upstream's draws replayed, upstream in float64): stage-1
+schedule video 3.1e-5 / audio 2.4e-4, stage 2 2.4e-5 / 1.7e-4 (fp32 against
+float64 through 15 x 2 evaluations and the 100-iteration refinement).
+Upstream's HQ pipeline never passes a noise seed to the loop (it runs at the
+loop's default); ours seeds both streams from the request seed.
+
+Smoke: 512x320x33 in 131 s (stage 1 88 s = 15 steps x 2 evaluations x 3
+passes, stage 2 18 s), a coherent clip. Profile `ltx25-hq` (the dev file set).
+Not yet measured at 1536x1024x121; expected around 2 x 15 / 30 of dev's
+stage 1 plus the LoRA's +22%: ~1400 s.

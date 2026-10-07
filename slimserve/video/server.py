@@ -145,9 +145,9 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         )
     params["decoder"] = decoder
     if "negative_prompt" in body:
-        if cfg["pipeline"] != "dev":
+        if cfg["pipeline"] not in ("dev", "hq"):
             raise BadRequest(
-                "negative_prompt applies to the dev pipeline only "
+                "negative_prompt applies to the dev and hq pipelines only "
                 "(the distilled flows have no CFG)"
             )
         params["negative_prompt"] = str(body["negative_prompt"])
@@ -260,7 +260,7 @@ class VideoService:
         pipeline = self.cfg["pipeline"]
         engine = LTX25Engine(
             root=self.cfg.get("root"),
-            variant="dev" if pipeline == "dev" else "distilled",
+            variant="dev" if pipeline in ("dev", "hq") else "distilled",
         )
         engine.load_text()
         engine.load_dit()
@@ -270,7 +270,7 @@ class VideoService:
         engine.load_duration()
         if self.cfg.get("decoder", "diffusion") == "diffusion":
             engine.load_diffvae()
-        if pipeline == "dev":
+        if pipeline in ("dev", "hq"):
             engine.load_distilled_lora()
         elif pipeline == "dfr":
             engine.load_detail_lora()

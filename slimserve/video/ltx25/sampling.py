@@ -745,3 +745,134 @@ def spatial_tiles(h: int, w: int, num_tiles: int, overlap: int) -> list[SpatialT
             mw = trapezoid_mask(w1 - w0, wl, wr)
             tiles.append(SpatialTile(h0, h1, w0, w1, mh[:, None] * mw[None, :]))
     return tiles
+
+
+# ---- res_2s (the HQ pipeline; upstream utils/res2s.py, samplers.py, ----------
+# ---- diffusion_steps.Res2sDiffusionStep) --------------------------------------
+RES2S_SUBSTEP_SEED_OFFSET = 10000
+RES2S_TERMINAL_SIGMA = 0.0011
+
+
+def _phi(j: int, z: float) -> float:
+    """phi_j(z) = (e^z - sum_{k<j} z^k / k!) / z^j, the exponential-integrator
+    functions; 1 / j! at z = 0."""
+    import math
+
+    if abs(z) < 1e-10:
+        return 1.0 / math.factorial(j)
+    remainder = sum(z**k / math.factorial(k) for k in range(j))
+    return (math.exp(z) - remainder) / (z**j)
+
+
+def res2s_coefficients(h: float, c2: float = 0.5) -> tuple[float, float, float]:
+    """(a21, b1, b2) for the two-stage exponential Runge-Kutta step of size h in
+    log-sigma: a21 = c2 phi_1(-h c2), b2 = phi_2(-h) / c2, b1 = phi_1(-h) - b2."""
+    a21 = c2 * _phi(1, -h * c2)
+    b2 = _phi(2, -h) / c2
+    return a21, _phi(1, -h) - b2, b2
+
+
+def _res2s_noise(shape: tuple[int, ...], key: mx.array) -> mx.array:
+    """upstream _get_new_noise: standard normal, standardized globally, then
+    per batch row over (tokens, channels)."""
+    n = mx.random.normal(shape, key=key)
+    n = (n - mx.mean(n)) / mx.std(n)
+    return (n - mx.mean(n, axis=(1, 2), keepdims=True)) / mx.std(
+        n, axis=(1, 2), keepdims=True
+    )
+
+
+def _res2s_inject(
+    state: LatentState,
+    sample: mx.array,
+    denoised: mx.array,
+    sigma: float,
+    sigma_next: float,
+    eta: float,
+    key: mx.array,
+) -> mx.array:
+    """Res2sDiffusionStep.step with sigma_up = eta sigma_next (legacy mode:
+    the result is blended with the clean latent on the denoise mask). The
+    noise is drawn whether or not it is used, as upstream does."""
+    noise = _res2s_noise(sample.shape, key)
+    sigma_up = min(sigma_next * eta, sigma_next * 0.9999)
+    if sigma_up == 0 or sigma_next == 0:
+        x = denoised
+    else:
+        residual = max(sigma_next**2 - sigma_up**2, 0.0) ** 0.5
+        alpha_ratio = (1.0 - sigma_next) + residual
+        sigma_down = residual / alpha_ratio
+        eps = (sample - denoised) / (sigma - sigma_next)
+        x = alpha_ratio * ((sample - sigma * eps) + sigma_down * eps) + sigma_up * noise
+    return blend(x, state)
+
+
+def res2s_loop(
+    denoise: Denoiser,
+    video: LatentState,
+    audio: LatentState,
+    sigmas: list[float],
+    noise_seed: int,
+    eta: float = 0.5,
+    bongmath: bool = True,
+    bongmath_max_iter: int = 100,
+    on_step: Callable[[int, float], None] | None = None,
+) -> tuple[mx.array, mx.array]:
+    """Upstream res2s_audio_video_denoising_loop: per step an x0 at sigma, a
+    midpoint at sqrt(sigma sigma_next) reached with a21 and SDE-noised from
+    the substep stream (eta 0.5), an anchor refinement when the step is small
+    (h < 0.5 and sigma > 0.03), an x0 at the midpoint, the RK combination
+    b1 / b2, SDE noise from the step stream (eta); a terminal 0 is replaced by
+    0.0011 and the loop ends with that x0. Two draws per modality per step
+    (video first), each stream from its own seed."""
+    import math
+
+    if sigmas[-1] == 0:
+        sigmas = [*sigmas[:-1], RES2S_TERMINAL_SIGMA, 0.0]
+        terminal = True
+    else:
+        terminal = False
+    n_steps = len(sigmas) - 2 if terminal else len(sigmas) - 1
+    hs = [-math.log(sigmas[i + 1] / sigmas[i]) for i in range(n_steps)]
+    vx, ax = video.latent, audio.latent
+    step_key = mx.random.key(noise_seed)
+    sub_key = mx.random.key(noise_seed + RES2S_SUBSTEP_SEED_OFFSET)
+
+    for i in range(n_steps):
+        s, s_next = sigmas[i], sigmas[i + 1]
+        h = hs[i]
+        a21, b1, b2 = res2s_coefficients(h)
+        sub = math.sqrt(s * s_next)
+        v0, a0 = denoise(video, audio, vx, ax, s)
+        v0, a0 = blend(v0, video), blend(a0, audio)
+        ev, ea = v0 - vx, a0 - ax
+        vm, am = vx + h * a21 * ev, ax + h * a21 * ea
+        sub_key, k1, k2 = mx.random.split(sub_key, 3)
+        vm = _res2s_inject(video, vx, vm, s, sub, 0.5, k1)
+        am = _res2s_inject(audio, ax, am, s, sub, 0.5, k2)
+        va, aa = vx, ax  # the anchors
+        if bongmath and h < 0.5 and s > 0.03:
+            for _ in range(bongmath_max_iter):
+                va = vm - h * a21 * ev
+                ev = v0 - va
+                aa = am - h * a21 * ea
+                ea = a0 - aa
+            mx.eval(va, ev, aa, ea)
+        v2, a2 = denoise(video, audio, vm, am, sub)
+        v2, a2 = blend(v2, video), blend(a2, audio)
+        vn = va + h * (b1 * ev + b2 * (v2 - va))
+        an = aa + h * (b1 * ea + b2 * (a2 - aa))
+        step_key, k1, k2 = mx.random.split(step_key, 3)
+        vn = _res2s_inject(video, va, vn, s, s_next, eta, k1)
+        an = _res2s_inject(audio, aa, an, s, s_next, eta, k2)
+        vx, ax = vn, an
+        mx.async_eval(vx, ax)
+        if on_step:
+            on_step(i, s)
+    if terminal:
+        v0, a0 = denoise(video, audio, vx, ax, sigmas[n_steps])
+        vx, ax = blend(v0, video), blend(a0, audio)
+        mx.async_eval(vx, ax)
+        if on_step:
+            on_step(n_steps, sigmas[n_steps])
+    return vx, ax
