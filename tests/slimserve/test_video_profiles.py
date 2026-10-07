@@ -241,10 +241,14 @@ def test_the_queue_is_bounded(tmp_path):
             return super().distilled(prompt, on_step=on_step, **params)
 
     service = _service(tmp_path, _Blocked())
-    accepted = [
-        service.submit({"prompt": "x"}) for _ in range(server.MAX_QUEUED + 1)
-    ]  # one running
-    time.sleep(0.05)
+    first = service.submit({"prompt": "x"})
+    deadline = time.time() + 5
+    while first.status != "in_progress" and time.time() < deadline:
+        time.sleep(0.01)  # the worker must hold it before the queue is filled
+    assert first.status == "in_progress"
+    accepted = [first] + [
+        service.submit({"prompt": "x"}) for _ in range(server.MAX_QUEUED)
+    ]
     with pytest.raises(OverflowError):
         for _ in range(3):
             service.submit({"prompt": "x"})
