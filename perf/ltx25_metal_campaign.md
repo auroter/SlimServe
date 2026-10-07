@@ -1092,3 +1092,19 @@ pass off keeps the footstep timing exactly (onsets 1.3 / 2.0 / 2.6 / 3.3 s in
 both) but mixes ~9 dB quieter; DFR audio is bit-identical (it comes from stage
 1). Prompt note for future renders: no close-up that pulls out from a face
 while the subject walks; one steady continuous shot.
+
+**Dev audio level (2026-10-06, after the review).** The fast stage-1 levers
+lower the audio level: relative to exact, modality pass off -1.6 dB, 20 steps
+-3.9 dB, step cache -3.5 dB, stack A (all three) -6.6 dB, stack C (20 steps +
+cache + conv, all four passes) -3.4 dB at 911.4 s (1.66x). Footstep onsets are
+at the same instants in every variant (1.3 / 2.0 / 2.6 / 3.3 s): the sync is
+intact, the mix is quieter. It is systematic (every lever that takes
+denoising work away from stage 1 moves it the same way), and in the dev
+pipeline the audio is frozen in stage 2, so it only ever gets stage 1's
+steps. Tried: re-noising the stage-1 audio to the stage-2 start sigma and
+refining it with the video for the 3 stage-2 steps (what distilled does):
+-3.2 dB, onsets perturbed (1.1 / 1.9 / 2.5 / 3.2). Measured negative, code
+removed. Dropping the modality pass is out of the profile. The remaining
+-3.4 dB of stack C is a decision for the user: ship it as a documented level
+difference, or keep dev's stage 1 whole (then dev-fast is the conv decoder
+alone, 1513 -> ~1444 s, not worth a profile).
