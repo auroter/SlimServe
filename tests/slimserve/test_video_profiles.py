@@ -48,9 +48,9 @@ def test_fast_profiles_are_the_exact_profiles_plus_a_fast_block():
         2,
         2,
     )
-    assert server.fast_settings(_plan("ltx25-dev-fast").engine).guidance == {
-        "modality": 1.0
-    }
+    dev = server.fast_settings(_plan("ltx25-dev-fast").engine)
+    assert dev.steps == 20 and dev.step_cache == 0.1
+    assert dev.guidance is None  # all four guidance passes stay (ledger section 24)
 
 
 def test_video_profiles_carry_no_chat_serving_defaults():
