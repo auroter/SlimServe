@@ -41,6 +41,15 @@ DELETE /v1/videos/<id>
 GET    /health, /v1/models
 ```
 
+`ltx25-dfr` takes two more options (upstream's `--temporal-upscalings` and
+`--spatial-upscalings`; CLI flags of the same names): `temporal_upscalings`
+1 or 2 doubles the frame rate per round (the canvas is x2 temporally
+upsampled and re-denoised in keyframe-seam windows; a 5 s clip at 24 fps
+ships at 48 or 96 fps) and `spatial_upscalings` 2 runs the first two stages
+at a quarter and half of the output size and adds the tiled full-resolution
+detailing epilogue (sizes must be multiples of 128; the way to a sharp
+2048x1024 from the same base as a 1024x512 clip).
+
 `"wait": true` holds the POST open until the clip is done. A request with
 neither `seconds` nor `num_frames` gets its length from the model's duration
 head (Lightricks' auto-duration: the clip the prompt implies, 1-20 s, snapped
@@ -236,8 +245,7 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
   indices, video-to-video reference conditioning); the I2V first-frame path
   is wired but its end-to-end output has not yet been compared against
   upstream on this machine.
-- DFR temporal rounds and the second spatial epilogue; the res_2s sampler (HQ
-  pipeline).
+- The res_2s sampler (HQ pipeline).
 - The prompt enhancer. With the 2.5 Gemma-4 encoder, upstream enhances only
   through a separate generative instruct Gemma (`--prompt-enhancer-gemma-root`,
   e.g. Gemma-4 E2B-it); the LTX fine-tuned 12B tower is not a generative

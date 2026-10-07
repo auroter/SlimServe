@@ -140,6 +140,36 @@ def test_request_outside_the_envelope_is_refused(body):
         server.normalize_request(body, CFG)
 
 
+def test_temporal_upscalings_is_a_dfr_option():
+    dfr = dict(CFG, pipeline="dfr")
+    assert "temporal_upscalings" not in server.normalize_request({"prompt": "x"}, dfr)
+    req = {"prompt": "x", "temporal_upscalings": 2}
+    assert server.normalize_request(req, dfr)["temporal_upscalings"] == 2
+    assert "temporal_upscalings" not in server.normalize_request(
+        {"prompt": "x", "temporal_upscalings": 0}, dfr
+    )
+    with pytest.raises(server.BadRequest):
+        server.normalize_request({"prompt": "x", "temporal_upscalings": 3}, dfr)
+    with pytest.raises(server.BadRequest):
+        server.normalize_request(req, CFG)  # distilled
+
+
+def test_spatial_upscalings_is_a_dfr_option_on_128_multiples():
+    dfr = dict(CFG, pipeline="dfr")
+    assert "spatial_upscalings" not in server.normalize_request({"prompt": "x"}, dfr)
+    assert "spatial_upscalings" not in server.normalize_request(
+        {"prompt": "x", "spatial_upscalings": 1}, dfr
+    )
+    req = {"prompt": "x", "spatial_upscalings": 2}
+    assert server.normalize_request(req, dfr)["spatial_upscalings"] == 2
+    with pytest.raises(server.BadRequest):
+        server.normalize_request(dict(req, size="1472x1024"), dfr)
+    with pytest.raises(server.BadRequest):
+        server.normalize_request({"prompt": "x", "spatial_upscalings": 3}, dfr)
+    with pytest.raises(server.BadRequest):
+        server.normalize_request(req, CFG)
+
+
 def test_decoder_defaults_to_diffusion_and_accepts_conv():
     assert server.normalize_request({"prompt": "x"}, CFG)["decoder"] == "diffusion"
     req = {"prompt": "x", "decoder": "conv"}

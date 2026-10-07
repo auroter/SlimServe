@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 
 from slimserve.video.ltx25 import checkpoints, sampling
 from slimserve.video.ltx25.dit import (
@@ -281,6 +282,79 @@ class GuidedDenoiser:
         )
 
 
+class TiledDenoiser:
+    """Upstream TiledDiffusionModel for the DFR spatial epilogue: one x0 per
+    spatial tile of the window (every frame, the tile's cells widened by the
+    overlap), blended back with separable trapezoid weights; a conditioning
+    token rides in every tile its cell extent overlaps and is averaged over
+    them. `extents` holds each token's [y0, y1) x [x0, x1) in target cells
+    (generated and keyframe tokens: their cell; reference tokens: their cell
+    times the downscale). Positions are shifted so the tile's generated
+    tokens start at 0 in height and width, as upstream normalizes them."""
+
+    def __init__(
+        self,
+        inner: Denoiser,
+        f: int,
+        h: int,
+        w: int,
+        extents: np.ndarray,
+        tiles: list[sampling.SpatialTile],
+    ):
+        self.inner, self.f, self.h, self.w = inner, f, h, w
+        self.n_gen = f * h * w
+        self.extents = extents  # (N, 4): y0, y1, x0, x1
+        self.tiles = tiles
+        n = extents.shape[0]
+        keep = np.zeros((len(tiles), n), dtype=bool)
+        for i, t in enumerate(tiles):
+            keep[i] = (
+                (extents[:, 0] < t.h1)
+                & (extents[:, 1] > t.h0)
+                & (extents[:, 2] < t.w1)
+                & (extents[:, 3] > t.w0)
+            )
+        count = keep.sum(axis=0).astype(np.float32)
+        self.plans = []
+        for i, t in enumerate(tiles):
+            idx = np.nonzero(keep[i])[0]
+            weight = np.empty(len(idx), dtype=np.float32)
+            gen = idx < self.n_gen
+            yy = (idx[gen] // w) % h
+            xx = idx[gen] % w
+            weight[gen] = t.weights[yy - t.h0, xx - t.w0]
+            weight[~gen] = 1.0 / count[idx[~gen]]
+            self.plans.append(
+                (mx.array(idx.astype(np.int32)), mx.array(weight)[None, :, None], t)
+            )
+
+    def __call__(self, video, audio, vx, ax, sigma, step_cache=None):
+        n = vx.shape[1]
+        out_v = mx.zeros_like(vx)
+        out_a = None
+        for idx, weight, t in self.plans:
+
+            def take(z, idx=idx):
+                return None if z is None else mx.take(z, idx, axis=1)
+
+            pos = take(video.positions) - mx.array([0.0, t.h0 * 32.0, t.w0 * 32.0])
+            sub = sampling.LatentState(
+                latent=take(video.latent),
+                clean=take(video.clean),
+                denoise_mask=take(video.denoise_mask),
+                positions=pos,
+                keyframes_mask=take(video.keyframes_mask),
+                frozen=video.frozen,
+            )
+            v0, a0 = self.inner(sub, audio, take(vx), ax, sigma)
+            out_v = out_v + mx.zeros((1, n, vx.shape[2]), dtype=vx.dtype).at[
+                :, idx
+            ].add(v0 * weight)
+            out_a = a0 if out_a is None else out_a + a0
+            mx.eval(out_v)
+        return out_v, out_a / len(self.plans)
+
+
 @dataclass(frozen=True)
 class Fast:
     """The fast tier: output-changing settings a profile may stack on a
@@ -366,6 +440,7 @@ class LTX25Engine:
         self.detail_lora = None
         self.diffvae = None
         self.duration = None
+        self.temporal_upscaler = None
         self.decoder = decoder
 
     # ---- components -------------------------------------------------------
@@ -658,16 +733,27 @@ class LTX25Engine:
         image_strength: float = 1.0,
         fast: Fast | None = None,
         max_num_frames: int | None = None,
+        temporal_upscalings: int = 0,
+        spatial_upscalings: int = 1,
     ) -> Result:
         """Lightricks' DFRPipeline, default configuration: the distilled flow
         with one generated keyframe slot per 24/32-frame segment in stage 1,
         then a stage 2 that runs under the detailing IC-LoRA with the upscaled
         slots and the half-resolution stage-1 latent as reference tokens.
         `image` conditions the first frame in both stages (see `distilled`).
-        Temporal rounds and the second spatial epilogue are not implemented.
-        `fast` stacks the fast tier (see `Fast`)."""
+        `temporal_upscalings` (0-2): each round doubles the frame rate with the
+        temporal upscaler and re-denoises the canvas in keyframe-seam windows
+        (see `_temporal_round`); the clip ships at fps * 2**rounds.
+        `spatial_upscalings` 2 runs stage 1 at a quarter and stage 2 at half of
+        the output size and adds the tiled full-resolution detailing epilogue
+        (see `_spatial_epilogue`); sizes must then be multiples of 128. `fast`
+        stacks the fast tier (see `Fast`)."""
         if self.variant != "distilled":
             raise ValueError("the DFR pipeline runs on the distilled transformer")
+        if temporal_upscalings not in (0, 1, 2):
+            raise ValueError("temporal_upscalings must be 0, 1 or 2")
+        if spatial_upscalings not in (1, 2):
+            raise ValueError("spatial_upscalings must be 1 or 2")
         fast = fast or Fast()
         tm = Timings()
         if text_embeds is None:
@@ -689,10 +775,12 @@ class LTX25Engine:
         denoise = Denoiser(dit, video_text, audio_text)
         stepper = self._stepper(tm, on_step)
 
-        height, width = sampling.snap_dimensions(height, width, two_stage=True)
+        div = 2**spatial_upscalings
+        m = 32 * div
+        height, width = max(m, height // m * m), max(m, width // m * m)
         canvas, _segment, slot_frames = sampling.dfr_canvas(num_frames)
         cfps = sampling.conditioning_fps(fps)
-        f, h1, w1 = sampling.video_latent_shape(canvas, height // 2, width // 2)
+        f, h1, w1 = sampling.video_latent_shape(canvas, height // div, width // div)
         audio_t = sampling.audio_token_count(canvas, fps)
         apos = sampling.audio_positions(audio_t)
         k = len(slot_frames)
@@ -786,27 +874,469 @@ class LTX25Engine:
             finally:
                 lora.detach(dit)
 
-        keep = (num_frames - 1) // 8 + 1  # trim the canvas padding back off
-        latent = sampling.unpatchify(v2[:, : f * h2 * w2], (f, h2, w2))[:, :, :keep]
+        canvas_latent = sampling.unpatchify(v2[:, : f * h2 * w2], (f, h2, w2))
+        slot_planes = sampling.slots_to_latent(v2, slots2, k, h2, w2)
+        plane_at = {
+            fr: slot_planes[:, :, i : i + 1] for i, fr in enumerate(slot_frames)
+        }
+        canvas_frames, playback_fps = canvas, fps
+        source_duration = canvas / fps
+        for round_idx in range(1, temporal_upscalings + 1):
+            canvas_frames = 2 * (canvas_frames - 1) + 1
+            playback_fps *= 2.0
+            with tm.span(f"temporal{round_idx}"):
+                canvas_latent, plane_at = self._temporal_round(
+                    round_idx,
+                    Denoiser(dit, video_text, audio_text),  # plain stage, no LoRA
+                    vae,
+                    canvas_latent,
+                    plane_at,
+                    canvas_frames,
+                    playback_fps,
+                    h2,
+                    w2,
+                    a1,
+                    source_duration,
+                    seed,
+                    still,
+                    image_strength,
+                    tm,
+                    stepper(f"temporal{round_idx}"),
+                )
+        if spatial_upscalings == 2:
+            with tm.span("epilogue"):
+                canvas_latent, plane_at = self._spatial_epilogue(
+                    dit,
+                    lora,
+                    vae,
+                    video_text,
+                    audio_text,
+                    canvas_latent,
+                    plane_at,
+                    canvas_frames,
+                    playback_fps,
+                    temporal_upscalings,
+                    a1,
+                    source_duration,
+                    seed,
+                    still,
+                    image_strength,
+                    detail_strength,
+                    tm,
+                    stepper("epilogue"),
+                )
+        # trim the canvas padding back off: (requested - 1) * 2**rounds + 1 frames
+        num_frames = (num_frames - 1) * 2**temporal_upscalings + 1
+        keep = (num_frames - 1) // 8 + 1
+        latent = canvas_latent[:, :, :keep]
         # the denoised slots anchor the decode (upstream DFR always keyframe-
         # decodes); slots past the trimmed clip are dropped
-        planes = sampling.slots_to_latent(v2, slots2, k, h2, w2)
-        kept = [i for i, fr in enumerate(slot_frames) if fr < num_frames]
+        kept = sorted(fr for fr in plane_at if fr < num_frames)
         keyframes = None
         if kept:
-            keyframes = (planes[:, :, mx.array(kept)], [slot_frames[i] for i in kept])
+            keyframes = (
+                mx.concatenate([plane_at[fr] for fr in kept], axis=2),
+                kept,
+            )
             mx.eval(keyframes[0])
         return Result(
             latent,
-            a1[:, : sampling.audio_token_count(num_frames, fps)],
+            a1[:, : sampling.audio_token_count(num_frames, playback_fps)],
             num_frames,
             height,
             width,
-            fps,
+            playback_fps,
             tm,
             keyframes=keyframes,
             predicted_seconds=predicted,
         )
+
+    def load_temporal_upscaler(self):
+        if self.temporal_upscaler is None:
+            from slimserve.video.ltx25.upscaler import LatentUpscaler
+
+            self.temporal_upscaler = LatentUpscaler("temporal", self.root)
+            self.temporal_upscaler.load()
+        return self.temporal_upscaler
+
+    def _temporal_round(
+        self,
+        round_idx: int,
+        denoise: Denoiser,
+        vae,
+        canvas_latent: mx.array,
+        plane_at: dict[int, mx.array],
+        canvas_frames: int,
+        playback_fps: float,
+        h: int,
+        w: int,
+        audio_tokens: mx.array,
+        source_duration: float,
+        seed: int,
+        still,
+        image_strength: float,
+        tm: Timings,
+        on_step,
+    ) -> tuple[mx.array, dict[int, mx.array]]:
+        """Upstream run_one_temporal_round: x2 temporal upsample of the canvas
+        (the keyframe planes move to 2x their pixel frames), then 2**round
+        windows cut on the keyframe seams, each re-denoised from sigma 0.975
+        (DISTILLED_SIGMAS[4:], ancestral, eta 0.5) as its own clip: the window's
+        seams are pinned as near-clean anchor keyframes (strength 0.95), each
+        segment midpoint gets a generated slot seeded from the nearest cell, a
+        non-first window starts on the last plane before its seam with the
+        previous window's cells up to the seam held fixed (the lead-in), and
+        its stage-1 audio window rides along frozen. Owned cells are stitched;
+        new slot planes join the carry bag for the next round and the decode."""
+        up = vae.normalize(
+            self.load_temporal_upscaler()(vae.denormalize(canvas_latent))
+        )
+        mx.eval(up)
+        plane_at = {2 * p: plane for p, plane in plane_at.items()}
+        seams = sorted(plane_at)
+        tiles = sampling.temporal_tile_plan(seams, canvas_frames, 2**round_idx)
+        cond_fps = sampling.conditioning_fps(playback_fps)
+        sigmas = sampling.DISTILLED_SIGMAS[4:]
+        s0 = sigmas[0]
+        cond_image = self._image_latent(still, h, w, tm) if still is not None else None
+        owned: list[mx.array] = []
+        previous: tuple[int, mx.array] | None = None
+        for tile_index, tile in enumerate(tiles):
+            prefix = None
+            if tile_index > 0:
+                prefix = sampling.tile_prefix((tile.start - 1) * 8, plane_at)
+            if prefix is None:
+                tile_latent = up[:, :, tile.start : tile.end]
+                pixel_start, pinned = 0, 0
+            else:
+                tile_latent = mx.concatenate(
+                    [
+                        plane_at[prefix.keyframe_position],
+                        up[:, :, prefix.video_start_cell : tile.end],
+                    ],
+                    axis=2,
+                )
+                pixel_start, pinned = prefix.keyframe_position, prefix.cells
+            ft = tile_latent.shape[2]
+            local_frames = (ft - 1) * 8 + 1
+            tile_seed = seed + 1000 * round_idx + tile_index
+            video = sampling.noised_state(
+                (1, ft * h * w, 128),
+                sampling.video_positions(ft, h, w, cond_fps),
+                tile_seed,
+                sigma=s0,
+                initial=sampling.patchify(tile_latent),
+                tokens_per_frame=h * w,
+                bf16_noise=self.bf16_noise,
+            )
+            # a still at the clip's first frame sits in the first window only
+            if cond_image is not None and tile_index == 0:
+                video = self._condition(video, cond_image, image_strength)
+            resume = prefix.resume_pixel if prefix else 0
+            anchors = [p for p in tile.anchors if p >= resume]
+            if anchors:
+                video = sampling.append_anchor_keyframes(
+                    video,
+                    mx.concatenate([plane_at[p] for p in anchors], axis=2),
+                    [p - pixel_start for p in anchors],
+                    h,
+                    w,
+                    cond_fps,
+                    s0,
+                    tile_seed,
+                )
+            slots = None
+            if tile.slots:
+                local = [p - pixel_start for p in tile.slots]
+                initial = mx.concatenate(
+                    [
+                        tile_latent[:, :, min(max(round(p / 8), 0), ft - 1)][:, :, None]
+                        for p in local
+                    ],
+                    axis=2,
+                )
+                video, slots = sampling.append_slots(
+                    video, local, h, w, cond_fps, initial, s0, tile_seed
+                )
+            if prefix is not None and previous is not None:
+                base_cell, prev_latent = previous
+                cells = prefix.cells - 1
+                offset = prefix.video_start_cell - base_cell
+                carried = mx.concatenate(
+                    [
+                        plane_at[prefix.keyframe_position],
+                        prev_latent[:, :, offset : offset + cells],
+                    ],
+                    axis=2,
+                )
+                video = sampling.condition_latent_frame(video, carried, 1.0, 0)
+            mx.eval(video.latent, video.clean, video.denoise_mask)
+            audio_t = sampling.audio_token_count(local_frames, cond_fps)
+            a = sampling.audio_tokens_for_tile(
+                audio_tokens,
+                pixel_start,
+                local_frames,
+                playback_fps,
+                source_duration,
+                cond_fps,
+            )
+            audio = sampling.LatentState(
+                latent=a,
+                clean=a,
+                denoise_mask=mx.zeros((1, audio_t, 1), dtype=G),
+                positions=sampling.audio_positions(audio_t),
+                frozen=True,
+            )
+            vt, _ = sampling.euler_ancestral_loop(
+                denoise,
+                video,
+                audio,
+                sigmas,
+                noise_seed=tile_seed,
+                eta=sampling.TEMPORAL_ANCESTRAL_ETA,
+                on_step=on_step,
+            )
+            tile_out = sampling.unpatchify(vt[:, : ft * h * w], (ft, h, w))
+            mx.eval(tile_out)
+            owned.append(tile_out[:, :, pinned:])
+            previous = (prefix.video_start_cell - 1 if prefix else tile.start, tile_out)
+            if slots is not None:
+                planes = sampling.slots_to_latent(vt, slots, len(tile.slots), h, w)
+                for i, p in enumerate(tile.slots):
+                    plane_at.setdefault(p, planes[:, :, i : i + 1])
+        stitched = mx.concatenate(owned, axis=2)
+        if stitched.shape[2] != (canvas_frames - 1) // 8 + 1:
+            raise RuntimeError("temporal round stitched the wrong number of cells")
+        mx.eval(stitched)
+        return stitched, dict(sorted(plane_at.items()))
+
+    def _rebuild_keyframes(
+        self, planes: dict[int, mx.array], seed: int
+    ) -> dict[int, mx.array]:
+        """Upstream _rebuild_epilogue_keyframes: decode each carry plane as its
+        own one-frame clip, Lanczos x2 in RGB, encode back as a one-frame
+        latent at the epilogue's resolution."""
+        from PIL import Image
+
+        decoder = self.load_diffvae()
+        vae = self.load_vae()
+        out = {}
+        for i, (pos, plane) in enumerate(planes.items()):
+            px = decoder.decode_raw(
+                plane, seed=seed + sampling.EPILOGUE_KEYFRAME_DECODE_SEED_OFFSET + i
+            )
+            rgb = np.array(
+                mx.clip((px[0, :, 0] + 1.0) * 0.5, 0.0, 1.0).transpose(1, 2, 0)
+            )
+            img = Image.fromarray(np.round(rgb * 255.0).astype(np.uint8), mode="RGB")
+            img = img.resize(
+                (img.width * 2, img.height * 2), resample=Image.Resampling.LANCZOS
+            )
+            big = np.asarray(img, dtype=np.float32) / 255.0 * 2.0 - 1.0
+            pixels = mx.array(big).transpose(2, 0, 1)[None, :, None]  # (1, 3, 1, H, W)
+            out[pos] = vae.encode(pixels)
+            mx.eval(out[pos])
+            del px
+        return out
+
+    def _spatial_epilogue(
+        self,
+        dit: LTX25DiT,
+        lora,
+        vae,
+        video_text: mx.array,
+        audio_text: mx.array,
+        canvas_latent: mx.array,
+        plane_at: dict[int, mx.array],
+        canvas_frames: int,
+        playback_fps: float,
+        temporal_upscalings: int,
+        audio_tokens: mx.array,
+        source_duration: float,
+        seed: int,
+        still,
+        image_strength: float,
+        detail_strength: float,
+        tm: Timings,
+        on_step,
+    ) -> tuple[mx.array, dict[int, mx.array]]:
+        """Upstream run_spatial_epilogue (spatial_upscalings 2): the stage-2
+        canvas is x2 spatially upsampled and re-detailed at the output size
+        under the detailing IC-LoRA with the stage-2 latent as reference tokens,
+        in keyframe-seam temporal windows (one window without temporal rounds;
+        upstream's plan cannot express that and fails), each window first one
+        Euler step from sigma 0.909 on 2x2 spatial tiles then the remaining
+        steps on 4x4 tiles (overlap 10 cells, trapezoid blend), its carry
+        keyframes pinned clean (decoded, Lanczos x2, re-encoded), a generated
+        opening plane pinned at frame 0 when no still is given, a non-first
+        window starting on the plane before its seam with the lead-in pinned.
+        Returns the full-resolution canvas latent and the rebuilt planes."""
+        _, _, t_cells, h2, w2 = canvas_latent.shape
+        h, w = 2 * h2, 2 * w2
+        to_decode = dict(plane_at)
+        if still is None:
+            to_decode[-1] = canvas_latent[:, :, :1]
+        encoded = self._rebuild_keyframes(to_decode, seed)
+        opening = encoded.pop(-1, None)
+        guide = canvas_latent
+        up = vae.normalize(self.load_upscaler()(vae.denormalize(guide)))
+        mx.eval(up)
+        if temporal_upscalings == 0:
+            windows = [sampling.TemporalTile(0, t_cells, 0, (t_cells - 1) * 8, (), ())]
+        else:
+            windows = sampling.temporal_tile_plan(
+                sorted(plane_at), canvas_frames, 2**temporal_upscalings
+            )
+        cond_fps = sampling.conditioning_fps(playback_fps)
+        sigmas = sampling.STAGE_2_DISTILLED_SIGMAS
+        phases = [(sigmas[:2], sigmas[0], sampling.EPILOGUE_SPATIAL_COARSE_TILES)]
+        if len(sigmas) > 2:
+            phases.append((sigmas[1:], 0.0, sampling.EPILOGUE_SPATIAL_TILES))
+        cond_image = self._image_latent(still, h, w, tm) if still is not None else None
+        downscale = lora.reference_downscale
+        stitched: list[mx.array] = []
+        previous: tuple[int, mx.array] | None = None
+        lora.attach(dit, detail_strength)
+        try:
+            for index, win in enumerate(windows):
+                prefix = None
+                if index > 0:
+                    prefix = sampling.tile_prefix((win.start - 1) * 8, encoded)
+                if prefix is None:
+                    latent_in = up[:, :, win.start : win.end]
+                    ref = guide[:, :, win.start : win.end]
+                    origin, resume, pinned = win.pixel_start, 0, 0
+                else:
+                    latent_in = mx.concatenate(
+                        [
+                            encoded[prefix.keyframe_position],
+                            up[:, :, prefix.video_start_cell : win.end],
+                        ],
+                        axis=2,
+                    )
+                    ref = guide[:, :, prefix.video_start_cell - 1 : win.end]
+                    origin, resume, pinned = (
+                        prefix.keyframe_position,
+                        prefix.resume_pixel,
+                        prefix.cells,
+                    )
+                ft = latent_in.shape[2]
+                local_frames = (ft - 1) * 8 + 1
+                audio_t = sampling.audio_token_count(local_frames, cond_fps)
+                a = sampling.audio_tokens_for_tile(
+                    audio_tokens,
+                    origin,
+                    local_frames,
+                    playback_fps,
+                    source_duration,
+                    cond_fps,
+                )
+                audio = sampling.LatentState(
+                    latent=a,
+                    clean=a,
+                    denoise_mask=mx.zeros((1, audio_t, 1), dtype=G),
+                    positions=sampling.audio_positions(audio_t),
+                    frozen=True,
+                )
+                window_seed = seed + 100 * index
+                anchors = [
+                    (pos - origin, plane)
+                    for pos, plane in encoded.items()
+                    if origin <= pos <= win.pixel_end and pos >= resume
+                ]
+                if opening is not None and prefix is None:
+                    anchors.append((0, opening))
+                latent = latent_in
+                for phase_sigmas, noise_scale, n_tiles in phases:
+                    video = sampling.noised_state(
+                        (1, ft * h * w, 128),
+                        sampling.video_positions(ft, h, w, cond_fps),
+                        window_seed + sampling.EPILOGUE_NOISE_SEED_OFFSET,
+                        sigma=noise_scale,
+                        initial=sampling.patchify(latent),
+                        tokens_per_frame=h * w,
+                        bf16_noise=self.bf16_noise,
+                    )
+                    yy, xx = np.divmod(np.arange(ft * h * w) % (h * w), w)
+                    extents = [
+                        np.stack([yy, yy + 1, xx, xx + 1], axis=1).astype(np.float32)
+                    ]
+                    if cond_image is not None and index == 0:
+                        video = self._condition(video, cond_image, image_strength)
+                    for local, plane in anchors:
+                        video = sampling.append_anchor_keyframes(
+                            video,
+                            plane,
+                            [local],
+                            h,
+                            w,
+                            cond_fps,
+                            noise_scale,
+                            window_seed,
+                            strength=sampling.EPILOGUE_KEYFRAME_STRENGTH,
+                        )
+                        extents.append(extents[0][: h * w])
+                    video = sampling.append_reference(
+                        video,
+                        sampling.patchify(ref),
+                        sampling.video_positions(ft, h2, w2, cond_fps),
+                        downscale,
+                    )
+                    ry, rx = np.divmod(np.arange(ft * h2 * w2) % (h2 * w2), w2)
+                    extents.append(
+                        np.stack(
+                            [
+                                ry * downscale,
+                                (ry + 1) * downscale,
+                                rx * downscale,
+                                (rx + 1) * downscale,
+                            ],
+                            axis=1,
+                        ).astype(np.float32)
+                    )
+                    if prefix is not None and previous is not None:
+                        base_cell, prev_latent = previous
+                        cells = prefix.cells - 1
+                        offset = prefix.video_start_cell - base_cell
+                        carried = mx.concatenate(
+                            [
+                                encoded[prefix.keyframe_position],
+                                prev_latent[:, :, offset : offset + cells],
+                            ],
+                            axis=2,
+                        )
+                        video = sampling.condition_latent_frame(video, carried, 1.0, 0)
+                    mx.eval(video.latent, video.clean, video.denoise_mask)
+                    tiles = sampling.spatial_tiles(
+                        h, w, n_tiles, sampling.EPILOGUE_SPATIAL_OVERLAP
+                    )
+                    den = TiledDenoiser(
+                        Denoiser(dit, video_text, audio_text),
+                        ft,
+                        h,
+                        w,
+                        np.concatenate(extents, axis=0),
+                        tiles,
+                    )
+                    vt, _ = sampling.euler_loop(
+                        den, video, audio, phase_sigmas, on_step=on_step
+                    )
+                    latent = sampling.unpatchify(vt[:, : ft * h * w], (ft, h, w))
+                    mx.eval(latent)
+                previous = (
+                    prefix.video_start_cell - 1 if prefix else win.start,
+                    latent,
+                )
+                stitched.append(latent[:, :, pinned:])
+        finally:
+            lora.detach(dit)
+        out = mx.concatenate(stitched, axis=2)
+        if out.shape[2] != t_cells:
+            raise RuntimeError(
+                "the spatial epilogue stitched the wrong number of cells"
+            )
+        mx.eval(out)
+        return out, encoded
 
     # ---- dev --------------------------------------------------------------
     def load_distilled_lora(self):

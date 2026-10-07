@@ -1150,3 +1150,71 @@ own code refuses `enhance_prompt` with a Gemma-4 encode root unless
 second small model to port; not started without the user's go-ahead. The
 cached-generation code is parked in `~/.local/scratch/ltx25/n11/
 text_generate_wip.patch`.
+
+## 26. DFR temporal rounds and the second spatial epilogue (2026-10-06/07)
+
+Both DFR options that the HANDOFF listed and section 23 had written off are
+in: `temporal_upscalings` (0-2) and `spatial_upscalings` (1-2), API and CLI,
+`pipeline.dfr` -> `_temporal_round` / `_spatial_epilogue`, ported from
+`ltx_pipelines/dfr_stages.py`, `dfr_helpers/{layout,ops}.py` and
+`ltx_core/tiling.py`.
+
+**Temporal round.** The stage-2 canvas is x2 temporally upsampled (the planes
+move to 2x their pixel frames), the canvas is cut on its keyframe seams into
+2**round windows (largest-first, remainder to the leading ones), and each
+window is re-denoised from sigma 0.975 (DISTILLED_SIGMAS[4:], ancestral, eta
+0.5, noise seed seed + 1000 round + tile) as its own clip: its seams pinned as
+0.95-strength anchor keyframes (appended unmarked tokens), one generated slot
+per segment midpoint seeded from the nearest cell, a non-first window starting
+on the last plane before its seam with the previous window's cells to the
+seam held fixed (the lead-in, strength 1 at index 0), the stage-1 audio window
+resampled to the window's token count and frozen. Owned cells (after the
+pinned prefix) are stitched; new planes join the carry bag. Layout
+(`sampling.temporal_tile_plan`, `tile_prefix`, `split_at_seams`) matches
+upstream's for 10 canvases x round counts and 3 prefixes
+(`tests/slimserve/data/ltx25_temporal_layout.json`, captured from
+ltx_pipelines).
+
+Parity (`n11_temporal_round_parity.py`; upstream's run_one_temporal_round on
+the CPU through ltx_pipelines with OpenImageIO stubbed, the transformer built
+in fp32 by ltx_core's builder and the sampler's latent updates pinned to fp32;
+ours with fp32 operands and upstream's noise replayed draw by draw): on a real
+stage-2 canvas (our DFR at 256x256x49, two planes, real audio and text) one
+round (97 frames, two windows, two anchors, two new slots) ends at rel-L2
+**1.2e-3** on the latent and 1.1e-3 on the carry planes. On random tensors
+the per-step capture showed every window's first step exact (inputs 6e-7, x0
+6e-5 / 2e-4) and the forward amplifying input error ~10x per step at low
+sigma - the model, not the port. Two defects found and fixed on the way:
+`condition_latent_frame` re-blended every token with its own mask (a no-op at
+masks 0/1, so nothing shipped changes; wrong for the 0.95 anchors once the
+lead-in pinned them), and the reference harness's own dtype plumbing (the
+stage builds bf16 and disposes per window; the loop defaults to bf16
+updates).
+
+Timings: 512x320x49 round 1 25.7 s (97 frames at 48 fps), round 2 +54 s (193
+at 96); no motion spikes at the seams (frame-to-frame change flat).
+
+**Spatial epilogue** (`spatial_upscalings` 2; sizes multiples of 128): stage 1
+at a quarter, stage 2 at half, then at the output size: the carry planes and
+(without a still) the opening cell decoded one at a time with the diffusion
+decoder, Lanczos x2 in RGB, re-encoded as one-frame planes; the stage-2 latent
+x2 spatially upsampled; keyframe-seam windows (one window without temporal
+rounds - upstream's plan fails on an empty seam list there) each denoised
+under the detailing IC-LoRA with the stage-2 cells as reference tokens, the
+planes pinned at strength 1, the lead-in pinned, frozen resampled audio: one
+plain Euler step from sigma 0.909 on 2x2 spatial tiles (10-cell overlap,
+trapezoid blend, a conditioning token in every tile its extent overlaps,
+averaged), then the remaining steps on 4x4 tiles (`TiledDenoiser`; tile
+layout and masks match upstream's `split_by_count` / trapezoids,
+`ltx25_spatial_tiles.json`; 4x4 triple-covers a few cells to 1.08 as upstream
+does, nothing renormalizes). The rebuilt planes drive the keyframe decode.
+
+Result: 2048x1024x49 from the same base as a 1024x512 DFR clip (identical
+stages 1-2, same seed): the same shot, visibly sharper fur, snow and branches,
+no tile seams (`n11/epilogue_ab2_crop.png`); 516 s (epilogue 375, decode 68).
+At 1024x512 the x2 path puts stage 1 at 256x128 and is softer than plain DFR:
+the option is for output sizes above the two-stage envelope, as upstream
+uses it. Not parity-checked against upstream's run_spatial_epilogue (its
+VideoDecoder/ImageConditioner/TiledDiffusionModel chain on the CPU is a day
+of its own); its pieces are: the layout (fixtures), the windows (the temporal
+round's code), the IC-LoRA stage (DFR stage 2), the decoders and encoder.

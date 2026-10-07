@@ -84,6 +84,19 @@ def _parser() -> argparse.ArgumentParser:
     video.add_argument("--seed", type=int, help="random seed (default 42)")
     video.add_argument("--negative-prompt", help="dev pipeline only")
     video.add_argument(
+        "--temporal-upscalings",
+        type=int,
+        choices=(0, 1, 2),
+        help="DFR only: x2 frame-rate rounds (each re-denoises the clip at 2x fps)",
+    )
+    video.add_argument(
+        "--spatial-upscalings",
+        type=int,
+        choices=(1, 2),
+        help="DFR only: 2 = stage 1 at a quarter, stage 2 at half, then the tiled "
+        "full-resolution detailing epilogue (sizes multiples of 128)",
+    )
+    video.add_argument(
         "--image",
         help="image-to-video: a still that becomes the first frame",
     )

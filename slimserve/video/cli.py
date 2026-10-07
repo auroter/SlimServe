@@ -41,7 +41,15 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     from slimserve.video.ltx25.pipeline import LTX25Engine
 
     body = {"prompt": args.prompt}
-    for key in ("size", "seconds", "seed", "negative_prompt", "decoder"):
+    for key in (
+        "size",
+        "seconds",
+        "seed",
+        "negative_prompt",
+        "decoder",
+        "temporal_upscalings",
+        "spatial_upscalings",
+    ):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
     if getattr(args, "image", None):

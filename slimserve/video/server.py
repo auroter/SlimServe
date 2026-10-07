@@ -151,6 +151,26 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
                 "(the distilled flows have no CFG)"
             )
         params["negative_prompt"] = str(body["negative_prompt"])
+    if "temporal_upscalings" in body:
+        if cfg["pipeline"] != "dfr":
+            raise BadRequest("temporal_upscalings applies to the DFR pipeline only")
+        rounds = body["temporal_upscalings"]
+        if rounds not in (0, 1, 2):
+            raise BadRequest("temporal_upscalings must be 0, 1 or 2")
+        if rounds:
+            params["temporal_upscalings"] = int(rounds)
+    if "spatial_upscalings" in body:
+        if cfg["pipeline"] != "dfr":
+            raise BadRequest("spatial_upscalings applies to the DFR pipeline only")
+        stages = body["spatial_upscalings"]
+        if stages not in (1, 2):
+            raise BadRequest("spatial_upscalings must be 1 or 2")
+        if stages == 2:
+            if width % 128 or height % 128:
+                raise BadRequest(
+                    "spatial_upscalings 2 needs width and height as multiples of 128"
+                )
+            params["spatial_upscalings"] = 2
     if body.get("image") is not None:
         params["image"] = decode_image_field(body["image"])
         strength = body.get("image_strength", 1.0)
@@ -254,6 +274,7 @@ class VideoService:
             engine.load_distilled_lora()
         elif pipeline == "dfr":
             engine.load_detail_lora()
+            engine.load_temporal_upscaler()
         return engine
 
     # ---- worker (the only thread that touches the engine) -----------------
