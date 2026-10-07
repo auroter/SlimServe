@@ -3876,7 +3876,7 @@
       "title": "LTX-2.5 dev (two-stage, guided), fast tier, on Apple Silicon",
       "source": "ltx25",
       "gpus": 1,
-      "summary": "The dev pipeline with the fast tier: 20 guided steps instead of 30, three guidance passes (CFG + STG; the modality pass off), the first-block step cache at 0.10, a 2-step stage 2, conv decoder. 1536x1024x121 in 644 s against 1513 s exact (2.35x) on an M1 Ultra. Same engine as ltx25-dev; the clip keeps the shot and its quality at sheet scale (21-23 dB from the exact pipeline). Measured in perf/ltx25_metal_campaign.md section 24.",
+      "summary": "The dev pipeline with the fast tier: 20 guided steps instead of 30, three guidance passes (CFG + STG; the modality pass off), the first-block step cache at 0.10, conv decoder. 1536x1024x121 in 730 s against 1513 s exact (2.07x) on an M1 Ultra. Dev is the profile that adheres to the prompt; its fast tier keeps the full 3-step stage 2, which reviewed slightly better than the 2-step one (644 s). Same engine as ltx25-dev; the clip keeps the shot and its quality at sheet scale (21-23 dB from the exact pipeline). Measured in perf/ltx25_metal_campaign.md section 24.",
       "speculative": false,
       "variants": {
         "metal": {
@@ -3896,14 +3896,13 @@
               "guidance": {
                 "modality": 1.0
               },
-              "step_cache": 0.1,
-              "stage2_sigmas": [0.909375, 0.421875, 0.0]
+              "step_cache": 0.1
             }
           },
           "notes": [
             "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
             "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
-            "What is on: `fast.steps` 20, `fast.guidance.modality` 1.0 (the audio<->video isolation pass is not run: 3 passes per step; this is the lever that touches audio-video alignment), `fast.step_cache` 0.10 (block 0 runs every step; a step whose block-0 residual moved less than 10% accumulated since the last computed step reuses that step's residual: 11 of 30 stage-1 steps at 1536x1024x121, never in stage 2), `fast.stage2_sigmas` with two refinement steps, and `decoder: conv`. Each stage-1 lever alone saved 22-27% of the exact 1513 s; stacked, 20 steps leave larger per-step moves so the cache skips 4 of 20 instead of 11 of 30.",
+            "What is on: `fast.steps` 20, `fast.guidance.modality` 1.0 (the audio<->video isolation pass is not run: 3 passes per step; this is the lever that touches audio-video alignment), `fast.step_cache` 0.10 (block 0 runs every step; a step whose block-0 residual moved less than 10% accumulated since the last computed step reuses that step's residual: 11 of 30 stage-1 steps at 1536x1024x121, never in stage 2), and `decoder: conv`. The 2-step stage 2 (`fast.stage2_sigmas` [0.909375, 0.421875, 0.0], 644 s) is an opt-in: it reviewed slightly worse than the 3-step one. With the modality pass off the audio mix is about 9 dB quieter than the exact profile's at the same footstep timing. Each stage-1 lever alone saved 22-27% of the exact 1513 s; stacked, 20 steps leave larger per-step moves so the cache skips 4 of 20 instead of 11 of 30.",
             "negative_prompt is accepted as on ltx25-dev."
           ]
         }

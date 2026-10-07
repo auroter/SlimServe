@@ -1078,3 +1078,17 @@ faces; the 1x2/halo-6 geometry passed one prompt and is an opt-in), the
 levers stay available through `engine.fast` for anyone who wants them.
 Artifacts: `~/.local/scratch/ltx25/n10/{distilled,dev,dfr}/` (mp4, uint8
 frames, contact sheets, `results.tsv`); the clips are for the user's review.
+
+**Review (the user, 2026-10-06).** No meaningful difference between the exact
+and the fast clips in any mode; dev is a lot better than distilled and DFR in
+quality and, most importantly, prompt adherence; in the dev folder stack A
+(3-step stage 2) looks slightly better than stack B. Decision: `ltx25-dev-fast`
+ships stack A (730 s, 2.07x); the 2-step stage 2 is an opt-in. Analysis notes
+behind it (`review_<mode>.png`, full-resolution crops; audio envelopes): every
+visible difference is the conv decoder (wirier hair strands, slightly softer
+mosaic); the step / pass / cache levers are invisible at full resolution;
+frame-to-frame change 0.95-0.99x of exact (no flicker); dev with the modality
+pass off keeps the footstep timing exactly (onsets 1.3 / 2.0 / 2.6 / 3.3 s in
+both) but mixes ~9 dB quieter; DFR audio is bit-identical (it comes from stage
+1). Prompt note for future renders: no close-up that pulls out from a face
+while the subject walks; one steady continuous shot.

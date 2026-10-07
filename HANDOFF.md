@@ -51,7 +51,7 @@ schedule overrides, dropped guidance passes, the first-block step cache,
 tiled stage-2 attention; plus the conv decoder). Measured one lever at a
 time and stacked at 1536x1024x121 against the exact pipeline (PSNR + contact
 sheets, clips in `~/.local/scratch/ltx25/n10/` for the user's review):
-distilled 413 -> 278 s, dev 1513 -> 644 s, DFR 681 -> 421 s. The exact
+distilled 413 -> 278 s, dev 1513 -> 730 s, DFR 681 -> 421 s. Reviewed: no meaningful difference from exact; dev is clearly the best mode for quality and prompt adherence. The exact
 profiles stay the reference; never tune them by the fast tier's method.
 Not done: DFR temporal rounds and second spatial epilogue, duration head,
 prompt enhancer, res_2s, the opt-in tier, any hand-written Metal GEMM
@@ -86,8 +86,8 @@ DiT, same kernels:
 | `ltx25-dfr` | DFRPipeline | distilled + 5 generated keyframe slots | upscale, spatial-detailing epilogue with the official IC-LoRA (strength 0.5), optional temporal rounds (+8 steps each) | production (Lightricks' label) |
 | `ltx25-*-fast` | the same three | output-changing settings stacked on (section 24 of the ledger) | | iterate, judged by eye |
 
-Dev vs distilled is the user's choice (test an idea vs render the final);
-never pick one on speed grounds. DFR must be supported. Default output
+Dev is the profile that adheres to the prompt (reviewed 2026-10-06: a lot
+better than distilled and DFR); never pick a mode on speed grounds. DFR must be supported. Default output
 1536x1024x121 @ 24 fps (stage 1 at 768x512); the campaign's short clip is
 768x512x121 (stage 1 at 384x256).
 

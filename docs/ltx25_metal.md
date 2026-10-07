@@ -91,14 +91,17 @@ are a 400. The encode is timed as the `image` span (both stages summed).
 
 `ltx25-distilled-fast`, `ltx25-dev-fast` and `ltx25-dfr-fast` are the same
 engine with output-changing settings stacked on: they are for iterating, and
-for anyone who judges a clip by eye rather than against a reference. The
+for anyone who judges a clip by eye rather than against a reference. Reviewed
+at 1536x1024x121: no meaningful difference from the exact clips in any mode;
+dev (exact or fast) is clearly the best of the three in quality and in prompt
+adherence, so `ltx25-dev-fast` at 730 s is the profile to reach for first. The
 exact profiles stay the reference the fast ones are measured against. At
 1536x1024x121 on the M1 Ultra (ledger section 24):
 
 | profile | exact | fast | what is on |
 | --- | ---: | ---: | --- |
 | distilled | 413 s | **278 s** (229 s with the opt-in 5-step stage 1) | conv decoder; 2-step stage 2 |
-| dev | 1513 s | **644 s** | 20 steps; 3 guidance passes (modality off); first-block step cache 0.10; 2-step stage 2; conv decoder |
+| dev | 1513 s | **730 s** | 20 steps; 3 guidance passes (modality off); first-block step cache 0.10; conv decoder |
 | DFR | 681 s | **421 s** | 2-step stage 2; 2x2-tiled stage-2 attention; conv decoder |
 
 Every lever was measured alone first, with a PSNR against the exact clip and a
