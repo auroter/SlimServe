@@ -157,114 +157,130 @@ class TextEncoder:
             self.max_abs.append((name, mx.max(mx.abs(y.astype(mx.float32)))))
         return y
 
-    def _tower(self, ids: list[int], pad: int) -> list[mx.array]:
-        """Hidden states (embeddings + every layer; the last one final-normed), stream
-        dtype."""
+    # ---- Gemma-4 tower ----------------------------------------------------
+    def _rotary(self, sliding: bool, pos: mx.array):
+        """(head_dim, cos, sin) for the layer flavour at fp32 positions `pos`;
+        cos/sin are (1, 1, n, head_dim / 2) in the operand dtype."""
+        t, op = self.cfg, self.O
+        hd = t["head_dim"] if sliding else t["global_head_dim"]
+        rp = t["rope_parameters"]["sliding_attention" if sliding else "full_attention"]
+        half = hd // 2
+        angles = half if sliding else int(rp["partial_rotary_factor"] * hd // 2)
+        inv = 1.0 / mx.power(
+            mx.array(rp["rope_theta"], dtype=mx.float32),
+            mx.arange(0, 2 * angles, 2, dtype=mx.float32) / hd,
+        )
+        if angles < half:
+            inv = mx.concatenate([inv, mx.zeros((half - angles,), dtype=mx.float32)])
+        f = pos[:, None] * inv[None, :]
+        return hd, mx.cos(f)[None, None].astype(op), mx.sin(f)[None, None].astype(op)
+
+    def _causal_mask(self, n: int, sliding: bool) -> mx.array:
+        q_idx, k_idx = mx.arange(n)[:, None], mx.arange(n)[None, :]
+        visible = k_idx <= q_idx
+        if sliding:
+            visible = mx.logical_and(
+                visible, k_idx > q_idx - self.cfg["sliding_window"]
+            )
+        return mx.where(
+            visible, mx.array(0.0, dtype=self.O), mx.array(-mx.inf, dtype=self.O)
+        )
+
+    @staticmethod
+    def _rope(
+        x, cos, sin
+    ):  # rotate_half form: [a, b] -> [a cos - b sin, b cos + a sin]
+        half = x.shape[-1] // 2
+        a, b = x[..., :half], x[..., half:]
+        return mx.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1)
+
+    def _layer(self, i: int, h: mx.array, flavors: dict, masks: dict) -> mx.array:
+        """One decoder layer on the stream `h` (1, n, D)."""
         w, t, op, S = self.w, self.cfg, self.O, self.S
         eps, heads = t["rms_norm_eps"], t["num_attention_heads"]
-        n = len(ids)
+        kind = t["layer_types"][i]
+        sliding = kind == "sliding_attention"
+        p = f"model.layers.{i}"
+        n = h.shape[1]
+        hd, cos, sin = flavors[sliding]
+        x = _rms(h, w[p + ".input_layernorm.weight"], eps).astype(op)
+        q = self._lin(w, p + ".self_attn.q_proj", x).reshape(1, n, heads, hd)
+        k = self._lin(w, p + ".self_attn.k_proj", x)
+        kv_heads = k.shape[-1] // hd
+        k = k.reshape(1, n, kv_heads, hd)
+        vkey = p + ".self_attn.v_proj"
+        v = (
+            self._lin(w, vkey, x).reshape(1, n, kv_heads, hd)
+            if vkey + ".weight" in w
+            else k
+        )
+        q = self._rope(
+            _rms(q, w[p + ".self_attn.q_norm.weight"], eps)
+            .astype(op)
+            .transpose(0, 2, 1, 3),
+            cos,
+            sin,
+        )
+        k = self._rope(
+            _rms(k, w[p + ".self_attn.k_norm.weight"], eps)
+            .astype(op)
+            .transpose(0, 2, 1, 3),
+            cos,
+            sin,
+        )
+        v = _rms(v, None, eps).astype(op).transpose(0, 2, 1, 3)
+        mask = masks[sliding]
+        length = k.shape[2]
+        if kv_heads != heads:
+            rep = heads // kv_heads
+            k = mx.broadcast_to(k[:, :, None], (1, kv_heads, rep, length, hd)).reshape(
+                1, heads, length, hd
+            )
+            v = mx.broadcast_to(v[:, :, None], (1, kv_heads, rep, length, hd)).reshape(
+                1, heads, length, hd
+            )
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
+        y = self._lin(
+            w,
+            p + ".self_attn.o_proj",
+            y.transpose(0, 2, 1, 3).reshape(1, n, heads * hd),
+        )
+        h = h + _rms(y, w[p + ".post_attention_layernorm.weight"], eps).astype(S)
+        x = _rms(h, w[p + ".pre_feedforward_layernorm.weight"], eps).astype(op)
+        y = _gelu(self._lin(w, p + ".mlp.gate_proj", x)) * self._lin(
+            w, p + ".mlp.up_proj", x
+        )
+        y = self._lin(w, p + ".mlp.down_proj", y)
+        return (
+            h + _rms(y, w[p + ".post_feedforward_layernorm.weight"], eps).astype(S)
+        ) * w[p + ".layer_scalar"].astype(S)
+
+    def _embed(self, ids: list[int]) -> mx.array:
+        t, S = self.cfg, self.S
         # Upstream holds embed_scale in the model dtype, bf16: sqrt(3840) rounds to
         # 62.0.
         scale = mx.array(math.sqrt(t["hidden_size"])).astype(mx.bfloat16).astype(S)
-        h = w["model.embed_tokens.weight"][mx.array(ids)][None].astype(S) * scale
+        return (
+            self.w["model.embed_tokens.weight"][mx.array(ids)][None].astype(S) * scale
+        )
+
+    def _tower(self, ids: list[int], pad: int) -> list[mx.array]:
+        """Hidden states (embeddings + every layer; the last one final-normed), stream
+        dtype."""
+        w, t = self.w, self.cfg
+        n = len(ids)
+        h = self._embed(ids)
         pos = mx.arange(pad, pad + n).astype(mx.float32)
-        q_idx, k_idx = mx.arange(n)[:, None], mx.arange(n)[None, :]
-
-        def flavor(sliding: bool):
-            hd = t["head_dim"] if sliding else t["global_head_dim"]
-            rp = t["rope_parameters"][
-                "sliding_attention" if sliding else "full_attention"
-            ]
-            half = hd // 2
-            angles = half if sliding else int(rp["partial_rotary_factor"] * hd // 2)
-            inv = 1.0 / mx.power(
-                mx.array(rp["rope_theta"], dtype=mx.float32),
-                mx.arange(0, 2 * angles, 2, dtype=mx.float32) / hd,
-            )
-            if angles < half:
-                inv = mx.concatenate(
-                    [inv, mx.zeros((half - angles,), dtype=mx.float32)]
-                )
-            f = pos[:, None] * inv[None, :]
-            visible = k_idx <= q_idx
-            if sliding:
-                visible = mx.logical_and(visible, k_idx > q_idx - t["sliding_window"])
-            mask = mx.where(
-                visible, mx.array(0.0, dtype=op), mx.array(-mx.inf, dtype=op)
-            )
-            # (1, 1, n, half): broadcast over heads in (B, H, n, hd) layout
-            return (
-                hd,
-                mx.cos(f)[None, None].astype(op),
-                mx.sin(f)[None, None].astype(op),
-                mask,
-            )
-
-        flavors = {True: flavor(True), False: flavor(False)}
-
-        def rope(
-            x, cos, sin
-        ):  # rotate_half form: [a, b] -> [a cos - b sin, b cos + a sin]
-            half = x.shape[-1] // 2
-            a, b = x[..., :half], x[..., half:]
-            return mx.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1)
-
+        flavors = {True: self._rotary(True, pos), False: self._rotary(False, pos)}
+        masks = {True: self._causal_mask(n, True), False: self._causal_mask(n, False)}
         states = [h]
-        for i, kind in enumerate(t["layer_types"]):
-            p = f"model.layers.{i}"
-            hd, cos, sin, mask = flavors[kind == "sliding_attention"]
-            x = _rms(h, w[p + ".input_layernorm.weight"], eps).astype(op)
-            q = self._lin(w, p + ".self_attn.q_proj", x).reshape(1, n, heads, hd)
-            k = self._lin(w, p + ".self_attn.k_proj", x)
-            kv_heads = k.shape[-1] // hd
-            k = k.reshape(1, n, kv_heads, hd)
-            vkey = p + ".self_attn.v_proj"
-            v = (
-                self._lin(w, vkey, x).reshape(1, n, kv_heads, hd)
-                if vkey + ".weight" in w
-                else k
-            )
-            q = rope(
-                _rms(q, w[p + ".self_attn.q_norm.weight"], eps)
-                .astype(op)
-                .transpose(0, 2, 1, 3),
-                cos,
-                sin,
-            )
-            k = rope(
-                _rms(k, w[p + ".self_attn.k_norm.weight"], eps)
-                .astype(op)
-                .transpose(0, 2, 1, 3),
-                cos,
-                sin,
-            )
-            v = _rms(v, None, eps).astype(op).transpose(0, 2, 1, 3)
-            if kv_heads != heads:
-                rep = heads // kv_heads
-                k = mx.broadcast_to(k[:, :, None], (1, kv_heads, rep, n, hd)).reshape(
-                    1, heads, n, hd
-                )
-                v = mx.broadcast_to(v[:, :, None], (1, kv_heads, rep, n, hd)).reshape(
-                    1, heads, n, hd
-                )
-            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
-            y = self._lin(
-                w,
-                p + ".self_attn.o_proj",
-                y.transpose(0, 2, 1, 3).reshape(1, n, heads * hd),
-            )
-            h = h + _rms(y, w[p + ".post_attention_layernorm.weight"], eps).astype(S)
-            x = _rms(h, w[p + ".pre_feedforward_layernorm.weight"], eps).astype(op)
-            y = _gelu(self._lin(w, p + ".mlp.gate_proj", x)) * self._lin(
-                w, p + ".mlp.up_proj", x
-            )
-            y = self._lin(w, p + ".mlp.down_proj", y)
-            h = (
-                h + _rms(y, w[p + ".post_feedforward_layernorm.weight"], eps).astype(S)
-            ) * w[p + ".layer_scalar"].astype(S)
+        for i in range(len(t["layer_types"])):
+            h = self._layer(i, h, flavors, masks)
             mx.eval(h)
             states.append(h)
-        states[-1] = _rms(states[-1], w["model.norm.weight"], eps).astype(S)
+        states[-1] = _rms(states[-1], w["model.norm.weight"], t["rms_norm_eps"]).astype(
+            self.S
+        )
         return states
 
     def _connector(self, name: str, x: mx.array, n_valid: int) -> mx.array:

@@ -105,14 +105,15 @@ CFG = {
 }
 
 
-def test_request_defaults_to_the_profile_clip():
+def test_request_without_a_length_is_auto_duration_within_the_envelope():
     params = server.normalize_request({"prompt": "a fox"}, CFG)
-    assert (
-        params["width"],
-        params["height"],
-        params["num_frames"],
-        params["seed"],
-    ) == (1536, 1024, 121, 42)
+    assert (params["width"], params["height"], params["seed"]) == (1536, 1024, 42)
+    assert params["num_frames"] is None  # the duration head decides
+    assert params["max_num_frames"] == 121  # 24,576 tokens at 1536x1024
+    small = server.normalize_request({"prompt": "a fox", "size": "768x512"}, CFG)
+    assert small["max_num_frames"] == 505
+    explicit = server.normalize_request({"prompt": "a fox", "seconds": 5}, CFG)
+    assert explicit["num_frames"] == 121 and "max_num_frames" not in explicit
 
 
 def test_request_accepts_size_and_seconds():
@@ -179,6 +180,8 @@ class _FakeEngine:
 
         class _Result:
             timings = _Timings()
+            num_frames = params.get("num_frames") or 49
+            predicted_seconds = None if params.get("num_frames") else 2.0
 
         return _Result()
 

@@ -1117,3 +1117,36 @@ the picture; not a decode fault (the decoder path is bit-identical on DFR
 and on the tiles variant, 0.0 dB). Decision (user, 2026-10-06): that is the
 model and the diffusion working as designed; `ltx25-dev-fast` ships stack C
 (911.4 s, 1.66x) with the tradeoff stated in the profile note.
+
+## 25. The component checklist, resumed (2026-10-06)
+
+The HANDOFF's "nothing skipped" checklist still had five unbuilt items
+(temporal rounds, second spatial epilogue, duration head, prompt enhancer,
+res_2s); section 23 had mislabelled them as out of scope. Resumed in order of
+user value.
+
+**Duration head** (`duration.py`, `n11_duration_parity.py`): upstream's
+DurationHead (modality projections + modality embeddings, one learnable query
+cross-attending the connector tokens with 4 heads, GELU MLP, exp) ported in
+fp32 from `model_patches/ltx-2.5-duration-head-bf16.safetensors`. Parity
+against the torch head on random connector tokens: rel 9e-8 (video-only,
+audio-only, both). On real prompts (24 fps): beat1d 10.74 s -> 257 frames,
+"a red fox trotting ..." 4.55 s -> 105, a one-line greeting 2.43 s -> 57, a
+cloud time-lapse 5.92 s -> 137. Wired as upstream's auto duration: a request
+with neither `seconds` nor `num_frames` is predicted, clamped to 1-20 s,
+snapped to 8k + 1, then capped at the profile's token envelope for the clip's
+size (121 frames at 1536x1024; 505 at 768x512); frames larger than the
+validated frame are refused. End to end through the CLI at 512x320: the
+greeting rendered 57 frames (2.4 s). The text-encoder tower was refactored
+into per-layer pieces on the way (bit-identical on the beat1d encode).
+
+**Prompt enhancer: blocked on a second model.** The resident tower, run as a
+language model (tied embeddings, final norm, logit soft-cap, Gemma-4 chat
+template, greedy with no 5-gram repeats as upstream's generate kwargs),
+emits garbage: the LTX fine-tune is not a generative model, and upstream's
+own code refuses `enhance_prompt` with a Gemma-4 encode root unless
+`--prompt-enhancer-gemma-root` names a separate generative instruct checkpoint
+("gemma3 or gemma4 E2B-it"). That is a new download (gated, ~5 GB) and a
+second small model to port; not started without the user's go-ahead. The
+cached-generation code is parked in `~/.local/scratch/ltx25/n11/
+text_generate_wip.patch`.

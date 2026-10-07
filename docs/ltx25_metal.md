@@ -41,7 +41,11 @@ DELETE /v1/videos/<id>
 GET    /health, /v1/models
 ```
 
-`"wait": true` holds the POST open until the clip is done. `negative_prompt`
+`"wait": true` holds the POST open until the clip is done. A request with
+neither `seconds` nor `num_frames` gets its length from the model's duration
+head (Lightricks' auto-duration: the clip the prompt implies, 1-20 s, snapped
+to the 8k + 1 frame grid, capped at the profile's envelope for that size); the
+job reports the pick as `num_frames` and `predicted_seconds`. `negative_prompt`
 is accepted by `ltx25-dev` only. `decoder` is `diffusion` (default, Lightricks'
 recommended decoder: sharper faces, textures and text) or `conv` (about 4x
 faster decode); the CLI flag is `--decoder`. Width and height are multiples of 64, frame
@@ -222,6 +226,7 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 | `lora.py` | runtime low-rank adapters |
 | `vae.py`, `upscaler.py` | conv VAE (slab conv3d, tiling planner), latent upscalers |
 | `image.py` | image-to-video still: decode, CRF-18 round trip, upstream resize/crop/normalize |
+| `duration.py` | the duration head (auto clip length from the prompt) |
 | `audio.py`, `mux.py` | audio VAE + vocoder + bandwidth extension; ffmpeg mux |
 | `../server.py`, `../cli.py` | the job queue and HTTP API; `slimserve` integration |
 
@@ -231,7 +236,11 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
   indices, video-to-video reference conditioning); the I2V first-frame path
   is wired but its end-to-end output has not yet been compared against
   upstream on this machine.
-- DFR temporal rounds and the second spatial epilogue; the duration head;
-  the prompt enhancer; the res_2s sampler (HQ pipeline).
+- DFR temporal rounds and the second spatial epilogue; the res_2s sampler (HQ
+  pipeline).
+- The prompt enhancer. With the 2.5 Gemma-4 encoder, upstream enhances only
+  through a separate generative instruct Gemma (`--prompt-enhancer-gemma-root`,
+  e.g. Gemma-4 E2B-it); the LTX fine-tuned 12B tower is not a generative
+  model. That second checkpoint is not part of the profile's file set yet.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
   hardware and are separate profile records when they exist.

@@ -79,7 +79,7 @@ def _parser() -> argparse.ArgumentParser:
         "--size", help="WIDTHxHEIGHT, multiples of 64 (default: the profile's)"
     )
     video.add_argument(
-        "--seconds", type=float, help="clip length (default: the profile's)"
+        "--seconds", type=float, help="clip length (default: predicted from the prompt)"
     )
     video.add_argument("--seed", type=int, help="random seed (default 42)")
     video.add_argument("--negative-prompt", help="dev pipeline only")

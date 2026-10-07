@@ -83,6 +83,8 @@ class Result:
     # DFR: the stage-2 keyframe slots (normalized (1, 128, K, H, W)) and their
     # pixel frames, for the keyframe-aware diffusion decode
     keyframes: tuple[mx.array, list[int]] | None = None
+    # set when the clip length came from the duration head
+    predicted_seconds: float | None = None
 
 
 class Denoiser:
@@ -363,6 +365,7 @@ class LTX25Engine:
         self.distilled_lora = None
         self.detail_lora = None
         self.diffvae = None
+        self.duration = None
         self.decoder = decoder
 
     # ---- components -------------------------------------------------------
@@ -403,6 +406,32 @@ class LTX25Engine:
             self.audio = AudioDecoder(self.root)
             self.audio.load()
         return self.audio
+
+    def load_duration(self):
+        if self.duration is None:
+            from slimserve.video.ltx25.duration import DurationHead
+
+            self.duration = DurationHead(self.root).load()
+        return self.duration
+
+    def resolve_frames(
+        self,
+        num_frames: int | None,
+        video_text: mx.array,
+        audio_text: mx.array,
+        fps: float,
+        max_num_frames: int | None,
+    ) -> tuple[int, float | None]:
+        """A request without a frame count gets the duration head's prediction
+        (upstream resolve_num_frames: clamped to 1-20 s, snapped to 8k + 1),
+        further capped at `max_num_frames` (the profile's validated envelope at
+        the clip's size)."""
+        if num_frames is not None:
+            return num_frames, None
+        frames, seconds = self.load_duration().num_frames(video_text, audio_text, fps)
+        if max_num_frames is not None:
+            frames = min(frames, max_num_frames)
+        return frames, seconds
 
     def unload_text(self) -> None:
         if self.text is not None:
@@ -484,7 +513,7 @@ class LTX25Engine:
         prompt: str,
         height: int = 1024,
         width: int = 1536,
-        num_frames: int = 121,
+        num_frames: int | None = 121,
         fps: float = 24.0,
         seed: int = 42,
         text_embeds: tuple[mx.array, mx.array] | None = None,
@@ -493,10 +522,12 @@ class LTX25Engine:
         image: str | bytes | None = None,
         image_strength: float = 1.0,
         fast: Fast | None = None,
+        max_num_frames: int | None = None,
     ) -> Result:
         """`image` (a path or encoded image bytes) conditions the first frame
         (image-to-video) at `image_strength` in both stages. `fast` stacks the
-        output-changing fast tier (see `Fast`)."""
+        output-changing fast tier (see `Fast`). `num_frames` None: the duration
+        head decides (see `resolve_frames`)."""
         fast = fast or Fast()
         tm = Timings()
         if text_embeds is None:
@@ -507,6 +538,9 @@ class LTX25Engine:
                 self.unload_text()
         else:
             video_text, audio_text = text_embeds
+        num_frames, predicted = self.resolve_frames(
+            num_frames, video_text, audio_text, fps, max_num_frames
+        )
         with tm.span("load"):
             dit = self.load_dit()
             vae = self.load_vae()
@@ -590,7 +624,14 @@ class LTX25Engine:
             )
 
         return Result(
-            sampling.unpatchify(v2, (f, h2, w2)), a2, num_frames, height, width, fps, tm
+            sampling.unpatchify(v2, (f, h2, w2)),
+            a2,
+            num_frames,
+            height,
+            width,
+            fps,
+            tm,
+            predicted_seconds=predicted,
         )
 
     # ---- DFR --------------------------------------------------------------
@@ -606,7 +647,7 @@ class LTX25Engine:
         prompt: str,
         height: int = 1024,
         width: int = 1536,
-        num_frames: int = 121,
+        num_frames: int | None = 121,
         fps: float = 24.0,
         seed: int = 42,
         detail_strength: float = 0.5,
@@ -616,6 +657,7 @@ class LTX25Engine:
         image: str | bytes | None = None,
         image_strength: float = 1.0,
         fast: Fast | None = None,
+        max_num_frames: int | None = None,
     ) -> Result:
         """Lightricks' DFRPipeline, default configuration: the distilled flow
         with one generated keyframe slot per 24/32-frame segment in stage 1,
@@ -636,6 +678,9 @@ class LTX25Engine:
                     self.unload_text()
         else:
             video_text, audio_text = text_embeds
+        num_frames, predicted = self.resolve_frames(
+            num_frames, video_text, audio_text, fps, max_num_frames
+        )
         with tm.span("load"):
             dit = self.load_dit()
             vae = self.load_vae()
@@ -760,6 +805,7 @@ class LTX25Engine:
             fps,
             tm,
             keyframes=keyframes,
+            predicted_seconds=predicted,
         )
 
     # ---- dev --------------------------------------------------------------
@@ -775,7 +821,7 @@ class LTX25Engine:
         prompt: str,
         height: int = 1024,
         width: int = 1536,
-        num_frames: int = 121,
+        num_frames: int | None = 121,
         fps: float = 24.0,
         seed: int = 42,
         negative_prompt: str | None = None,
@@ -788,6 +834,7 @@ class LTX25Engine:
         image: str | bytes | None = None,
         image_strength: float = 1.0,
         fast: Fast | None = None,
+        max_num_frames: int | None = None,
     ) -> Result:
         """Lightricks' TI2VidTwoStagesPipeline: guided dev stage 1 at half
         resolution, 2x latent upscale, 3-step stage 2 with the distilled LoRA
@@ -812,6 +859,9 @@ class LTX25Engine:
                 else negative_prompt
             )[:2]
             mx.eval(cond, neg)
+            num_frames, predicted = self.resolve_frames(
+                num_frames, cond[0], cond[1], fps, max_num_frames
+            )
             if not keep_text:
                 self.unload_text()
         with tm.span("load"):
@@ -899,7 +949,14 @@ class LTX25Engine:
                 lora.detach(dit)
 
         return Result(
-            sampling.unpatchify(v2, (f, h2, w2)), a1, num_frames, height, width, fps, tm
+            sampling.unpatchify(v2, (f, h2, w2)),
+            a1,
+            num_frames,
+            height,
+            width,
+            fps,
+            tm,
+            predicted_seconds=predicted,
         )
 
     # ---- decode -----------------------------------------------------------

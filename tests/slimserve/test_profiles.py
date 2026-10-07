@@ -122,7 +122,9 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
 
     monkeypatch.setattr(cli, "_chat", _capture_chat)
 
-    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec", "--chat"]) == 0
+    assert (
+        cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec", "--chat"]) == 0
+    )
     assert len(seen) == 1
     assert seen[0].speculative is False
     assert "speculative_config" not in engine_kwargs(seen[0])
@@ -1406,6 +1408,7 @@ def test_scalar_list_engine_args_render_space_separated():
     """vLLM's nargs list flags (numa_bind_nodes) take space-separated values;
     a JSON-rendered list is rejected at parse time (2026-09-11 NUMA arm)."""
     from dataclasses import replace
+
     from slimserve.engine import serve_argv
 
     plan = resolve("glm53f-nvfp4-8", "a100", 8, None)

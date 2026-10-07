@@ -97,26 +97,37 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
             raise BadRequest("`size` must look like 1536x1024") from exc
     width, height = int(body.get("width", width)), int(body.get("height", height))
     fps = float(body.get("fps", cfg["fps"]))
+    if width % 64 or height % 64 or width < 256 or height < 256:
+        raise BadRequest("width and height must be multiples of 64, at least 256")
+    if not 1.0 <= fps <= 60.0:
+        raise BadRequest("fps must be between 1 and 60")
+    per_frame = (height // 32) * (width // 32)
+    if per_frame > (cfg["height"] // 32) * (cfg["width"] // 32):
+        raise BadRequest(
+            f"{width}x{height} frames are larger than this profile's validated "
+            f"{cfg['width']}x{cfg['height']}"
+        )
+    # the longest 8k + 1 clip at this size inside the validated token envelope
+    max_frames = (cfg["max_video_tokens"] // per_frame - 1) * 8 + 1
     if "num_frames" in body:
         frames = int(body["num_frames"])
     elif "seconds" in body:
         frames = int(round(float(body["seconds"]) * fps / 8)) * 8 + 1
     else:
-        frames = cfg["num_frames"]
-    if width % 64 or height % 64 or width < 256 or height < 256:
-        raise BadRequest("width and height must be multiples of 64, at least 256")
-    if frames < 9 or (frames - 1) % 8:
-        raise BadRequest("num_frames must be 8k + 1 (9, 17, ..., 121)")
-    if not 1.0 <= fps <= 60.0:
-        raise BadRequest("fps must be between 1 and 60")
-    tokens = ((frames - 1) // 8 + 1) * (height // 32) * (width // 32)
-    if tokens > cfg["max_video_tokens"]:
-        raise BadRequest(
-            f"{width}x{height}x{frames} is {tokens} latent tokens; "
-            "this profile is validated up to "
-            f"{cfg['max_video_tokens']} "
-            f"({cfg['width']}x{cfg['height']}x{cfg['num_frames']})"
-        )
+        # no length asked for: the duration head predicts one from the prompt
+        # (upstream's auto duration), capped at the envelope
+        frames = None
+    if frames is not None:
+        if frames < 9 or (frames - 1) % 8:
+            raise BadRequest("num_frames must be 8k + 1 (9, 17, ..., 121)")
+        if frames > max_frames:
+            tokens = ((frames - 1) // 8 + 1) * per_frame
+            raise BadRequest(
+                f"{width}x{height}x{frames} is {tokens} latent tokens; "
+                "this profile is validated up to "
+                f"{cfg['max_video_tokens']} "
+                f"({cfg['width']}x{cfg['height']}x{cfg['num_frames']})"
+            )
     params: dict[str, Any] = {
         "prompt": prompt,
         "width": width,
@@ -125,6 +136,8 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         "fps": fps,
         "seed": int(body.get("seed", 42)),
     }
+    if frames is None:
+        params["max_num_frames"] = max_frames
     decoder = str(body.get("decoder", cfg.get("decoder", "diffusion")))
     if decoder not in ("diffusion", "conv"):
         raise BadRequest(
@@ -234,6 +247,7 @@ class VideoService:
         engine.load_vae()
         engine.load_upscaler()
         engine.load_audio()
+        engine.load_duration()
         if self.cfg.get("decoder", "diffusion") == "diffusion":
             engine.load_diffvae()
         if pipeline == "dev":
@@ -281,6 +295,9 @@ class VideoService:
         if fast is not None:
             p["fast"] = fast
         result = getattr(engine, self.cfg["pipeline"])(prompt, on_step=on_step, **p)
+        if result.predicted_seconds is not None:  # auto duration: report the pick
+            job.params["num_frames"] = result.num_frames
+            job.params["predicted_seconds"] = round(result.predicted_seconds, 2)
         job.progress = {"stage": "decode"}
         path = self.output_dir / f"{job.id}.mp4"
         engine.render(result, path, seed=p["seed"], decoder=decoder)

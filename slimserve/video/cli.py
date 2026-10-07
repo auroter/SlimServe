@@ -78,8 +78,13 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     )
     engine.render(result, out, seed=params["seed"], decoder=decoder)
     spans = ", ".join(f"{k} {v:.1f}s" for k, v in result.timings.spans.items())
+    auto = (
+        f"  (duration head: {result.predicted_seconds:.1f} s)"
+        if result.predicted_seconds is not None
+        else ""
+    )
     term.ok(
-        f"{out}  {params['width']}x{params['height']}x{params['num_frames']}  "
+        f"{out}  {params['width']}x{params['height']}x{result.num_frames}{auto}  "
         f"{time.perf_counter() - started:.1f}s  ({spans})"
     )
     return 0
