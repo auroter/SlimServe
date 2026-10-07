@@ -3834,7 +3834,7 @@
           "notes": [
             "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
             "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
-            "Temporal rounds and the second spatial epilogue of DFRPipeline are not implemented; requests for them are not accepted.",
+            "DFRPipeline's temporal rounds (`temporal_upscalings` 1-2: x2 fps per round, re-denoised in keyframe-seam windows; parity 1.2e-3 against upstream) and second spatial epilogue (`spatial_upscalings` 2: stages at a quarter and half of the output size, then the tiled full-resolution detailing pass under the IC-LoRA; sizes multiples of 128) are request options; the default request runs neither, as upstream. Ledger section 26.",
             "Stage 2 carries the slot and reference tokens (9,600 tokens at 768x512x121 against 6,144 for the distilled pipeline), which is where the extra time goes."
           ]
         }
@@ -3934,7 +3934,7 @@
             "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
             "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
             "What is on: `fast.stage2_sigmas` with two refinement steps, `fast.attention_tiles` [2, 2] with `attention_halo` 2 (each stage-2 query attends to its own tile widened by two latent cells plus every slot and reference token; on DFR the clean reference tokens anchor every tile and no seam was found at full resolution, unlike the distilled and dev flows where the same tiling seams faces), and `decoder: conv`. The step cache never fires on the DFR schedules and is off.",
-            "Temporal rounds and the second spatial epilogue are not implemented, as on ltx25-dfr."
+            "temporal_upscalings and spatial_upscalings are accepted as on ltx25-dfr (the fast settings apply to stages 1-2; the rounds and the epilogue run exactly)."
           ]
         }
       }

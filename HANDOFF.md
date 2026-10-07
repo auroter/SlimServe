@@ -53,8 +53,10 @@ time and stacked at 1536x1024x121 against the exact pipeline (PSNR + contact
 sheets, clips in `~/.local/scratch/ltx25/n10/` for the user's review):
 distilled 413 -> 278 s, dev 1513 -> 911 s, DFR 681 -> 421 s. Reviewed: no meaningful difference from exact; dev is clearly the best mode for quality and prompt adherence. The exact
 profiles stay the reference; never tune them by the fast tier's method.
-Not done: DFR temporal rounds and second spatial epilogue, duration head,
-prompt enhancer, res_2s, the opt-in tier, any hand-written Metal GEMM
+Done since (2026-10-06/07, ledger sections 25-26): the duration head (auto
+clip length), DFR temporal rounds and the second spatial epilogue. Not done:
+the prompt enhancer (needs a separate instruct Gemma: a download to approve),
+res_2s, the opt-in tier, any hand-written Metal GEMM
 (measured headroom on M1-M4 is at most ~10% of a forward; see ledger section
 15), N7 (candidates: na3d / na3d_joint kernels, split-K dispatch, slab conv
 driver), HD runs of dev and DFR beyond the default size, nothing on parity: decoder (both modes, 120 dB), transformer forward and dev guided step (fp32 5e-6 / 2e-5) are all checked against upstream's own code run on this machine's CPU (`n8_*_parity.py`). Draft PR #86 on QuixiAI/SlimServe from fork
