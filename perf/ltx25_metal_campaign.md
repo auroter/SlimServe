@@ -1108,3 +1108,12 @@ removed. Dropping the modality pass is out of the profile. The remaining
 -3.4 dB of stack C is a decision for the user: ship it as a documented level
 difference, or keep dev's stage 1 whole (then dev-fast is the conv decoder
 alone, 1513 -> ~1444 s, not worth a profile).
+Split by content (`dev/*.wav`, 10 ms RMS envelope): the background floor is
+-62 dB in every variant and the footstep timing is identical; what moves is
+the footstep peaks: exact -42 dB, 20 steps -46, cache -46, modality off -44,
+stack A -50, stack C -45. Less denoising work gives softer generated
+transients, the audio counterpart of the softer hair strands and mosaic in
+the picture; not a decode fault (the decoder path is bit-identical on DFR
+and on the tiles variant, 0.0 dB). Decision (user, 2026-10-06): that is the
+model and the diffusion working as designed; `ltx25-dev-fast` ships stack C
+(911.4 s, 1.66x) with the tradeoff stated in the profile note.

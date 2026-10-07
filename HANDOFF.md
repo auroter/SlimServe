@@ -51,7 +51,7 @@ schedule overrides, dropped guidance passes, the first-block step cache,
 tiled stage-2 attention; plus the conv decoder). Measured one lever at a
 time and stacked at 1536x1024x121 against the exact pipeline (PSNR + contact
 sheets, clips in `~/.local/scratch/ltx25/n10/` for the user's review):
-distilled 413 -> 278 s, dev 1513 -> 730 s, DFR 681 -> 421 s. Reviewed: no meaningful difference from exact; dev is clearly the best mode for quality and prompt adherence. The exact
+distilled 413 -> 278 s, dev 1513 -> 911 s, DFR 681 -> 421 s. Reviewed: no meaningful difference from exact; dev is clearly the best mode for quality and prompt adherence. The exact
 profiles stay the reference; never tune them by the fast tier's method.
 Not done: DFR temporal rounds and second spatial epilogue, duration head,
 prompt enhancer, res_2s, the opt-in tier, any hand-written Metal GEMM

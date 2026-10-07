@@ -94,21 +94,24 @@ engine with output-changing settings stacked on: they are for iterating, and
 for anyone who judges a clip by eye rather than against a reference. Reviewed
 at 1536x1024x121: no meaningful difference from the exact clips in any mode;
 dev (exact or fast) is clearly the best of the three in quality and in prompt
-adherence, so `ltx25-dev-fast` at 730 s is the profile to reach for first. The
+adherence, so `ltx25-dev-fast` is the profile to reach for first. The
 exact profiles stay the reference the fast ones are measured against. At
 1536x1024x121 on the M1 Ultra (ledger section 24):
 
 | profile | exact | fast | what is on |
 | --- | ---: | ---: | --- |
 | distilled | 413 s | **278 s** (229 s with the opt-in 5-step stage 1) | conv decoder; 2-step stage 2 |
-| dev | 1513 s | **730 s** | 20 steps; 3 guidance passes (modality off); first-block step cache 0.10; conv decoder |
+| dev | 1513 s | **911 s** | 20 steps; first-block step cache 0.10; conv decoder (all four guidance passes kept) |
 | DFR | 681 s | **421 s** | 2-step stage 2; 2x2-tiled stage-2 attention; conv decoder |
 
 Every lever was measured alone first, with a PSNR against the exact clip and a
 look at the frames. Kept: fewer refinement steps (30-33 dB, the same shot),
-the conv decoder (35 dB), on dev fewer steps / fewer passes / the step cache
+the conv decoder (35 dB), on dev fewer steps and the step cache
 (21-23 dB each, the same shot at sheet scale), on DFR tiled attention (28 dB,
-no seam: the reference tokens anchor every tile). Rejected: tiled attention
+no seam: the reference tokens anchor every tile). Rejected: dropping dev's
+modality guidance pass (its footsteps come out 4 dB softer on top of the 3 dB
+that fewer steps already cost; a less-work-less-punch tradeoff, as with fine
+detail, so the profile keeps all four passes), tiled attention
 on distilled and dev (a seam through faces at the frame centre), the step
 cache on the ancestral schedules (the block-0 residual moves 22-70% per step,
 so it never fires), and 5-step distilled stage 1 is left out of the default
