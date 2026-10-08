@@ -44,6 +44,10 @@ FILES = {
         "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors"
     ),
     "duration-head": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
+    # Not a Lightricks file: google/gemma-4-E2B-it, the generative instruct
+    # Gemma upstream's --prompt-enhancer-gemma-root names for 2.5. Its
+    # config.json, generation_config.json and tokenizer.json sit next to it.
+    "enhancer": "prompt_enhancer/gemma-4-E2B-it/model.safetensors",
 }
 
 DIT_PREFIX = "model.diffusion_model."

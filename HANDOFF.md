@@ -53,10 +53,12 @@ time and stacked at 1536x1024x121 against the exact pipeline (PSNR + contact
 sheets, clips in `~/.local/scratch/ltx25/n10/` for the user's review):
 distilled 413 -> 278 s, dev 1513 -> 911 s, DFR 681 -> 421 s. Reviewed: no meaningful difference from exact; dev is clearly the best mode for quality and prompt adherence. The exact
 profiles stay the reference; never tune them by the fast tier's method.
-Done since (2026-10-06/07, ledger sections 25-26): the duration head (auto
+Done since (2026-10-06/07, ledger sections 25-28): the duration head (auto
 clip length), DFR temporal rounds and the second spatial epilogue, the HQ
-pipeline (res_2s, `ltx25-hq`, section 27). Not done: the prompt enhancer
-(needs a separate instruct Gemma: a download to approve), the opt-in tier, any hand-written Metal GEMM
+pipeline (res_2s, `ltx25-hq`, section 27), the prompt enhancer (Gemma-4
+E2B-it in MLX, `enhance_prompt` / `--enhance-prompt`, section 28; its
+image-aware I2V variant is not ported). The component checklist is complete.
+Not done: the opt-in tier, any hand-written Metal GEMM
 (measured headroom on M1-M4 is at most ~10% of a forward; see ledger section
 15), N7 (candidates: na3d / na3d_joint kernels, split-K dispatch, slab conv
 driver), HD runs of dev and DFR beyond the default size, nothing on parity: decoder (both modes, 120 dB), transformer forward and dev guided step (fp32 5e-6 / 2e-5) are all checked against upstream's own code run on this machine's CPU (`n8_*_parity.py`). Draft PR #86 on QuixiAI/SlimServe from fork
@@ -263,7 +265,7 @@ attention masks (keyframe slots, prompt relay), keyframe absolute embedding.
 Text: Gemma-4 12B fine-tune, multi-layer feature extraction, projection,
 connector transformer (8 layers, 32x128, 128 registers, gated attn, RoPE
 max_pos 4096) -> 4096-d video context, 2048-d audio context; negative
-prompt path for dev. Duration head. Prompt enhancer (Gemma-4-E2B, optional).
+prompt path for dev. Duration head. Prompt enhancer (Gemma-4 E2B-it, text; opt-in).
 VAE: causal conv3d encoder (image/video conditioning), conv decoder
 (timestep-conditioned), tiled decode with budget, latent normalize /
 denormalize, spatial x2 and temporal x2 latent upscalers. Audio: mel

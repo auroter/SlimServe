@@ -446,6 +446,7 @@ class LTX25Engine:
         self.detail_lora = None
         self.diffvae = None
         self.duration = None
+        self.enhancer = None
         self.temporal_upscaler = None
         self.decoder = decoder
 
@@ -494,6 +495,24 @@ class LTX25Engine:
 
             self.duration = DurationHead(self.root).load()
         return self.duration
+
+    def load_enhancer(self):
+        if self.enhancer is None:
+            from slimserve.video.ltx25.enhancer import PromptEnhancer
+
+            self.enhancer = PromptEnhancer(self.root).load()
+        return self.enhancer
+
+    def enhance(self, prompt: str) -> str:
+        """Upstream's --enhance-prompt: Gemma-4 E2B-it rewrites the request into
+        the caption style the model was trained on (~4 GiB while loaded, 1.3 s
+        to load, ~5 s per rewrite)."""
+        return self.load_enhancer().enhance(prompt)
+
+    def unload_enhancer(self) -> None:
+        if self.enhancer is not None:
+            self.enhancer.unload()
+            self.enhancer = None
 
     def resolve_frames(
         self,

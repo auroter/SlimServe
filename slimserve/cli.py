@@ -82,7 +82,13 @@ def _parser() -> argparse.ArgumentParser:
         "--seconds", type=float, help="clip length (default: predicted from the prompt)"
     )
     video.add_argument("--seed", type=int, help="random seed (default 42)")
-    video.add_argument("--negative-prompt", help="dev pipeline only")
+    video.add_argument("--negative-prompt", help="dev and hq pipelines only")
+    video.add_argument(
+        "--enhance-prompt",
+        action="store_true",
+        help="rewrite the prompt into the model's caption style first "
+        "(Gemma-4 E2B-it, as upstream's --enhance-prompt)",
+    )
     video.add_argument(
         "--temporal-upscalings",
         type=int,

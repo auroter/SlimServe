@@ -52,6 +52,8 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     ):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
+    if getattr(args, "enhance_prompt", False):
+        body["enhance_prompt"] = True
     if getattr(args, "image", None):
         try:
             body["image"] = Path(args.image).expanduser().read_bytes()
@@ -75,6 +77,13 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         variant="dev" if cfg["pipeline"] in ("dev", "hq") else "distilled",
     )
     prompt = params.pop("prompt")
+    extra = ""
+    if params.pop("enhance_prompt", False):
+        t0 = time.perf_counter()
+        prompt = engine.enhance(prompt)
+        extra = f"enhance {time.perf_counter() - t0:.1f}s, "
+        term.note(f"enhanced prompt: {prompt}")
+        engine.unload_enhancer()
     decoder = params.pop("decoder")
     fast = server.fast_settings(cfg)
     if fast is not None:
@@ -94,6 +103,6 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     )
     term.ok(
         f"{out}  {params['width']}x{params['height']}x{result.num_frames}{auto}  "
-        f"{time.perf_counter() - started:.1f}s  ({spans})"
+        f"{time.perf_counter() - started:.1f}s  ({extra}{spans})"
     )
     return 0

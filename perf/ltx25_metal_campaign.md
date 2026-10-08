@@ -1257,3 +1257,81 @@ tokens, with the LoRA), decode 98 s. Slower than dev's 1513 s: res_2s halves
 the steps but doubles the evaluations, the LoRA adds its +22% to both stages,
 and stage 2 runs 7 forwards instead of 3. A clean clip with the prompt's
 elements in it.
+
+## 28. The prompt enhancer (2026-10-07)
+
+The last item of the component checklist (section 25). Upstream 2.5 enhances
+through a separate generative instruct Gemma (`--prompt-enhancer-gemma-root`;
+the resident LTX fine-tune emits garbage when asked to generate, verified in
+section 25). With the user's go-ahead the profiles now fetch
+`google/gemma-4-E2B-it` (public; 10.25 GB with its vision and audio towers,
+pinned to revision 3e22461f, four files as `shared` entries of the ltx25
+source under `prompt_enhancer/gemma-4-E2B-it/`; the registry's shared branch
+now honours a per-entry `url` like the quant branch does).
+
+**Model** (`enhancer.py`, from transformers 5.10.1 modeling_gemma4.py): the
+language model only (600 of the file's 2011 tensors): 4.25 GiB fp16, 5.0 GiB
+peak during a rewrite, 0.8 s to load. The 262144 x 8960 per-layer embedding
+table (4.7 GiB bf16) never enters memory: its rows are gathered from the
+safetensors file through a memmap (bf16 bits widened to fp32 exactly), about
+a thousand per prompt (the first version loaded it: 8.6 GiB resident). 35 layers, hidden 1536, 8 q heads over 1 kv head; head dim 256 on
+the 28 sliding (window 512) layers, 512 on the 7 global ones whose RoPE is
+"proportional" (quarter of the head rotated at theta 1e6, the rest zero
+frequency; sliding layers theta 1e4, full head). The last 20 layers carry no
+k/v projections: they read the K/V of layer 13 (sliding) or 14 (global) and
+their MLP is 12288 wide instead of 6144 (`use_double_wide_mlp`). Per-layer
+inputs: embed_tokens_per_layer rows (scaled by sqrt(256) in bf16 = 16) plus the token embedding projected by
+per_layer_model_projection, scaled by 1536^-0.5 and RMS-normed per layer, the
+sum times 2^-0.5; each layer ends with h += norm(proj(gelu(gate(h)) * pli))
+and the layer_scalar. Attention scale 1.0 after q/k RMS norms, v RMS-normed
+without a scale, GQA by broadcast. Tied LM head with tanh soft cap 30. Precision
+as the text encoder: GEMM operands fp16, stream and norms fp32 (upstream bf16).
+Decoding: prefill then one token at a time against a K/V cache (shared layers
+index their source layer's cache); sliding layers mask keys <= pos - 512 per
+step, global layers at a single query need no mask.
+
+**Recipe** (ltx_core base_encoder.py `enhance_t2v`, GEMMA4_ENHANCE_GENERATION_KWARGS,
+ltx_pipelines helpers.py `generate_enhanced_prompt` / `clean_response`): system
+prompt `gemma4_t2v_system_prompt.txt` (copied verbatim to `prompts/`), user
+turn `user prompt: <request>`, Gemma-4's chat template with both contents
+trimmed (`<bos><|turn>system\n...<turn|>\n<|turn>user\n...<turn|>\n<|turn>model\n`,
+checked against transformers' apply_chat_template on three fixtures), greedy,
+no_repeat_ngram_size 5 over prompt + generation, max 600 new tokens, stop on
+eos {1, 106, 50} (generation_config.json), curly quotes / dashes to ASCII and a
+leading non-letter run dropped. Upstream also left-pads the input to a
+multiple of 8 (a no-op with the mask and cumsum positions) and passes a seed
+that greedy decoding never uses.
+
+**Parity** (`n11_enhancer_parity.py`; reference transformers fp32 on the CPU,
+Gemma4ForConditionalGeneration.generate with upstream's kwargs; 64-87 s per
+reference generation):
+- prompt ids identical (806 and 811 tokens) once the template trimmed the
+  system prompt's trailing newline (the first run was one token long);
+- first-step logits rel-L2 2.6e-4 and 9.2e-4, same argmax;
+- "a woman walks through a crowded night market": 160 generated tokens
+  identical to the reference (the reference's 161st is its stop token);
+- "an old man repairs a bicycle in his garage while rain falls outside":
+  identical for 118 tokens, then ours takes ` with` where the reference takes
+  `,`: the reference's own top-2 margin there is 0.010 logits (17.879 vs
+  17.869), under our error. Teacher-forced on the reference's full sequence
+  our argmax agrees at all 218 positions (rel-L2 median 3.2e-4, max 2.9e-3).
+  Both continuations are valid captions; greedy decoding is deterministic on
+  a given machine.
+
+**Wiring**: `LTX25Engine.load_enhancer` / `enhance` / `unload_enhancer`;
+`enhance_prompt: true` (boolean, default false as upstream's store_true flag)
+loads the enhancer, rewrites before encoding, drops it again, and reports
+`enhanced_prompt` plus an `enhance` span (load included). Per request rather
+than resident on purpose: a dev HD request already sits near the 88 GiB
+active cap, and 4 GiB more at rest is not worth the 0.8 s. The CLI's
+`--enhance-prompt` prints the rewrite and does the same before loading the
+transformer.
+End to end: `ltx25-distilled --enhance-prompt` at 768x512x49, the 5-sentence
+caption, 60.6 s total. Tests: `test_video_enhancer.py` (template fixture,
+cleanup, n-gram ban, K/V-source map, RoPE flavours, masks),
+`test_video_profiles.py` (flag validation, the rewritten prompt is what the
+pipeline sees, every profile fetches the enhancer from the pinned revision).
+
+Not ported: the I2V variant's vision tower (Gemma sees the conditioning still
+at long side 896, 280 soft tokens, the I2V system prompt). An image request
+is enhanced from its text with the T2V prompt; documented.

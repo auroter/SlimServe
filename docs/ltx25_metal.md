@@ -24,17 +24,20 @@ slimserve ltx25-dfr -p "..." --size 768x512 --seconds 5 --seed 7
 slimserve ltx25-distilled -p "the fox turns and runs" --image fox.png     # image-to-video
 slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
 slimserve ltx25-hq -p "..."                                               # Lightricks' HQ preset (res_2s)
+slimserve ltx25-dev -p "a cat watches rain" --enhance-prompt                # Gemma rewrites the prompt first
 ```
 
 The weights are gated: the Hugging Face token on the machine must have
 accepted `Lightricks/LTX-2.5` and, for `ltx25-dfr`,
-`Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`. `ffmpeg` must be on
-PATH.
+`Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`. The prompt enhancer
+(`google/gemma-4-E2B-it`, 10.3 GB, every profile) is public. `ffmpeg` must be
+on PATH.
 
 Serving API (a clip takes minutes, so it is job-shaped):
 
 ```
 POST   /v1/videos               {"prompt": "...", "size": "1536x1024", "seconds": 5, "seed": 42,
+                                 "enhance_prompt": false,
                                  "image": "<base64 or data: URL>", "image_strength": 1.0}
 GET    /v1/videos/<id>          status (queued | in_progress | completed | failed), progress, timings
 GET    /v1/videos/<id>/content  the mp4
@@ -56,7 +59,7 @@ neither `seconds` nor `num_frames` gets its length from the model's duration
 head (Lightricks' auto-duration: the clip the prompt implies, 1-20 s, snapped
 to the 8k + 1 frame grid, capped at the profile's envelope for that size); the
 job reports the pick as `num_frames` and `predicted_seconds`. `negative_prompt`
-is accepted by `ltx25-dev` only. `decoder` is `diffusion` (default, Lightricks'
+is accepted by `ltx25-dev` and `ltx25-hq` (the guided pipelines). `decoder` is `diffusion` (default, Lightricks'
 recommended decoder: sharper faces, textures and text) or `conv` (about 4x
 faster decode); the CLI flag is `--decoder`. Width and height are multiples of 64, frame
 counts are 8k + 1. Requests larger than the profile's validated clip
@@ -65,6 +68,37 @@ what was measured to fit in memory. There is one GPU, so requests run one at
 a time in arrival order with the weights resident; up to 16 may wait (then
 429). Finished clips are kept under `$SLIMSERVE_VIDEO_DIR`
 (default `~/.cache/slimserve/videos`), the most recent 32.
+
+### Prompt enhancement
+
+`enhance_prompt: true` (CLI `--enhance-prompt`; off by default, as upstream's
+`--enhance-prompt`) rewrites the request into the long caption style the
+model was trained on before anything else runs. LTX-2.5's own text encoder is
+a fine-tune that cannot generate, so Lightricks' pipelines do this with a
+separate generative instruct Gemma (`--prompt-enhancer-gemma-root`); the
+profiles fetch the one their README names, `google/gemma-4-E2B-it`, and run
+its language model in MLX (`enhancer.py`: 35 layers with per-layer input
+embeddings, a shared-K/V tail, 512-token sliding and global attention). It is
+loaded for the rewrite and dropped again (4.3 GiB in fp16, 0.8 s to load; the
+4.7 GiB per-layer embedding table is never loaded, its rows are read from the
+file), so the measured resident set is unchanged. The recipe is
+upstream's exactly: its T2V system prompt (`prompts/`), `user prompt: ...`
+through Gemma's chat template, greedy decoding with no repeated 5-gram, at
+most 600 new tokens, curly quotes and a leading non-letter run cleaned off. A
+rewrite takes about 5 s (a 160-220 token caption) and is reported as the job's
+`enhanced_prompt` and `enhance` span; the CLI prints it.
+
+Checked against transformers' fp32 Gemma-4 on the CPU
+(`perf/ltx25_harness/n11_enhancer_parity.py`): same prompt tokens, first-step
+logits within 2.6e-4 (relative), and teacher-forced logits at every one of 218
+generated positions with the same argmax (median 3.2e-4, max 2.9e-3). Free
+running, one of two test prompts reproduced the reference caption token for
+token; the other followed it for 118 tokens and then took the other side of a
+0.01-logit tie (`,` 17.879 vs ` with` 17.869 in the reference), which is below
+the fp16-vs-fp32 error and gives an equally valid caption. Greedy decoding is
+deterministic on a given machine. Upstream's I2V variant additionally shows
+Gemma the conditioning still through its vision tower, which is not ported: an
+image-to-video request is enhanced from its text with the T2V system prompt.
 
 ### Image-to-video
 
@@ -241,6 +275,7 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 | `vae.py`, `upscaler.py` | conv VAE (slab conv3d, tiling planner), latent upscalers |
 | `image.py` | image-to-video still: decode, CRF-18 round trip, upstream resize/crop/normalize |
 | `duration.py` | the duration head (auto clip length from the prompt) |
+| `enhancer.py`, `prompts/` | the prompt enhancer: Gemma-4 E2B-it language model, greedy decoding, upstream's system prompts |
 | `audio.py`, `mux.py` | audio VAE + vocoder + bandwidth extension; ffmpeg mux |
 | `../server.py`, `../cli.py` | the job queue and HTTP API; `slimserve` integration |
 
@@ -250,9 +285,8 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
   indices, video-to-video reference conditioning); the I2V first-frame path
   is wired but its end-to-end output has not yet been compared against
   upstream on this machine.
-- The prompt enhancer. With the 2.5 Gemma-4 encoder, upstream enhances only
-  through a separate generative instruct Gemma (`--prompt-enhancer-gemma-root`,
-  e.g. Gemma-4 E2B-it); the LTX fine-tuned 12B tower is not a generative
-  model. That second checkpoint is not part of the profile's file set yet.
+- The prompt enhancer's image-aware variant (Gemma-4's vision tower on the
+  I2V still); text requests are enhanced exactly as upstream, image requests
+  from their text alone.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
   hardware and are separate profile records when they exist.

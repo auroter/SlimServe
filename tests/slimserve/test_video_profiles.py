@@ -96,6 +96,27 @@ def test_the_detailing_adapter_downloads_from_its_own_repository():
     )
 
 
+def test_every_profile_fetches_the_prompt_enhancer_from_googles_repo():
+    """The enhancer is google/gemma-4-E2B-it, shared by every quant, pinned to a
+    revision, and kept under the LTX root where checkpoints.path_of finds it."""
+    from slimserve.video.ltx25 import checkpoints
+
+    for pid in VIDEO_IDS + FAST_IDS:
+        shared = [e for e in files_for(_plan(pid)) if e["role"] == "shared"]
+        paths = {e["path"] for e in shared}
+        assert checkpoints.FILES["enhancer"] in paths
+        assert "prompt_enhancer/gemma-4-E2B-it/tokenizer.json" in paths
+        assert "prompt_enhancer/gemma-4-E2B-it/config.json" in paths
+        for e in shared:
+            assert e["url"].startswith(
+                "https://huggingface.co/google/gemma-4-E2B-it/resolve/"
+            )
+            assert "/resolve/main/" not in e["url"]
+            assert e["url"].endswith("/" + e["path"].rsplit("/", 1)[1])
+            assert e["sha256"]
+            assert e["local_dir"] == "ltx-2.5/official"
+
+
 CFG = {
     "pipeline": "distilled",
     "width": 1536,
@@ -186,6 +207,33 @@ def test_negative_prompt_reaches_the_dev_pipeline():
     assert params["negative_prompt"] == "blurry"
 
 
+def test_enhance_prompt_is_opt_in_and_boolean():
+    assert "enhance_prompt" not in server.normalize_request({"prompt": "x"}, CFG)
+    assert "enhance_prompt" not in server.normalize_request(
+        {"prompt": "x", "enhance_prompt": False}, CFG
+    )
+    assert server.normalize_request({"prompt": "x", "enhance_prompt": True}, CFG)[
+        "enhance_prompt"
+    ]
+    with pytest.raises(server.BadRequest):
+        server.normalize_request({"prompt": "x", "enhance_prompt": "yes"}, CFG)
+
+
+def test_enhanced_prompt_is_what_the_pipeline_sees_and_is_reported(tmp_path):
+    engine = _FakeEngine()
+    service = _service(tmp_path, engine)
+    job = service.submit({"prompt": "a cat", "enhance_prompt": True})
+    assert job.done.wait(10) and job.status == "completed", job.error
+    assert engine.prompts == ["ENHANCED a cat"]
+    assert job.params["enhanced_prompt"] == "ENHANCED a cat"
+    assert list(job.timings["spans_s"]) == ["enhance", "stage1"]
+    assert engine.enhancer_loaded is False  # dropped before the pipeline runs
+    plain = service.submit({"prompt": "a dog"})
+    assert plain.done.wait(10)
+    assert engine.prompts[-1] == "a dog" and "enhanced_prompt" not in plain.params
+    service.stop()
+
+
 class _FakeEngine:
     """Records overlap: the real engine must never run two generations at once."""
 
@@ -193,8 +241,17 @@ class _FakeEngine:
         self.active = 0
         self.max_active = 0
         self.calls = 0
+        self.prompts = []
+
+    def enhance(self, prompt):
+        self.enhancer_loaded = True
+        return f"ENHANCED {prompt}"
+
+    def unload_enhancer(self):
+        self.enhancer_loaded = False
 
     def distilled(self, prompt, on_step=None, **params):
+        self.prompts.append(prompt)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         self.calls += 1

@@ -675,7 +675,9 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
         wanted.append(
             {
                 **entry,
-                "url": f"{entry_base}/{entry['path']}",
+                # A shared file from another repository names its own URL and
+                # keeps its own local path (the LTX-2.5 prompt enhancer).
+                "url": entry.get("url") or f"{entry_base}/{entry['path']}",
                 "local_dir": plan.source["local_dir"],
                 "role": "shared",
             }

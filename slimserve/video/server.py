@@ -7,6 +7,7 @@ requests. The API is job-shaped because a clip takes minutes:
 
     POST   /v1/videos                 {"prompt": ..., "size": "1536x1024",
                                        "seconds": 5, "seed": 42,
+                                       "enhance_prompt": false,
                                        "image": <base64 or data: URL>,
                                        "image_strength": 1.0}
     GET    /v1/videos/<id>            status, progress, timings
@@ -15,7 +16,10 @@ requests. The API is job-shaped because a clip takes minutes:
     GET    /v1/models, /health
 
 `"wait": true` in the POST body holds the request open and returns the
-finished job. `image` (image-to-video) is an encoded still (PNG, JPEG, ...)
+finished job. `enhance_prompt` (default false, as upstream's --enhance-prompt)
+has Gemma-4 E2B-it rewrite the request into the model's caption style first;
+the rewritten text is reported as the job's `enhanced_prompt`. `image`
+(image-to-video) is an encoded still (PNG, JPEG, ...)
 as base64, optionally wrapped in a `data:image/...;base64,` URL; it becomes
 the clip's first frame, pinned at `image_strength` (0-1, default 1.0).
 Requests outside the profile's validated envelope are refused: the envelope
@@ -171,6 +175,11 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
                     "spatial_upscalings 2 needs width and height as multiples of 128"
                 )
             params["spatial_upscalings"] = 2
+    if "enhance_prompt" in body:
+        if not isinstance(body["enhance_prompt"], bool):
+            raise BadRequest("enhance_prompt must be true or false")
+        if body["enhance_prompt"]:
+            params["enhance_prompt"] = True
     if body.get("image") is not None:
         params["image"] = decode_image_field(body["image"])
         strength = body.get("image_strength", 1.0)
@@ -307,6 +316,16 @@ class VideoService:
     def _generate(self, engine, job: Job) -> None:
         p = dict(job.params)
         prompt = p.pop("prompt")
+        enhance_s = None
+        if p.pop("enhance_prompt", False):
+            job.progress = {"stage": "enhance"}
+            t0 = time.perf_counter()
+            # loaded for the rewrite and dropped: the resident set stays the
+            # measured one (a dev HD request sits near the active cap)
+            prompt = engine.enhance(prompt)
+            engine.unload_enhancer()
+            enhance_s = time.perf_counter() - t0
+            job.params["enhanced_prompt"] = prompt
 
         def on_step(stage: str, index: int, sigma: float) -> None:
             job.progress = {"stage": stage, "step": index + 1}
@@ -324,8 +343,11 @@ class VideoService:
         engine.render(result, path, seed=p["seed"], decoder=decoder)
         job.path = path
         tm = result.timings
+        spans = {k: round(v, 2) for k, v in tm.spans.items()}
+        if enhance_s is not None:
+            spans = {"enhance": round(enhance_s, 2), **spans}
         job.timings = {
-            "spans_s": {k: round(v, 2) for k, v in tm.spans.items()},
+            "spans_s": spans,
             "peak_gib": round(
                 max((m[0] for m in tm.memory.values()), default=0) / 2**30, 1
             ),
