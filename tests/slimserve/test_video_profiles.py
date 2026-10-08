@@ -3,6 +3,7 @@
 one-at-a-time serving queue. No weights and no GPU are needed here; the
 measured gates live in perf/ltx25_harness/."""
 
+import base64
 import threading
 import time
 
@@ -228,10 +229,32 @@ def test_enhanced_prompt_is_what_the_pipeline_sees_and_is_reported(tmp_path):
     assert job.params["enhanced_prompt"] == "ENHANCED a cat"
     assert list(job.timings["spans_s"]) == ["enhance", "stage1"]
     assert engine.enhancer_loaded is False  # dropped before the pipeline runs
+    assert engine.enhance_images == [None]
     plain = service.submit({"prompt": "a dog"})
     assert plain.done.wait(10)
     assert engine.prompts[-1] == "a dog" and "enhanced_prompt" not in plain.params
+    # an image request is enhanced with the still (upstream enhance_i2v)
+    png = _tiny_png()
+    i2v = service.submit(
+        {
+            "prompt": "a cat",
+            "enhance_prompt": True,
+            "image": base64.b64encode(png).decode(),
+        }
+    )
+    assert i2v.done.wait(10) and i2v.status == "completed", i2v.error
+    assert engine.enhance_images[-1] == png
     service.stop()
+
+
+def _tiny_png() -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 class _FakeEngine:
@@ -243,8 +266,9 @@ class _FakeEngine:
         self.calls = 0
         self.prompts = []
 
-    def enhance(self, prompt):
+    def enhance(self, prompt, image=None):
         self.enhancer_loaded = True
+        self.enhance_images = getattr(self, "enhance_images", []) + [image]
         return f"ENHANCED {prompt}"
 
     def unload_enhancer(self):

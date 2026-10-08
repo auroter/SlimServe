@@ -56,8 +56,9 @@ profiles stay the reference; never tune them by the fast tier's method.
 Done since (2026-10-06/07, ledger sections 25-28): the duration head (auto
 clip length), DFR temporal rounds and the second spatial epilogue, the HQ
 pipeline (res_2s, `ltx25-hq`, section 27), the prompt enhancer (Gemma-4
-E2B-it in MLX, `enhance_prompt` / `--enhance-prompt`, section 28; its
-image-aware I2V variant is not ported). The component checklist is complete.
+E2B-it in MLX, `enhance_prompt` / `--enhance-prompt`, section 28, with the
+image-aware I2V variant through Gemma's vision tower, section 29). The
+component checklist is complete.
 Not done: the opt-in tier, any hand-written Metal GEMM
 (measured headroom on M1-M4 is at most ~10% of a forward; see ledger section
 15), N7 (candidates: na3d / na3d_joint kernels, split-K dispatch, slab conv

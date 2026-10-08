@@ -87,7 +87,8 @@ def _parser() -> argparse.ArgumentParser:
         "--enhance-prompt",
         action="store_true",
         help="rewrite the prompt into the model's caption style first "
-        "(Gemma-4 E2B-it, as upstream's --enhance-prompt)",
+        "(Gemma-4 E2B-it, looking at --image when given; upstream's "
+        "--enhance-prompt)",
     )
     video.add_argument(
         "--temporal-upscalings",

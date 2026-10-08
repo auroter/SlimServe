@@ -96,9 +96,22 @@ running, one of two test prompts reproduced the reference caption token for
 token; the other followed it for 118 tokens and then took the other side of a
 0.01-logit tie (`,` 17.879 vs ` with` 17.869 in the reference), which is below
 the fp16-vs-fp32 error and gives an equally valid caption. Greedy decoding is
-deterministic on a given machine. Upstream's I2V variant additionally shows
-Gemma the conditioning still through its vision tower, which is not ported: an
-image-to-video request is enhanced from its text with the T2V system prompt.
+deterministic on a given machine.
+
+An image request is enhanced with the still, as upstream's `enhance_i2v`:
+Gemma gets the I2V system prompt and sees the image before `User Raw Input
+Prompt: ...`. The still is decoded like the conditioning frame and scaled to a
+896 long side with torch's uint8 bilinear arithmetic (`image.py
+resize_bilinear_uint8`, bit-exact: the vision tower turns the one-level
+rounding differences of a float resize into a 10% change of the soft tokens),
+fitted by Gemma's PIL image processor onto a 48-pixel grid of at most 2520
+patches (bicubic), and encoded by the vision tower (16 layers, 2-D RoPE,
+clamped linears) into at most 280 soft tokens that take the place of the
+`<|image|>` placeholders. The tower runs with fp32 operands (0.2 s per still;
+in fp16 its output is off by 5e-3, in fp32 by 4e-6). On the I2V reference
+(a snowy forest with a fox, a prompt about a woman and a window) ours is
+identical to transformers for all 191 generated tokens: Gemma describes what
+is in the image, then folds the request in.
 
 ### Image-to-video
 
@@ -275,7 +288,7 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 | `vae.py`, `upscaler.py` | conv VAE (slab conv3d, tiling planner), latent upscalers |
 | `image.py` | image-to-video still: decode, CRF-18 round trip, upstream resize/crop/normalize |
 | `duration.py` | the duration head (auto clip length from the prompt) |
-| `enhancer.py`, `prompts/` | the prompt enhancer: Gemma-4 E2B-it language model, greedy decoding, upstream's system prompts |
+| `enhancer.py`, `prompts/` | the prompt enhancer: Gemma-4 E2B-it language model and vision tower, greedy decoding, upstream's system prompts |
 | `audio.py`, `mux.py` | audio VAE + vocoder + bandwidth extension; ffmpeg mux |
 | `../server.py`, `../cli.py` | the job queue and HTTP API; `slimserve` integration |
 
@@ -285,8 +298,5 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
   indices, video-to-video reference conditioning); the I2V first-frame path
   is wired but its end-to-end output has not yet been compared against
   upstream on this machine.
-- The prompt enhancer's image-aware variant (Gemma-4's vision tower on the
-  I2V still); text requests are enhanced exactly as upstream, image requests
-  from their text alone.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
   hardware and are separate profile records when they exist.

@@ -17,8 +17,9 @@ requests. The API is job-shaped because a clip takes minutes:
 
 `"wait": true` in the POST body holds the request open and returns the
 finished job. `enhance_prompt` (default false, as upstream's --enhance-prompt)
-has Gemma-4 E2B-it rewrite the request into the model's caption style first;
-the rewritten text is reported as the job's `enhanced_prompt`. `image`
+has Gemma-4 E2B-it rewrite the request into the model's caption style first
+(looking at the still when there is one); the rewritten text is reported as
+the job's `enhanced_prompt`. `image`
 (image-to-video) is an encoded still (PNG, JPEG, ...)
 as base64, optionally wrapped in a `data:image/...;base64,` URL; it becomes
 the clip's first frame, pinned at `image_strength` (0-1, default 1.0).
@@ -322,7 +323,7 @@ class VideoService:
             t0 = time.perf_counter()
             # loaded for the rewrite and dropped: the resident set stays the
             # measured one (a dev HD request sits near the active cap)
-            prompt = engine.enhance(prompt)
+            prompt = engine.enhance(prompt, p.get("image"))
             engine.unload_enhancer()
             enhance_s = time.perf_counter() - t0
             job.params["enhanced_prompt"] = prompt

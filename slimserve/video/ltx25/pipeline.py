@@ -503,11 +503,12 @@ class LTX25Engine:
             self.enhancer = PromptEnhancer(self.root).load()
         return self.enhancer
 
-    def enhance(self, prompt: str) -> str:
+    def enhance(self, prompt: str, image: str | bytes | None = None) -> str:
         """Upstream's --enhance-prompt: Gemma-4 E2B-it rewrites the request into
-        the caption style the model was trained on (~4 GiB while loaded, 1.3 s
-        to load, ~5 s per rewrite)."""
-        return self.load_enhancer().enhance(prompt)
+        the caption style the model was trained on (~4.5 GiB while loaded, ~1 s
+        to load, ~5 s per rewrite). With the conditioning still it describes
+        what it sees (enhance_i2v)."""
+        return self.load_enhancer().enhance(prompt, image)
 
     def unload_enhancer(self) -> None:
         if self.enhancer is not None:

@@ -173,6 +173,57 @@ def resize_bilinear(image: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
     return x[:, c0] * (1.0 - lc)[None, :, None] + x[:, c1] * lc[None, :, None]
 
 
+def _uint8_taps(n_in: int, n_out: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """torch's int16 fixed-point bilinear taps for a uint8 axis
+    (UpSampleKernel.cpp _compute_indices_min_size_weights and
+    _compute_index_ranges_int16_weights, antialias=False): per output index the
+    first source index and two weights (the second folded into the first at the
+    last pixel), weights rounded to `precision` fractional bits, where precision
+    is the largest keeping twice the biggest weight below 2^15."""
+    i0, _i1, lam = _bilinear_weights(n_in, n_out)
+    lam = lam.astype(np.float64)
+    w = np.stack([1.0 - lam, lam], axis=1)
+    last = i0 == n_in - 1  # only one source pixel: both taps land on it
+    w[last] = [1.0, 0.0]
+    wt_max = w.max()
+    precision = 0
+    while precision < 22:
+        if int(0.5 + wt_max * (1 << (precision + 1))) >= 1 << 15:
+            break
+        precision += 1
+    q = np.floor(0.5 + w * (1 << precision)).astype(np.int64)  # v >= 0 here
+    return i0, q, precision
+
+
+def _uint8_pass(x: np.ndarray, n_out: int, axis: int) -> np.ndarray:
+    i0, q, precision = _uint8_taps(x.shape[axis], n_out)
+    i1 = np.minimum(i0 + 1, x.shape[axis] - 1)
+    a = np.moveaxis(x, axis, 0).astype(np.int64)
+    shape = (-1,) + (1,) * (a.ndim - 1)
+    acc = (
+        (1 << (precision - 1))
+        + a[i0] * q[:, 0].reshape(shape)
+        + a[i1] * q[:, 1].reshape(shape)
+    )
+    out = np.clip(acc >> precision, 0, 255).astype(np.uint8)
+    return np.moveaxis(out, 0, axis)
+
+
+def resize_bilinear_uint8(image: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
+    """(H, W, C) uint8 -> (new_h, new_w, C) uint8 exactly as torch interpolates
+    a uint8 tensor (bilinear, align_corners=False, no antialias): a horizontal
+    pass then a vertical pass, each in int16 fixed point rounding to uint8
+    (UpSampleKernelAVXAntialias.h / UpSampleKernelNEONAntialias.h, the generic
+    separable kernel has the same arithmetic). Differs from float bilinear
+    rounded in about a tenth of the pixels by one level."""
+    x = np.asarray(image, dtype=np.uint8)
+    if x.shape[1] != new_w:
+        x = _uint8_pass(x, new_w, 1)
+    if x.shape[0] != new_h:
+        x = _uint8_pass(x, new_h, 0)
+    return x
+
+
 def resize_and_center_crop(image: np.ndarray, height: int, width: int) -> np.ndarray:
     """(H, W, C) -> (height, width, C) float32: scale to fill, then center crop."""
     new_h, new_w, top, left = resize_plan(image.shape[0], image.shape[1], height, width)

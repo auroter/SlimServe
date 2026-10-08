@@ -80,7 +80,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     extra = ""
     if params.pop("enhance_prompt", False):
         t0 = time.perf_counter()
-        prompt = engine.enhance(prompt)
+        prompt = engine.enhance(prompt, params.get("image"))
         extra = f"enhance {time.perf_counter() - t0:.1f}s, "
         term.note(f"enhanced prompt: {prompt}")
         engine.unload_enhancer()

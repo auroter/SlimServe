@@ -1332,6 +1332,83 @@ cleanup, n-gram ban, K/V-source map, RoPE flavours, masks),
 `test_video_profiles.py` (flag validation, the rewritten prompt is what the
 pipeline sees, every profile fetches the enhancer from the pinned revision).
 
-Not ported: the I2V variant's vision tower (Gemma sees the conditioning still
-at long side 896, 280 soft tokens, the I2V system prompt). An image request
-is enhanced from its text with the T2V prompt; documented.
+The I2V variant (the vision tower) followed in section 29.
+
+## 29. The prompt enhancer sees the still (2026-10-08)
+
+The user's standard is the whole capability, so the image-aware variant
+followed: upstream `enhance_i2v` (base_encoder.py) gives Gemma the I2V system
+prompt and a user turn of the image then `User Raw Input Prompt: <request>.`;
+`generate_enhanced_prompt` (helpers.py) first scales the decoded still to a
+896 long side (`resize_aspect_ratio_preserving`, bilinear on the uint8
+tensor) and the processor (gemma_assets.py picks `Gemma4ImageProcessorPil`
+over the torchvision one on purpose: "shifts I2V enhance goldens") fits it onto
+a 48-pixel grid of at most 2520 16x16 patches (`get_aspect_ratio_preserving_size`,
+bicubic through PIL, /255, no normalization) and expands the template's one
+`<|image|>` into `<|image>` + one `<|image|>` per soft token + `<image|>`.
+
+**Model** (modeling_gemma4.py, vision path): patch embedder (pixels to
+[-1, 1], linear 768 -> 768, plus x and y rows of a (2, 10240, 768) position
+table), 16 bidirectional encoder layers of hidden 768 with 12 heads of 64,
+q/k RMS-normed with scale and v without, attention scale 1.0, 2-D RoPE (base
+100, 16 frequencies per axis over each half of the head; the first half turns
+with the patch column, the second with the row), gelu-tanh MLP of 3072, and
+every linear a `Gemma4ClippableLinear` whose input and output are clamped to
+bounds stored in the checkpoint (`use_clipped_linears`; they are real, e.g.
+[-91, 90]). The pooler averages 3x3 patch blocks (to <= 280 tokens) and
+scales by sqrt(768) in fp32 (the values reach 4e4); `embed_vision` RMS-norms
+without scale and projects 768 -> 1536. In the text stack the soft tokens
+replace the placeholders' embeddings; those positions keep the pad token's
+per-layer embedding while the per-layer *projection* is of the merged
+embeddings (Gemma4Model.forward merges, Gemma4TextModel projects). E2B's
+`use_bidirectional_attention` is unset, so image tokens attend causally like
+text. Padding patches are never materialized here: the encoder masks them as
+keys and the pooler drops them, so the result on the valid patches alone is
+the same. The audio tower stays in the file.
+
+**Two things that cost parity, both fixed:**
+1. *The still's rounding.* A float bilinear resize rounded to uint8 differs
+   from torch's uint8 interpolate in 10.3% of pixels by one level, and that
+   alone moved the soft tokens by 8% rel-L2 (max 62% on a token) and the
+   caption diverged after 51 tokens. torch's uint8 path (both the AVX2 kernel
+   Lightricks' Linux boxes hit and the NEON one on this Mac; the generic
+   separable fallback has the same arithmetic) is Pillow's: a horizontal pass
+   then a vertical pass, int16 weights `round(w * 2^p)` with `p` the largest
+   precision keeping `2 * max(w)` under 2^15 (14 for bilinear), accumulate
+   `2^(p-1) + sum(w * pixel)`, shift by `p`, clamp, uint8 between the passes.
+   `image.resize_bilinear_uint8` reproduces it bit for bit (0 differing
+   pixels on six shapes including the still, up- and down-scaling, odd sizes).
+2. *The tower's operand precision.* With fp16 GEMM operands the soft tokens
+   were 4.9e-3 rel-L2 from the fp32 reference (the clamps and the sqrt(768)
+   scale amplify) and the caption diverged after 71 tokens; with fp32
+   operands 4.4e-6, at the same 0.2 s per still (0.17 B parameters). The tower
+   runs in fp32; the language model keeps the fp16/fp32 policy.
+
+**Parity** (`n11_enhancer_parity.py ref-i2v` / `ours-i2v`, transformers fp32
+on the CPU with the processor built as gemma_assets builds it; the still is
+`n3/hd_distilled/f60.png`, 1152x768, a snowy forest with a fox):
+- the 896 still identical (0 pixels), the 2340 patches identical (6e-8), the
+  260 soft tokens rel-L2 4.4e-6 (max per token 6e-5);
+- prompt ids identical (1253 tokens: 787 of system prompt, 262 of image);
+- first-step logits rel-L2 3.3e-4, same argmax;
+- "the woman turns and walks toward the window" (deliberately not what the
+  image shows): all 191 generated tokens identical to the reference. Gemma
+  describes the image ("Extreme wide shot frames a vast, snow-covered forest
+  ... a small, bright orange fox is visible in the middle ground") and then
+  folds the request in;
+- "the fox trots forward through the snow" on `n2/e2e_4/f60.png` (768x512):
+  soft tokens 2.7e-6, prompt ids identical (1252), first logits 4.2e-4, all
+  182 generated tokens identical;
+- teacher-forced on the first reference's 192 positions: rel-L2 median
+  4.6e-4, max 3.2e-3, one argmax flip at a position where the reference's own
+  top-2 margin is 0.020 logits (free running, that step matched).
+
+End to end: `ltx25-distilled --image f60.png --enhance-prompt` at 768x512x49,
+58.2 s, `enhance 7.1s` (load, the still, a 5-sentence caption of the fox in
+the forest the image shows). `enhance_prompt` on an image request passes the
+request's still to the enhancer in both the server and the CLI
+(`test_video_profiles.py`); `test_video_enhancer.py` covers the still's
+geometry, the patch grid against transformers' values, patch order, the
+placeholder expansion, the 2-D RoPE split and the uint8 resize arithmetic.
+The enhancer's resident set grows by the tower: 4.9 GiB while loaded (fp32
+tower 0.7 GiB), still per request.
