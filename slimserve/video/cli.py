@@ -76,6 +76,52 @@ def _add_images(body: dict[str, Any], args: Any) -> None:
     body["images"] = stills
 
 
+def _add_guidance(body: dict[str, Any], args: Any) -> None:
+    """Upstream's guider flags -> `steps`, `guidance`, `lora_strengths`."""
+    if getattr(args, "num_inference_steps", None) is not None:
+        body["steps"] = args.num_inference_steps
+    guidance: dict[str, dict[str, Any]] = {}
+    for modality, other in (("video", "a2v"), ("audio", "v2a")):
+        fields = {
+            "cfg": getattr(args, f"{modality}_cfg_guidance_scale", None),
+            "stg": getattr(args, f"{modality}_stg_guidance_scale", None),
+            "stg_blocks": getattr(args, f"{modality}_stg_blocks", None),
+            "rescale": getattr(args, f"{modality}_rescale_scale", None),
+            "modality": getattr(args, f"{other}_guidance_scale", None),
+            "skip_step": getattr(args, f"{modality}_skip_step", None),
+        }
+        fields = {k: v for k, v in fields.items() if v is not None}
+        if fields:
+            guidance[modality] = fields
+    if guidance:
+        body["guidance"] = guidance
+    s1 = getattr(args, "distilled_lora_strength_stage_1", None)
+    s2 = getattr(args, "distilled_lora_strength_stage_2", None)
+    if s1 is not None or s2 is not None:
+        from slimserve.video.ltx25 import pipeline as pl
+
+        body["lora_strengths"] = [
+            pl.HQ_LORA_STAGE_1 if s1 is None else s1,
+            pl.HQ_LORA_STAGE_2 if s2 is None else s2,
+        ]
+
+
+def _add_loras(body: dict[str, Any], args: Any) -> None:
+    """--lora PATH [STRENGTH], repeatable (upstream's form)."""
+    groups = getattr(args, "lora", None) or []
+    loras = []
+    for group in groups:
+        if not 1 <= len(group) <= 2:
+            raise ValueError("--lora takes PATH [STRENGTH]")
+        try:
+            strength = float(group[1]) if len(group) > 1 else 1.0
+        except ValueError as error:
+            raise ValueError(f"--lora {group[0]}: {error}") from error
+        loras.append({"path": str(Path(group[0]).expanduser()), "strength": strength})
+    if loras:
+        body["loras"] = loras
+
+
 def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     from slimserve.video import server
     from slimserve.video.ltx25.pipeline import LTX25Engine
@@ -96,6 +142,8 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         body["enhance_prompt"] = True
     try:
         _add_images(body, args)
+        _add_guidance(body, args)
+        _add_loras(body, args)
         params = server.normalize_request(body, cfg)
     except ValueError as error:
         term.fail(str(error))
@@ -118,12 +166,13 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     fast = server.fast_settings(cfg)
     if fast is not None:
         params["fast"] = fast
-    result = getattr(engine, cfg["pipeline"])(
-        prompt,
-        keep_text=False,
-        on_step=lambda stage, i, s: term.note(f"{stage} step {i + 1}"),
-        **params,
-    )
+    with engine.user_loras(params.pop("loras", None)):
+        result = getattr(engine, cfg["pipeline"])(
+            prompt,
+            keep_text=False,
+            on_step=lambda stage, i, s: term.note(f"{stage} step {i + 1}"),
+            **params,
+        )
     engine.render(result, out, seed=params["seed"], decoder=decoder)
     spans = ", ".join(f"{k} {v:.1f}s" for k, v in result.timings.spans.items())
     auto = (

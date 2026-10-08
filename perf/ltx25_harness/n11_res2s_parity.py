@@ -111,7 +111,7 @@ def ours(out, ref_path):
     v, a, wv, wa = inputs()
     wv_m, wa_m = mx.array(wv), mx.array(wa)
 
-    def denoise(video, audio, vx, ax, sigma):
+    def denoise(video, audio, vx, ax, sigma, step=None):
         return 0.5 * mx.tanh(vx @ wv_m) + 0.3 * vx, 0.5 * mx.tanh(ax @ wa_m) + 0.3 * ax
 
     r = np.load(ref_path)

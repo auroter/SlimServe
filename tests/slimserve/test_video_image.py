@@ -232,7 +232,7 @@ def test_conditioned_tokens_survive_the_samplers():
     video = sampling.condition_latent_frame(video, latent)
     audio = sampling.noised_state((1, 5, c), sampling.audio_positions(5), 2)
 
-    def denoise(video, audio, vx, ax, sigma):
+    def denoise(video, audio, vx, ax, sigma, step=None):
         return mx.zeros_like(vx), mx.zeros_like(ax)
 
     vx, _ = sampling.euler_ancestral_loop(

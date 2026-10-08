@@ -121,6 +121,63 @@ def _parser() -> argparse.ArgumentParser:
         help="strength of the first --image, 0-1 (default 1.0)",
     )
     video.add_argument(
+        "--lora",
+        nargs="+",
+        action="append",
+        metavar=("PATH", "STRENGTH"),
+        help="a user LoRA (.safetensors, ComfyUI LTXV layout) and optional "
+        "strength (default 1.0), repeatable; applied in every stage",
+    )
+    video.add_argument(
+        "--num-inference-steps",
+        type=int,
+        help="guided pipelines: denoising steps of the guided stage (default 30; "
+        "hq 15)",
+    )
+    for modality, other in (("video", "a2v"), ("audio", "v2a")):
+        video.add_argument(
+            f"--{modality}-cfg-guidance-scale",
+            type=float,
+            help=f"guided pipelines: {modality} CFG scale (1.0 = off)",
+        )
+        video.add_argument(
+            f"--{modality}-stg-guidance-scale",
+            type=float,
+            help=f"guided pipelines: {modality} STG scale (0.0 = off)",
+        )
+        video.add_argument(
+            f"--{modality}-stg-blocks",
+            type=int,
+            nargs="+",
+            help=f"guided pipelines: transformer blocks perturbed for {modality} STG",
+        )
+        video.add_argument(
+            f"--{modality}-rescale-scale",
+            type=float,
+            help=f"guided pipelines: {modality} guidance rescale, 0-1",
+        )
+        video.add_argument(
+            f"--{other}-guidance-scale",
+            type=float,
+            help=f"guided pipelines: {other} cross-modality guidance scale (1.0 = off)",
+        )
+        video.add_argument(
+            f"--{modality}-skip-step",
+            type=int,
+            help=f"guided pipelines: run the {modality} stream only on every "
+            "(N + 1)th step (0 = every step)",
+        )
+    video.add_argument(
+        "--distilled-lora-strength-stage-1",
+        type=float,
+        help="hq only: distilled LoRA strength in stage 1 (default 0.25)",
+    )
+    video.add_argument(
+        "--distilled-lora-strength-stage-2",
+        type=float,
+        help="hq only: distilled LoRA strength in stage 2 (default 0.5)",
+    )
+    video.add_argument(
         "--decoder",
         choices=["diffusion", "conv"],
         help=(

@@ -7,6 +7,10 @@
   guided-ref OUT.npz / guided-ours OUT.npz REF.npz [fp32]: one dev guided step
        (CFG 3/7, STG 1 on block 28, modality 3, rescale 0.7) through upstream's
        BatchedPerturbationConfig + MultiModalGuider vs our GuidedDenoiser; compares x0.
+  skip-ref OUT.npz / skip-ours OUT.npz REF.npz [fp32]: the skip_step forward: one
+       modality disabled (upstream Modality.enabled False) -> its stream is left
+       as its input, the other still cross-attends to it. Two cases: audio off
+       (video output compared), video off (audio output compared).
 
 Both sides see identical latent tokens (upstream's own patchify order), identical
 random text context (the text path is audited separately), the first latent
@@ -79,7 +83,7 @@ def _upstream_states():
     return vstate, astate
 
 
-def _upstream_model():
+def _upstream_model(dtype=None):
     import torch
 
     sys.path[:0] = [f"{UP}/ltx-core/src"]
@@ -94,7 +98,9 @@ def _upstream_model():
         model_path=DIT,
         model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
     )
-    return builder.build(device=torch.device("cpu"), dtype=torch.float32).eval()
+    return builder.build(
+        device=torch.device("cpu"), dtype=dtype or torch.float32
+    ).eval()
 
 
 def guided_ref(out):
@@ -322,6 +328,91 @@ def ours(out, ref_path, operand="fp16"):
     np.savez(out, video=np.array(v), audio=np.array(a))
 
 
+def skip_ref(out, dtype="fp32"):
+    """`dtype` bf16: upstream's own serving precision, to size its error."""
+    import torch
+
+    sys.path[:0] = [f"{UP}/ltx-core/src"]
+    from ltx_core.model.transformer.modality import Modality
+
+    _, _, vtext, atext = inputs()
+    vstate, astate = _upstream_states()
+    sigma = torch.tensor([SIGMA])
+
+    def mod(state, ctx, enabled):
+        return Modality(
+            latent=state.latent,
+            sigma=sigma,
+            timesteps=state.denoise_mask * SIGMA,
+            positions=state.positions,
+            context=torch.from_numpy(ctx),
+            context_mask=None,
+            attention_mask=None,
+            keyframes_mask=state.keyframes_mask,
+            enabled=enabled,
+        )
+
+    model = _upstream_model(torch.bfloat16 if dtype == "bf16" else None)
+    if dtype == "bf16":
+        cast = lambda m: Modality(  # noqa: E731
+            **{
+                k: (v.to(torch.bfloat16) if k in ("latent", "context") else v)
+                for k, v in m.__dict__.items()
+            }
+        )
+        mod_ = mod
+        mod = lambda s, c, e: cast(mod_(s, c, e))  # noqa: E731
+    with torch.inference_mode():
+        vx, _ = model(mod(vstate, vtext, True), mod(astate, atext, False), None)
+        _, ax = model(mod(vstate, vtext, False), mod(astate, atext, True), None)
+    np.savez(
+        out,
+        video=vx.float().numpy(),  # audio disabled
+        audio=ax.float().numpy(),  # video disabled
+        video_tokens=vstate.latent.numpy(),
+        audio_tokens=astate.latent.numpy(),
+        keyframes_mask=vstate.keyframes_mask.numpy(),
+    )
+    print("saved", vx.shape, ax.shape)
+
+
+def skip_ours(out, ref_path, operand="fp16"):
+    import mlx.core as mx
+
+    from slimserve.video.ltx25 import checkpoints, sampling
+    from slimserve.video.ltx25 import dit as dit_mod
+    from slimserve.video.ltx25.dit import DiTConfig, LTX25DiT
+
+    if operand == "fp32":
+        dit_mod.F = mx.float32
+        checkpoints.cast_operands.__defaults__ = (
+            mx.float32,
+        ) + checkpoints.cast_operands.__defaults__[1:]
+    r = np.load(ref_path)
+    _, _, vtext, atext = inputs()
+    vt, at = mx.array(r["video_tokens"]), mx.array(r["audio_tokens"])
+    weights, _, tcfg = checkpoints.load_dit("dev")
+    model = LTX25DiT(weights, DiTConfig.from_checkpoint(tcfg))
+    common = dict(
+        video_keyframes_mask=mx.array(r["keyframes_mask"]),
+    )
+    args = (
+        vt,
+        at,
+        mx.array([SIGMA]),
+        mx.array(vtext),
+        mx.array(atext),
+        sampling.video_positions(F, H, W, FPS),
+        sampling.audio_positions(at.shape[1]),
+    )
+    v, a_none = model(*args, run_audio=False, **common)
+    assert a_none is None
+    v_none, a = model(*args, run_video=False, **common)
+    assert v_none is None
+    mx.eval(v, a)
+    np.savez(out, video=np.array(v), audio=np.array(a))
+
+
 def cmp(a, b):
     ra, rb = np.load(a), np.load(b)
     for key in ("video", "audio"):
@@ -337,6 +428,8 @@ if __name__ == "__main__":
     {
         "ref": ref,
         "ours": ours,
+        "skip-ref": skip_ref,
+        "skip-ours": skip_ours,
         "cmp": cmp,
         "guided-ref": guided_ref,
         "guided-ours": guided_ours,

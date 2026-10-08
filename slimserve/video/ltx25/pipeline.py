@@ -9,9 +9,11 @@ resolution (3 Euler steps), with the same distilled transformer in both.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 import numpy as np
@@ -118,6 +120,7 @@ class Denoiser:
         ax: mx.array,
         sigma: float,
         step_cache: StepCache | None = None,
+        step: int | None = None,
     ):
         b = vx.shape[0]
         t = mx.full((b,), sigma, dtype=G)
@@ -168,6 +171,7 @@ class GuidedDenoiser:
     ):
         self.dit, self.video_g, self.audio_g, self.batched = dit, video, audio, batched
         self.video_tiles = video_tiles
+        self.last: tuple[mx.array, mx.array] | None = None  # for skip_step
         kinds = ["cond"]
         if video.cfg != 1 or audio.cfg != 1:
             kinds.append("neg")
@@ -213,6 +217,8 @@ class GuidedDenoiser:
         sigma: float,
         rows: slice,
         step_cache: StepCache | None = None,
+        run_video: bool = True,
+        run_audio: bool = True,
     ):
         n = len(range(*rows.indices(self.passes)))
         if n == self.passes:  # distinct text rows, mapped per batch row
@@ -246,10 +252,16 @@ class GuidedDenoiser:
             share_from=self.share if n == self.passes else None,
             video_tiles=self.video_tiles,
             step_cache=step_cache if n == self.passes else None,
+            run_video=run_video,
+            run_audio=run_audio,
         )
         return (
-            x0_from_velocity(rep(vx), v, t if vt is None else vt),
-            x0_from_velocity(rep(ax), a, t if at is None else at),
+            None
+            if v is None
+            else x0_from_velocity(rep(vx), v, t if vt is None else vt),
+            None
+            if a is None
+            else x0_from_velocity(rep(ax), a, t if at is None else at),
         )
 
     def __call__(
@@ -260,32 +272,59 @@ class GuidedDenoiser:
         ax: mx.array,
         sigma: float,
         step_cache: StepCache | None = None,
+        step: int | None = None,
     ):
+        # upstream _guided_denoise: a modality whose guider skips this step
+        # keeps its last x0 (both skipped: no forward at all)
+        run_v, run_a = not self.video_g.skips(step), not self.audio_g.skips(step)
+        if not (run_v or run_a):
+            if self.last is None:
+                raise ValueError("skip_step cannot skip the first step")
+            return self.last
         if self.batched:
             v0, a0 = self._forward(
-                video, audio, vx, ax, sigma, slice(0, self.passes), step_cache
+                video,
+                audio,
+                vx,
+                ax,
+                sigma,
+                slice(0, self.passes),
+                step_cache,
+                run_v,
+                run_a,
             )
         else:
             parts = [
-                self._forward(video, audio, vx, ax, sigma, slice(i, i + 1))
+                self._forward(
+                    video, audio, vx, ax, sigma, slice(i, i + 1), None, run_v, run_a
+                )
                 for i in range(self.passes)
             ]
-            v0 = mx.concatenate([p[0] for p in parts], axis=0)
-            a0 = mx.concatenate([p[1] for p in parts], axis=0)
+            cat = lambda k: (  # noqa: E731
+                None
+                if parts[0][k] is None
+                else mx.concatenate([p[k] for p in parts], axis=0)
+            )
+            v0, a0 = cat(0), cat(1)
         rows = {k: i for i, k in enumerate(self.kinds)}
 
         def term(x: mx.array, kind: str) -> mx.array | None:
             i = rows.get(kind)
             return None if i is None else x[i : i + 1]
 
-        return (
-            self.video_g.combine(
-                v0[0:1], term(v0, "neg"), term(v0, "stg"), term(v0, "mod")
-            ),
-            self.audio_g.combine(
-                a0[0:1], term(a0, "neg"), term(a0, "stg"), term(a0, "mod")
-            ),
+        def guided(x: mx.array | None, g: sampling.Guidance, last) -> mx.array:
+            if x is None:
+                if last is None:
+                    raise ValueError("skip_step cannot skip the first step")
+                return last
+            return g.combine(x[0:1], term(x, "neg"), term(x, "stg"), term(x, "mod"))
+
+        prev = self.last or (None, None)
+        self.last = (
+            guided(v0, self.video_g, prev[0]),
+            guided(a0, self.audio_g, prev[1]),
         )
+        return self.last
 
 
 class TiledDenoiser:
@@ -334,7 +373,7 @@ class TiledDenoiser:
                 (mx.array(idx.astype(np.int32)), mx.array(weight)[None, :, None], t)
             )
 
-    def __call__(self, video, audio, vx, ax, sigma, step_cache=None):
+    def __call__(self, video, audio, vx, ax, sigma, step_cache=None, step=None):
         n = vx.shape[1]
         out_v = mx.zeros_like(vx)
         out_a = None
@@ -449,6 +488,34 @@ class LTX25Engine:
         self.enhancer = None
         self.temporal_upscaler = None
         self.decoder = decoder
+        self.user_lora_cache: dict[str, Any] = {}  # path -> loaded Lora
+
+    # ---- user LoRAs (upstream --lora PATH [STRENGTH]) ------------------------
+    @contextmanager
+    def user_loras(self, specs: list[tuple[str, float]] | None) -> Iterator[None]:
+        """Attach user adapters to the transformer for one request: every stage
+        of every pipeline runs with them (upstream passes `loras` to each
+        DiffusionStage, the official distilled / detailing adapters on top).
+        Loaded files are kept by path."""
+        if not specs:
+            yield
+            return
+        from slimserve.video.ltx25.lora import Lora
+
+        dit = self.load_dit()
+        attached = []
+        try:
+            for path, strength in specs:
+                key = str(Path(path).expanduser().resolve())
+                lora = self.user_lora_cache.get(key)
+                if lora is None:
+                    lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+                lora.attach(dit, strength)
+                attached.append(lora)
+            yield
+        finally:
+            for lora in attached:
+                lora.detach(dit)
 
     # ---- components -------------------------------------------------------
     def load_text(self):
@@ -1739,6 +1806,8 @@ class LTX25Engine:
         image_strength: float = 1.0,
         max_num_frames: int | None = None,
         images: list[sampling.Still] | None = None,
+        lora_stage_1: float = HQ_LORA_STAGE_1,
+        lora_stage_2: float = HQ_LORA_STAGE_2,
     ) -> Result:
         """Lightricks' TI2VidTwoStagesHQPipeline: the dev transformer with the
         distilled LoRA at 0.25, 15 guided res_2s steps (CFG 3 / 7, no STG,
@@ -1746,7 +1815,8 @@ class LTX25Engine:
         half resolution; 2x latent upscale; 3 res_2s steps at full resolution
         with the LoRA at 0.5, audio re-noised and refined alongside (it ships
         from stage 2). The SDE noise streams are seeded from the request seed
-        (upstream leaves them at their default seed)."""
+        (upstream leaves them at their default seed). `lora_stage_1` /
+        `lora_stage_2` are upstream's --distilled-lora-strength-stage-1 / -2."""
         if self.variant != "dev":
             raise ValueError("the HQ pipeline needs LTX25Engine(variant='dev')")
         tm = Timings()
@@ -1791,7 +1861,7 @@ class LTX25Engine:
                 (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
             )
             guided = GuidedDenoiser(dit, cond, neg, video_guidance, audio_guidance)
-            lora.attach(dit, HQ_LORA_STAGE_1)
+            lora.attach(dit, lora_stage_1)
             try:
                 v1, a1 = sampling.res2s_loop(
                     guided,
@@ -1835,7 +1905,7 @@ class LTX25Engine:
                 initial=a1,
                 bf16_noise=self.bf16_noise,
             )
-            lora.attach(dit, HQ_LORA_STAGE_2)
+            lora.attach(dit, lora_stage_2)
             try:
                 v2, a2 = sampling.res2s_loop(
                     Denoiser(dit, *cond),

@@ -1520,3 +1520,49 @@ one-stage 227.4 s (2.18x; the same shot, the fox placed differently, 14.8
 dB from exact at frame 48 - without a stage 2 to re-anchor on, fewer steps
 move the one-stage result further than dev's). Contact sheet
 `n12/compare_fast.png`.
+
+## 32. Per-request guidance, skip_step, user LoRAs (2026-10-08)
+
+**Guidance knobs.** The guided pipelines take `steps` and `guidance`
+({video, audio} x {cfg, stg, stg_blocks, rescale, modality, skip_step};
+upstream's MultiModalGuiderParams with modality_scale = a2v on video, v2a on
+audio) over the pipeline's defaults (dev / hq), hq its two distilled-LoRA
+strengths; CLI flags under upstream's names. The fast tier's guidance
+overrides stack on the request's.
+
+**skip_step** (`Guidance.skips`, upstream should_skip_step: step %
+(N + 1) != 0): the sampler loops hand the step index to the denoiser
+(res_2s: the midpoint evaluation is index 0 as upstream, the terminal x0 is
+n_steps). `GuidedDenoiser` keeps its last combined x0 per modality and, on a
+skipped modality, runs the forward with that stream disabled
+(`LTX25DiT(run_video / run_audio)`: no self-attention, text cross-attention,
+cross update or feed-forward for it, its hidden state stays the patchified
+input, the other modality still cross-attends to it; its output is None) and
+returns the kept x0; both skipped: no forward. The first-block step cache is
+off on a video-skipped step (it keys on the video residual).
+
+Parity (`n8_dit_parity.py skip-ref / skip-ours`, upstream LTXModel on the CPU
+with Modality.enabled False, the 3x8x12 forward): fp32 operands video
+6.5e-6 / audio 3.7e-6 (the plain forward: 5.4e-6 / 3.9e-6) - the port is
+exact. fp16 operands: audio (video off) 1.5e-3 as the plain forward; video
+(audio off) 1.55e-2, ten times the plain forward's 1.6e-3. Not one GEMM
+(upcasting any of them changes nothing, `n12/skip_probe*.py`): the
+configuration is sensitive to activation rounding. Upstream's own bf16 in
+the same configuration is 6.4e-2 (video) / 2.0e-2 (audio) from its fp32, so
+ours is 4x / 13x closer to the fp32 truth than the reference serving
+precision; the fp16 / fp32 policy stays.
+
+**User LoRAs** (`--lora PATH [STRENGTH]`, API `loras`): `Lora.from_path`,
+the same loader as the official adapters (diffusion_model. prefix stripped,
+delta strength * B @ A, no alpha scaling: upstream's fuse_loras ignores
+alpha, and the alpha == rank check went with it), attached around the whole
+request (`LTX25Engine.user_loras`) so every stage of every pipeline carries
+them under the official ones, as upstream passes `loras` to each stage;
+loaded files cached by path.
+
+Smoke (`n12/dev_skip_lora.*`): dev 512x320x33, `--video-skip-step 1
+--num-inference-steps 20 --video-cfg-guidance-scale 2.5 --lora <the
+distilled adapter> 0.25`: 71 s, stage 1 34 s (10 of 20 steps audio-only), a
+clean frame. Tests: `test_video_guidance.py` (the modulo rule, the x0 reuse
+and run flags on a fake DiT, request parsing and defaults, the adapter
+loader and attach/detach, CLI groups).

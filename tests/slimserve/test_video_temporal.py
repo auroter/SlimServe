@@ -155,7 +155,7 @@ def test_res2s_coefficients_match_the_exponential_integrator():
 def test_res2s_loop_ends_on_the_terminal_x0_and_draws_twice_per_modality_per_step():
     calls = []
 
-    def denoise(video, audio, vx, ax, sigma):
+    def denoise(video, audio, vx, ax, sigma, step=None):
         calls.append(sigma)
         return vx * 0.0, ax * 0.0  # x0 = 0 everywhere
 

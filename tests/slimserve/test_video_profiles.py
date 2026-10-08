@@ -286,6 +286,12 @@ class _FakeEngine:
         self.enhance_images = getattr(self, "enhance_images", []) + [image]
         return f"ENHANCED {prompt}"
 
+    def user_loras(self, specs):
+        from contextlib import nullcontext
+
+        self.loras = getattr(self, "loras", []) + [specs]
+        return nullcontext()
+
     def unload_enhancer(self):
         self.enhancer_loaded = False
 
@@ -420,7 +426,7 @@ def test_samplers_reach_the_denoisers_answer():
         (1, 6, 4), mx.zeros((1, 6, 3)), seed=1, tokens_per_frame=2
     )
     audio = sampling.noised_state((1, 3, 4), mx.zeros((1, 3, 1)), seed=2)
-    perfect = lambda vs, au, vx, ax, sigma: (target_v, target_a)  # noqa: E731
+    perfect = lambda vs, au, vx, ax, sigma, step=None: (target_v, target_a)  # noqa: E731
     for out in (
         sampling.euler_loop(perfect, video, audio, sampling.STAGE_2_DISTILLED_SIGMAS),
         sampling.euler_ancestral_loop(

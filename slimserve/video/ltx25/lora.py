@@ -5,8 +5,11 @@ An adapter is applied as y += strength * (x A^T) B^T next to the base GEMM
 instead of being fused into the weights. The base checkpoint stays exactly
 the official one, adapters attach and detach per stage or per request with no
 reload, and the rank-450 distilled adapter costs 8.3 GiB instead of a second
-39 GiB transformer. Official files use `diffusion_model.<linear>.lora_{A,B}.weight`
-with alpha == rank, so the scale is the strength alone.
+39 GiB transformer. Files use `diffusion_model.<linear>.lora_{A,B}.weight`
+(the ComfyUI layout upstream's LTXV_LORA_COMFY_RENAMING_MAP strips); as
+upstream's fuse_loras, the delta is strength * B @ A with no alpha scaling
+(the official files carry alpha == rank; any other alpha is ignored there too).
+User LoRAs (upstream --lora PATH [STRENGTH]) load the same way from a path.
 """
 
 from __future__ import annotations
@@ -27,28 +30,37 @@ class Lora:
         self.pairs: dict[str, tuple[mx.array, mx.array]] = {}
         self.reference_downscale = 1
 
+    @classmethod
+    def from_path(cls, path: str | Path) -> Lora:
+        """A user adapter file (upstream --lora)."""
+        self = cls.__new__(cls)
+        self.path = Path(path).expanduser()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"LoRA file not found: {self.path}")
+        self.pairs = {}
+        self.reference_downscale = 1
+        return self
+
     def load(self) -> Lora:
         if self.pairs:
             return self
         header = checkpoints.read_header(self.path)
-        rank, alpha = (
-            header.metadata.get("lora_rank"),
-            header.metadata.get("lora_alpha"),
-        )
-        if (
-            rank != alpha
-        ):  # both absent on the IC-LoRA, which the reference applies unscaled as well
-            raise ValueError(
-                f"{self.path.name}: lora_alpha {alpha} != lora_rank {rank}; "
-                "scaling not implemented"
-            )
         self.reference_downscale = int(
             header.metadata.get("reference_downscale_factor", 1)
         )
         raw = checkpoints.cast_operands(checkpoints.load_raw(self.path))
         for key in [k for k in raw if k.endswith(".lora_A.weight")]:
-            name = key[len(PREFIX) : -len(".lora_A.weight")]
-            self.pairs[name] = (raw[key], raw[key.replace(".lora_A.", ".lora_B.")])
+            name = key[len(PREFIX) :] if key.startswith(PREFIX) else key
+            name = name[: -len(".lora_A.weight")]
+            b_key = key.replace(".lora_A.", ".lora_B.")
+            if b_key not in raw:
+                raise KeyError(f"{self.path.name}: {key} has no lora_B partner")
+            self.pairs[name] = (raw[key], raw[b_key])
+        if not self.pairs:
+            raise ValueError(
+                f"{self.path.name}: no `<linear>.lora_A.weight` / `lora_B.weight` "
+                "pairs (the ComfyUI LTXV layout upstream loads)"
+            )
         return self
 
     def attach(self, dit: LTX25DiT, strength: float = 1.0) -> None:

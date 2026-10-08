@@ -148,7 +148,7 @@ def test_step_cache_skips_within_the_threshold_and_never_on_a_forced_step():
 def test_samplers_force_the_last_step_and_hand_the_cache_to_the_denoiser():
     seen = []
 
-    def denoise(video, audio, vx, ax, sigma, step_cache=None):
+    def denoise(video, audio, vx, ax, sigma, step_cache=None, step=None):
         seen.append((sigma, step_cache.force if step_cache else None))
         return vx * 0.5, ax * 0.5
 

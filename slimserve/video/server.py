@@ -6,6 +6,14 @@ owns the engine (and every MLX call), with the weights resident between
 requests. The API is job-shaped because a clip takes minutes:
 
     POST   /v1/videos                 {"prompt": ..., "size": "1536x1024",
+                                       "steps": 30,
+                                       "guidance": {"video": {"cfg": 3.0, "stg": 1.0,
+                                                    "stg_blocks": [28], "rescale": 0.7,
+                                                    "modality": 3.0, "skip_step": 0},
+                                                    "audio": {...}},
+                                       "loras": [{"path": "x.safetensors",
+                                                  "strength": 1.0}],
+                                       "lora_strengths": [0.25, 0.5],
                                        "seconds": 5, "seed": 42,
                                        "enhance_prompt": false,
                                        "image": <base64 or data: URL>,
@@ -27,9 +35,14 @@ as base64, optionally wrapped in a `data:image/...;base64,` URL; it becomes
 the clip's first frame, pinned at `image_strength` (0-1, default 1.0). `images`
 is upstream's repeatable `--image PATH FRAME_IDX STRENGTH [CRF]`: stills at any
 pixel frame (frame 0 replaces the first latent frame, other frames ride along
-as keyframe tokens); the keyframe interpolation profile requires it.
-Requests outside the profile's validated envelope are refused: the envelope
-is what was measured to fit this machine's memory.
+as keyframe tokens); the keyframe interpolation profile requires it. On the
+guided pipelines `steps` and `guidance` (per modality: upstream's
+MultiModalGuiderParams cfg / stg / stg_blocks / rescale / modality (a2v on
+video, v2a on audio) / skip_step) override the profile's defaults; `loras`
+attaches user adapters (upstream --lora PATH [STRENGTH]; files on the server)
+to every stage; `lora_strengths` is the hq pipeline's two distilled-LoRA
+strengths. Requests outside the profile's validated envelope are refused: the
+envelope is what was measured to fit this machine's memory.
 """
 
 from __future__ import annotations
@@ -43,7 +56,7 @@ import queue
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -84,6 +97,11 @@ class Job:
         }
         if isinstance(out.get("image"), (bytes, bytearray)):
             out["image"] = f"<{len(out['image'])} bytes>"
+        for key in ("video_guidance", "audio_guidance"):
+            if key in out:
+                out[key] = asdict(out[key])
+        if out.get("loras"):
+            out["loras"] = [{"path": p, "strength": s} for p, s in out["loras"]]
         if out.get("images"):
             out["images"] = [
                 {
@@ -207,6 +225,34 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         params["images"] = [
             still_field(item, frames, cfg["pipeline"]) for item in _list(body["images"])
         ]
+    guided = cfg["pipeline"] in GUIDED_PIPELINES
+    if "steps" in body:
+        if not guided:
+            raise BadRequest("steps applies to the guided pipelines only")
+        steps = body["steps"]
+        if (
+            not isinstance(steps, int)
+            or isinstance(steps, bool)
+            or not 1 <= steps <= 200
+        ):
+            raise BadRequest("steps must be an integer in [1, 200]")
+        params["steps"] = steps
+    if "guidance" in body:
+        if not guided:
+            raise BadRequest("guidance applies to the guided pipelines only")
+        params.update(guidance_fields(body["guidance"], cfg["pipeline"]))
+    if "lora_strengths" in body:
+        if cfg["pipeline"] != "hq":
+            raise BadRequest("lora_strengths applies to the hq pipeline only")
+        pair = body["lora_strengths"]
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise BadRequest("lora_strengths is [stage 1, stage 2]")
+        params["lora_stage_1"], params["lora_stage_2"] = (
+            _strength(pair[0], "lora_strengths", 2.0),
+            _strength(pair[1], "lora_strengths", 2.0),
+        )
+    if body.get("loras") is not None:
+        params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
     if cfg["pipeline"] == "keyframes":
         if "image" in params:  # the shorthand is a frame-0 keyframe here
             from slimserve.video.ltx25.sampling import Still
@@ -221,20 +267,95 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
     return params
 
 
-def _list(value: Any) -> list:
+def _list(value: Any, name: str = "images") -> list:
     if not isinstance(value, list) or not value:
-        raise BadRequest("images must be a non-empty list")
+        raise BadRequest(f"{name} must be a non-empty list")
     return value
 
 
-def _strength(value: Any) -> float:
+def _strength(value: Any, name: str = "image strength", top: float = 1.0) -> float:
     try:
         strength = float(value)
     except (TypeError, ValueError) as exc:
-        raise BadRequest("image strength must be a number in [0, 1]") from exc
-    if not 0.0 <= strength <= 1.0:
-        raise BadRequest("image strength must be a number in [0, 1]")
+        raise BadRequest(f"{name} must be a number in [0, {top:g}]") from exc
+    if not 0.0 <= strength <= top:
+        raise BadRequest(f"{name} must be a number in [0, {top:g}]")
     return strength
+
+
+GUIDANCE_KEYS = ("cfg", "stg", "stg_blocks", "rescale", "modality", "skip_step")
+
+
+def guidance_fields(value: Any, pipeline: str) -> dict[str, Any]:
+    """`guidance: {"video": {...}, "audio": {...}}` with upstream's
+    MultiModalGuiderParams fields per modality (cfg_scale, stg_scale,
+    stg_blocks, rescale_scale, modality_scale (a2v on video, v2a on audio),
+    skip_step), over the pipeline's defaults -> video_guidance / audio_guidance."""
+    from dataclasses import replace as dc_replace
+
+    from slimserve.video.ltx25 import pipeline as pl
+
+    if not isinstance(value, dict) or not value:
+        raise BadRequest('guidance is {"video": {...}, "audio": {...}}')
+    unknown = set(value) - {"video", "audio"}
+    if unknown:
+        raise BadRequest(f"guidance has unknown modalities {sorted(unknown)}")
+    defaults = {
+        "video": pl.HQ_VIDEO_GUIDANCE
+        if pipeline == "hq"
+        else pl.DEFAULT_VIDEO_GUIDANCE,
+        "audio": pl.HQ_AUDIO_GUIDANCE
+        if pipeline == "hq"
+        else pl.DEFAULT_AUDIO_GUIDANCE,
+    }
+    out = {}
+    for modality, fields in value.items():
+        if not isinstance(fields, dict):
+            raise BadRequest(f"guidance.{modality} must be an object")
+        bad = set(fields) - set(GUIDANCE_KEYS)
+        if bad:
+            raise BadRequest(
+                f"guidance.{modality} has unknown fields {sorted(bad)}; "
+                f"known: {', '.join(GUIDANCE_KEYS)}"
+            )
+        clean = {}
+        for key, raw in fields.items():
+            if key == "stg_blocks":
+                if not isinstance(raw, list) or not all(
+                    isinstance(b, int) and not isinstance(b, bool) and 0 <= b < 48
+                    for b in raw
+                ):
+                    raise BadRequest("stg_blocks is a list of block indices in [0, 48)")
+                clean[key] = tuple(raw)
+            elif key == "skip_step":
+                if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+                    raise BadRequest("skip_step must be a non-negative integer")
+                clean[key] = raw
+            else:
+                try:
+                    clean[key] = float(raw)
+                except (TypeError, ValueError) as exc:
+                    raise BadRequest(
+                        f"guidance.{modality}.{key} must be a number"
+                    ) from exc
+                if key == "rescale" and not 0.0 <= clean[key] <= 1.0:
+                    raise BadRequest("rescale must be in [0, 1]")
+                if key != "rescale" and clean[key] < 0.0:
+                    raise BadRequest(f"{key} must be non-negative")
+        out[f"{modality}_guidance"] = dc_replace(defaults[modality], **clean)
+    return out
+
+
+def lora_field(item: Any) -> tuple[str, float]:
+    """One entry of `loras`: {"path": <.safetensors on the server>, "strength": 1.0}
+    (upstream --lora PATH [STRENGTH]); the file is checked when the engine
+    loads it."""
+    if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+        raise BadRequest('each loras entry needs a "path"')
+    path = Path(item["path"]).expanduser()
+    if path.suffix != ".safetensors" or not path.is_file():
+        raise BadRequest(f"loras: {path} is not a .safetensors file")
+    return str(path), _strength(item.get("strength", 1.0), "lora strength", 2.0)
 
 
 def still_field(item: Any, frames: int | None, pipeline: str):
@@ -411,7 +532,8 @@ class VideoService:
         fast = fast_settings(self.cfg)
         if fast is not None:
             p["fast"] = fast
-        result = getattr(engine, self.cfg["pipeline"])(prompt, on_step=on_step, **p)
+        with engine.user_loras(p.pop("loras", None)):
+            result = getattr(engine, self.cfg["pipeline"])(prompt, on_step=on_step, **p)
         if result.predicted_seconds is not None:  # auto duration: report the pick
             job.params["num_frames"] = result.num_frames
             job.params["predicted_seconds"] = round(result.predicted_seconds, 2)

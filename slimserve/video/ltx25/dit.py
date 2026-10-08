@@ -439,38 +439,46 @@ class LTX25DiT:
         vt, at = w[p + ".scale_shift_table"], w[p + ".audio_scale_shift_table"]
         vm, am = s["video_mod"], s["audio_mod"]
         stg = s["stg"]
+        # A modality a guider skips this step (upstream Modality.enabled False,
+        # BasicTransformerBlock run_vx / run_ax) keeps its hidden state as it
+        # entered the block: no self-attention, text cross-attention, cross
+        # update or feed-forward for it, while the other modality still reads
+        # it through the cross-attention.
+        run_v, run_a = s["run_video"], s["run_audio"]
 
         def skip(kind: str, like_ndim: int) -> mx.array | None:
             m = stg.get((kind, i)) if stg else None
             return None if m is None else m.reshape([-1] + [1] * (like_ndim - 1))
 
         # 1. video self-attention (table rows 0..2 = shift, scale, gate)
-        x = _modulate(self._norm(v), vm.get(1, vt[1]), vm.get(0, vt[0]))
-        sk = skip("video_self", 4)
-        y = self._attn(
-            p + ".attn1",
-            x,
-            rope_q=s["video_rope"],
-            mask=s["video_mask"],
-            skip=None if sk is None else sk.astype(F),
-            tiles=s["video_tiles"],
-        )
-        v = _gated_residual(v, y, vm.get(2, vt[2]))
+        if run_v:
+            x = _modulate(self._norm(v), vm.get(1, vt[1]), vm.get(0, vt[0]))
+            sk = skip("video_self", 4)
+            y = self._attn(
+                p + ".attn1",
+                x,
+                rope_q=s["video_rope"],
+                mask=s["video_mask"],
+                skip=None if sk is None else sk.astype(F),
+                tiles=s["video_tiles"],
+            )
+            v = _gated_residual(v, y, vm.get(2, vt[2]))
 
         # 2. audio self-attention
-        x = _modulate(self._norm(a), am.get(1, at[1]), am.get(0, at[0]))
-        sk = skip("audio_self", 4)
-        y = self._attn(
-            p + ".audio_attn1",
-            x,
-            rope_q=s["audio_rope"],
-            mask=s["audio_mask"],
-            skip=None if sk is None else sk.astype(F),
-        )
-        a = _gated_residual(a, y, am.get(2, at[2]))
+        if run_a:
+            x = _modulate(self._norm(a), am.get(1, at[1]), am.get(0, at[0]))
+            sk = skip("audio_self", 4)
+            y = self._attn(
+                p + ".audio_attn1",
+                x,
+                rope_q=s["audio_rope"],
+                mask=s["audio_mask"],
+                skip=None if sk is None else sk.astype(F),
+            )
+            a = _gated_residual(a, y, am.get(2, at[2]))
 
         # 3. video text cross-attention (rows 6..8; prompt table modulates the text)
-        if s["video_text"] is not None:
+        if run_v and s["video_text"] is not None:
             x = _modulate(self._norm(v), vm.get(7, vt[7]), vm.get(6, vt[6]))
             pt, pm = w[p + ".prompt_scale_shift_table"], s["video_prompt_mod"]
             text = (
@@ -487,7 +495,7 @@ class LTX25DiT:
             v = _gated_residual(v, y, vm.get(8, vt[8]))
 
         # 4. audio text cross-attention
-        if s["audio_text"] is not None:
+        if run_a and s["audio_text"] is not None:
             x = _modulate(self._norm(a), am.get(7, at[7]), am.get(6, at[6]))
             pt, pm = w[p + ".audio_prompt_scale_shift_table"], s["audio_prompt_mod"]
             text = (
@@ -505,38 +513,43 @@ class LTX25DiT:
         )
         cvm, cam = s["av_video_mod"], s["av_audio_mod"]
         vn, an = self._norm(v), self._norm(a)
-        vq = _modulate(vn, cvm.get(0, cvt[0]), cvm.get(1, cvt[1]))
-        akv = _modulate(an, cam.get(0, cat[0]), cam.get(1, cat[1]))
-        y = self._attn(
-            p + ".audio_to_video_attn",
-            vq,
-            ctx=akv,
-            rope_q=s["video_cross_rope"],
-            rope_k=s["audio_cross_rope"],
-        )
-        y = y * s["a2v_gate_mod"].get(0, cvt[4])
-        sk = skip("a2v", 3)
-        v_new = v + (y if sk is None else y * sk)
+        v_new = v
+        if run_v:
+            vq = _modulate(vn, cvm.get(0, cvt[0]), cvm.get(1, cvt[1]))
+            akv = _modulate(an, cam.get(0, cat[0]), cam.get(1, cat[1]))
+            y = self._attn(
+                p + ".audio_to_video_attn",
+                vq,
+                ctx=akv,
+                rope_q=s["video_cross_rope"],
+                rope_k=s["audio_cross_rope"],
+            )
+            y = y * s["a2v_gate_mod"].get(0, cvt[4])
+            sk = skip("a2v", 3)
+            v_new = v + (y if sk is None else y * sk)
 
-        aq = _modulate(an, cam.get(2, cat[2]), cam.get(3, cat[3]))
-        vkv = _modulate(vn, cvm.get(2, cvt[2]), cvm.get(3, cvt[3]))
-        y = self._attn(
-            p + ".video_to_audio_attn",
-            aq,
-            ctx=vkv,
-            rope_q=s["audio_cross_rope"],
-            rope_k=s["video_cross_rope"],
-        )
-        y = y * s["v2a_gate_mod"].get(0, cat[4])
-        sk = skip("v2a", 3)
-        a = a + (y if sk is None else y * sk)
+        if run_a:
+            aq = _modulate(an, cam.get(2, cat[2]), cam.get(3, cat[3]))
+            vkv = _modulate(vn, cvm.get(2, cvt[2]), cvm.get(3, cvt[3]))
+            y = self._attn(
+                p + ".video_to_audio_attn",
+                aq,
+                ctx=vkv,
+                rope_q=s["audio_cross_rope"],
+                rope_k=s["video_cross_rope"],
+            )
+            y = y * s["v2a_gate_mod"].get(0, cat[4])
+            sk = skip("v2a", 3)
+            a = a + (y if sk is None else y * sk)
         v = v_new
 
         # 7-8. feed-forward (rows 3..5)
-        x = _modulate(self._norm(v), vm.get(4, vt[4]), vm.get(3, vt[3]))
-        v = _gated_residual(v, self._ff(p + ".ff", x), vm.get(5, vt[5]))
-        x = _modulate(self._norm(a), am.get(4, at[4]), am.get(3, at[3]))
-        a = _gated_residual(a, self._ff(p + ".audio_ff", x), am.get(5, at[5]))
+        if run_v:
+            x = _modulate(self._norm(v), vm.get(4, vt[4]), vm.get(3, vt[3]))
+            v = _gated_residual(v, self._ff(p + ".ff", x), vm.get(5, vt[5]))
+        if run_a:
+            x = _modulate(self._norm(a), am.get(4, at[4]), am.get(3, at[3]))
+            a = _gated_residual(a, self._ff(p + ".audio_ff", x), am.get(5, at[5]))
         return v, a
 
     # ---- model ------------------------------------------------------------
@@ -562,7 +575,9 @@ class LTX25DiT:
         share_from: tuple[int, int, int] | None = None,
         video_tiles: tuple[list[mx.array], list[mx.array], mx.array] | None = None,
         step_cache: StepCache | None = None,
-    ) -> tuple[mx.array, mx.array]:
+        run_video: bool = True,
+        run_audio: bool = True,
+    ) -> tuple[mx.array | None, mx.array | None]:
         """Velocity prediction. All inputs fp32; returns fp32 (video, audio).
 
         `stg` maps (kind, block) -> (B,) keep-mask (1 keep, 0 skip) with kind in
@@ -574,8 +589,13 @@ class LTX25DiT:
         forked from `src`'s hidden state there. Exact up to GEMM row-count
         kernel selection. `video_tiles` and `step_cache` are the fast tier
         (tiled video self-attention, the first-block step cache); both change
-        the output.
+        the output. `run_video` / `run_audio` False: that modality is a guider's
+        skipped step (upstream Modality.enabled): its stream is left as its
+        patchified input through every block, the other modality still
+        cross-attends to it, and its output is None.
         """
+        if not (run_video or run_audio):
+            raise ValueError("at least one modality must run")
         inputs = dict(
             video_latent=video_latent,
             audio_latent=audio_latent,
@@ -595,6 +615,8 @@ class LTX25DiT:
             stg=stg,
             text_rows=text_rows,
             video_tiles=video_tiles,
+            run_video=run_video,
+            run_audio=run_audio,
         )
         fork_block = self.cfg.num_layers
         if share_from is not None and share_from[0] == 0:
@@ -617,13 +639,15 @@ class LTX25DiT:
         v_in = v
         v, a = self._block(0, v, a, state)
         v1 = a1 = None
+        if step_cache is not None and not run_video:
+            step_cache = None  # the cache keys on the video residual
         if step_cache is not None:
             v1, a1 = expand(v), expand(a)
             if step_cache.hit(v - v_in):
                 v, a = step_cache.reuse(v1, a1)
                 if share_from is not None:
                     _, _, _, video_emb, audio_emb = self._prepare(**inputs)
-                return self._out_both(v, a, video_emb, audio_emb)
+                return self._out_both(v, a, video_emb, audio_emb, run_video, run_audio)
         for i in range(1, self.cfg.num_layers):
             if i == fork_block:
                 v, a = expand(v), expand(a)
@@ -636,13 +660,19 @@ class LTX25DiT:
                 mx.async_eval(v, a)
         if step_cache is not None:
             step_cache.store(v1, a1, v, a)
-        return self._out_both(v, a, video_emb, audio_emb)
+        return self._out_both(v, a, video_emb, audio_emb, run_video, run_audio)
 
-    def _out_both(self, v, a, video_emb, audio_emb) -> tuple[mx.array, mx.array]:
+    def _out_both(
+        self, v, a, video_emb, audio_emb, run_video=True, run_audio=True
+    ) -> tuple[mx.array | None, mx.array | None]:
         w = self.w
         return (
-            self._out(v, video_emb, w["scale_shift_table"], "proj_out"),
-            self._out(a, audio_emb, w["audio_scale_shift_table"], "audio_proj_out"),
+            self._out(v, video_emb, w["scale_shift_table"], "proj_out")
+            if run_video
+            else None,
+            self._out(a, audio_emb, w["audio_scale_shift_table"], "audio_proj_out")
+            if run_audio
+            else None,
         )
 
     def _prepare(
@@ -665,6 +695,8 @@ class LTX25DiT:
         stg=None,
         text_rows=None,
         video_tiles=None,
+        run_video=True,
+        run_audio=True,
     ):
         """Patchify, AdaLN heads, RoPE tables: everything the block loop reads."""
         cfg, w = self.cfg, self.w
@@ -745,6 +777,8 @@ class LTX25DiT:
             "stg": stg,
             "text_rows": text_rows,
             "video_tiles": video_tiles,
+            "run_video": run_video,
+            "run_audio": run_audio,
             # one batch row standing for each distinct text row, for the prompt AdaLN
             "text_reps": None
             if text_rows is None

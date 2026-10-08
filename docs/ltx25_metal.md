@@ -66,7 +66,17 @@ head (Lightricks' auto-duration: the clip the prompt implies, 1-20 s, snapped
 to the 8k + 1 frame grid, capped at the profile's envelope for that size); the
 job reports the pick as `num_frames` and `predicted_seconds`. `negative_prompt`
 is accepted by the guided pipelines (`ltx25-dev`, `ltx25-hq`, `ltx25-keyframes`,
-`ltx25-one-stage`). `decoder` is `diffusion` (default, Lightricks'
+`ltx25-one-stage`), as are `steps` and `guidance` (per modality, upstream's
+MultiModalGuiderParams: `cfg`, `stg`, `stg_blocks`, `rescale`, `modality`
+(a2v on video, v2a on audio), `skip_step`; CLI flags with upstream's names,
+`--num-inference-steps`, `--video-cfg-guidance-scale`, `--video-skip-step`,
+`--a2v-guidance-scale`, ...). `skip_step` N runs that modality's stream only
+on every (N + 1)th step, reusing its last x0 on the others while the other
+modality keeps cross-attending to its untouched state (a skipped step of both
+costs no forward). `loras` / `--lora PATH [STRENGTH]` attach user adapters
+(ComfyUI LTXV layout, `diffusion_model.<linear>.lora_{A,B}.weight`, no alpha
+scaling, as upstream) to every stage of every profile; `lora_strengths` /
+`--distilled-lora-strength-stage-1/-2` are hq's two strengths. `decoder` is `diffusion` (default, Lightricks'
 recommended decoder: sharper faces, textures and text) or `conv` (about 4x
 faster decode); the CLI flag is `--decoder`. Width and height are multiples of 64, frame
 counts are 8k + 1. Requests larger than the profile's validated clip
@@ -318,8 +328,8 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 Of upstream's pipelines and options (ledger section 30): ICLoraPipeline
 (video-to-video reference conditioning), A2VidPipelineTwoStage (audio-driven),
 RetakePipeline, DubItPipeline, T2AOneStagePipeline, HDRICLoraPipeline and the
-native `--hdr` EXR path, alpha_gen; generated keyframes on the distilled flow,
-user LoRAs, per-request guidance scales, and chunked long clips. The I2V
+native `--hdr` EXR path, alpha_gen; generated keyframes on the distilled flow
+and chunked long clips. The I2V
 first-frame path is wired but its end-to-end output has not been compared
 against upstream on this machine.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on

@@ -170,9 +170,9 @@ def euler_loop(
     for i, (s, s_next) in enumerate(zip(sigmas[:-1], sigmas[1:])):
         if step_cache is not None:
             step_cache.force = s_next == 0
-            v0, a0 = denoise(video, audio, vx, ax, s, step_cache=step_cache)
+            v0, a0 = denoise(video, audio, vx, ax, s, step_cache=step_cache, step=i)
         else:
-            v0, a0 = denoise(video, audio, vx, ax, s)
+            v0, a0 = denoise(video, audio, vx, ax, s, step=i)
         v0, a0 = blend(v0, video), blend(a0, audio)
         dt = s_next - s
         vx = vx + (vx - v0) / s * dt
@@ -216,9 +216,9 @@ def euler_ancestral_loop(
     for i, (s, s_next) in enumerate(zip(sigmas[:-1], sigmas[1:])):
         if step_cache is not None:
             step_cache.force = s_next == 0
-            v0, a0 = denoise(video, audio, vx, ax, s, step_cache=step_cache)
+            v0, a0 = denoise(video, audio, vx, ax, s, step_cache=step_cache, step=i)
         else:
-            v0, a0 = denoise(video, audio, vx, ax, s)
+            v0, a0 = denoise(video, audio, vx, ax, s, step=i)
         v0, a0 = blend(v0, video), blend(a0, audio)
         if s_next == 0:
             vx, ax = v0, a0
@@ -415,6 +415,15 @@ class Guidance:
     # LTX_2_4_PARAMS (constants.py _PARAMS_SINCE_VERSION), whose stg_blocks is
     # [28]. The [29] in the PipelineParams dataclass is the LTX-2.0 default.
     stg_blocks: tuple[int, ...] = (28,)
+    # upstream MultiModalGuiderParams.skip_step: with N > 0 only steps with
+    # index % (N + 1) == 0 run this modality; a skipped step keeps its last x0
+    skip_step: int = 0
+
+    def skips(self, step: int | None) -> bool:
+        """upstream MultiModalGuider.should_skip_step"""
+        if not self.skip_step or step is None:
+            return False
+        return step % (self.skip_step + 1) != 0
 
     def combine(
         self,
@@ -920,7 +929,7 @@ def res2s_loop(
         h = hs[i]
         a21, b1, b2 = res2s_coefficients(h)
         sub = math.sqrt(s * s_next)
-        v0, a0 = denoise(video, audio, vx, ax, s)
+        v0, a0 = denoise(video, audio, vx, ax, s, step=i)
         v0, a0 = blend(v0, video), blend(a0, audio)
         ev, ea = v0 - vx, a0 - ax
         vm, am = vx + h * a21 * ev, ax + h * a21 * ea
@@ -935,7 +944,9 @@ def res2s_loop(
                 aa = am - h * a21 * ea
                 ea = a0 - aa
             mx.eval(va, ev, aa, ea)
-        v2, a2 = denoise(video, audio, vm, am, sub)
+        # upstream evaluates the midpoint with step_index 0 (a skipping guider
+        # never skips it)
+        v2, a2 = denoise(video, audio, vm, am, sub, step=0)
         v2, a2 = blend(v2, video), blend(a2, audio)
         vn = va + h * (b1 * ev + b2 * (v2 - va))
         an = aa + h * (b1 * ea + b2 * (a2 - aa))
@@ -947,7 +958,7 @@ def res2s_loop(
         if on_step:
             on_step(i, s)
     if terminal:
-        v0, a0 = denoise(video, audio, vx, ax, sigmas[n_steps])
+        v0, a0 = denoise(video, audio, vx, ax, sigmas[n_steps], step=n_steps)
         vx, ax = blend(v0, video), blend(a0, audio)
         mx.async_eval(vx, ax)
         if on_step:
