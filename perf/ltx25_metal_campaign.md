@@ -1841,4 +1841,60 @@ seam slot and guide tokens), 33 EXR frames (ACEScg) and the HLG master.
 The real conversion waits for the adapter.
 
 That closes section 30's pipeline list: every upstream pipeline is ported.
-Still open there: chunked long clips on IC-LoRA and Dub-It.
+Chunked long clips on IC-LoRA and Dub-It follow in section 42.
+
+## 42. Chunked long clips on IC-LoRA and Dub-It (2026-10-08)
+
+Closes section 30's last item. `_chunked` grew the three hooks the editing
+pipelines need: `stage_loras` (the adapter stays merged for both stages or
+stage 1 only, as `stage_2_ic_lora` says), `references` (a per-window hook)
+and `audio_extra` (Dub-It's reference audio tokens for the window).
+`_window_references` is upstream `reference_video_conditionings_for_chunk`
++ `append_ic_lora_reference_video_conditionings(reference_prefix_frames)`:
+each window encodes the reference frames of its own pixel window
+`[start_pixel_frame, start_pixel_frame + pixel_frames)` at the stage size,
+drops the leading reference latents whose target-time span touches the
+incoming carry (`1 + (prefix + stride - 2) // stride`, stride 8 x the
+adapter's temporal scale; the kept latents stay at their temporal
+indices, so the carry's pinned latents are the only conditioning there)
+and appends them with the attention strength / mask window; Dub-It's
+reference goes through the tiled source encoder as upstream. Request side:
+`CHUNK_PIPELINES` adds ic_lora and dubit (Dub-It keeps the clip's own
+length; `chunked` / `chunk_*` ride along).
+
+The bug this surfaced is in the reader, and it affected the plain paths
+too. `media.read_frames` ran ffmpeg in its default constant-rate output
+mode, which pads timestamp gaps with duplicate frames: the 241-frame fox
+clip (four one-frame pts gaps from the concat that made it, average rate
+23.6) decoded to 246 frames, so a chunk window's reference came back off
+the 8k + 1 grid (`[reshape] Cannot reshape array of size 1064960`), and a
+pts window could also come back a frame short (frames 72..168 gave 96).
+Fixes: `-fps_mode passthrough` on every read (the decoded frames as PyAV
+yields them), and `media.read_frames_by_index(path, info, start, count)`
+(`select=between(n, a, b)` + `-frames:v`) = upstream
+`decode_video_by_frame(starting_frame, frame_cap)`, exact by decode index,
+now used wherever upstream reads by index: IC-LoRA references (plain and
+per window), the attention mask video, HDR IC-LoRA's SDR source, and the
+chunked Dub-It windows (`_source_video_latent(start_frame=)`); retake and
+the unchunked Dub-It / A2Vid sources keep the pts read upstream's
+`video_latent_from_file` uses. Test: a 41-frame clip with a one-frame pts
+gap (ffmpeg's default mode gives 43) reads 41 and index windows match the
+full decode exactly (`test_frames_by_index_are_exact_windows_and_passthrough_keeps_the_count`);
+the chunked Dub-It request parse joins `test_a2vid_and_dubit_requests`.
+
+Smokes (`n12/iclora_chunked2.*`, `iclora_chunked_fast.*`,
+`dubit_chunked.*`; the Pixel-Spatial-Upscaler adapter at 0.5 standing in
+for the gated ones, 512x384, the 241-frame fox clip, three 97-frame windows
+with 25-frame carries, conv decoder):
+
+| run | total | stage1 | stage2 | decode |
+| --- | --- | --- | --- | --- |
+| ltx25-ic-lora --chunked | 128.9 s | 52.8 s | 42.7 s | 21.6 s |
+| ltx25-ic-lora-fast --chunked | 115.3 s | 53.2 s | 28.5 s | 22.0 s |
+| ltx25-dubit --chunked | 153.3 s | 55.0 s | 64.3 s | 21.9 s |
+
+All three ship 241 frames (Dub-It's with its generated 10.2 s audio track,
+std 0.052). The fast tier's saving sits in stage 2 (its step cache; stage 1
+is the same 8 distilled steps). End-to-end quality of the chunked editing
+flows waits, like the unchunked ones (sections 35, 37), on the gated
+Lightricks adapters.

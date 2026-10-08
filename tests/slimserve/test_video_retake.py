@@ -183,6 +183,48 @@ def test_retake_requests_take_the_source_clips_geometry(tmp_path):
     assert flags["regenerate_audio"] is False and "regenerate_video" not in flags
 
 
+def test_frames_by_index_are_exact_windows_and_passthrough_keeps_the_count(tmp_path):
+    # a clip with a one-frame timestamp gap (the fox clip had four, 246
+    # frames decoded for 241): ffmpeg's default constant-rate output pads
+    # them with duplicates and a pts window can come back a frame short; the
+    # readers take the decoded frames as they are, the index reader exactly
+    clip = tmp_path / "v.mp4"
+    subprocess.run(
+        [
+            shutil.which("ffmpeg"),
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=96x64:rate=24:duration=2",
+            "-vf",
+            "setpts=PTS+gte(N\\,20)/24/TB",
+            "-fps_mode",
+            "passthrough",
+            "-frames:v",
+            "41",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(clip),
+        ],
+        check=True,
+    )
+    info = media.probe(clip)
+    assert info.frames == 41 and 23.0 < info.fps < 24.0
+    full = media.read_frames(clip, info)
+    assert full.shape[0] == 41
+    window = media.read_frames_by_index(clip, info, 8, 17)
+    assert window.shape[0] == 17 and np.array_equal(window, full[8:25])
+    assert media.read_frames_by_index(clip, info, 32).shape[0] == 9
+    assert media.read_frames_by_index(clip, info, 32, 17).shape[0] == 9  # short
+    with pytest.raises(ValueError):
+        media.read_frames_by_index(clip, info, -1)
+
+
 def test_a2vid_and_dubit_requests(tmp_path):
     clip = _clip(tmp_path / "c.mp4")
     a2v = {**CFG, "pipeline": "a2vid", "width": 768, "height": 512}
@@ -237,6 +279,18 @@ def test_a2vid_and_dubit_requests(tmp_path):
             {"prompt": "x", "reference_video": silent, "loras": [{"path": str(lora)}]},
             dub,
         )
+    # chunked Dub-It: the window layout rides along, the clip's own length
+    params = server.normalize_request(
+        {
+            "prompt": "x",
+            "reference_video": clip,
+            "loras": [{"path": str(lora)}],
+            "chunked": True,
+            "chunk_carry_frames": 17,
+        },
+        dub,
+    )
+    assert params["chunk"].carry_frames == 17 and params["source"]["num_frames"] == 17
 
 
 def test_audio_reference_tokens_sit_before_the_timeline():

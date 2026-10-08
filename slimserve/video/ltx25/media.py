@@ -150,8 +150,14 @@ def read_frames(
     args += ["-i", str(path)]
     if max_duration is not None:
         args += ["-t", f"{max_duration:.6f}"]
+    # passthrough: the decoded frames themselves, as PyAV yields them; the
+    # default constant-rate mode duplicates frames when the container's average
+    # rate is below its nominal one (a 23.6 fps clip came back with 246 frames
+    # for 241)
     args += [
         "-an",
+        "-fps_mode",
+        "passthrough",
         "-sws_flags",
         "bilinear",
         "-pix_fmt",
@@ -165,6 +171,59 @@ def read_frames(
     if len(raw) % per:
         raise RuntimeError(f"{path}: decoded {len(raw)} bytes, not whole frames")
     return np.frombuffer(raw, dtype=np.uint8).reshape(-1, info.height, info.width, 3)
+
+
+def read_frames_by_index(
+    path: str | os.PathLike,
+    info: VideoInfo,
+    start_frame: int = 0,
+    count: int | None = None,
+) -> np.ndarray:
+    """Upstream decode_video_by_frame(starting_frame, frame_cap): frames
+    selected by decode index rather than by presentation time, so a window
+    of `count` frames is exactly `count` long whatever the stream's timestamp
+    jitter (the chunked IC-LoRA / Dub-It reference windows need their frame
+    count on the 8k + 1 grid)."""
+    from slimserve.video.ltx25 import hdr
+
+    if start_frame < 0 or (count is not None and count < 0):
+        raise ValueError(f"start_frame {start_frame} / count {count} must be >= 0")
+    if hdr.is_exr_dir(path):
+        files = hdr.exr_paths(path)[start_frame:]
+        if count is not None:
+            files = files[:count]
+        return np.stack([hdr.read_exr(f) for f in files])
+    if count is None:
+        select = f"gte(n\\,{start_frame})"
+    else:
+        select = f"between(n\\,{start_frame}\\,{start_frame + count - 1})"
+    args = [
+        _ffmpeg_binary(),
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-an",
+        "-vf",
+        f"select={select}",
+        "-fps_mode",
+        "passthrough",
+        "-sws_flags",
+        "bilinear",
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    if count is not None:
+        args[-1:-1] = ["-frames:v", str(count)]
+    raw = _run(args)
+    per = info.height * info.width * 3
+    if len(raw) % per:
+        raise RuntimeError(f"{path}: decoded {len(raw)} bytes, not whole frames")
+    frames = np.frombuffer(raw, dtype=np.uint8).reshape(-1, info.height, info.width, 3)
+    return frames if count is None else frames[:count]
 
 
 def read_audio(

@@ -144,14 +144,18 @@ diffusion decode on them (the conv decoder ignores them, as upstream).
 Long clips (upstream's `--chunked`, `--chunk-pixel-frames`,
 `--chunk-carry-frames`, `--chunk-blend-frames`; API `chunked`,
 `chunk_pixel_frames`, `chunk_carry_frames`, `chunk_blend_frames`) on the
-distilled, dev and a2vid profiles generate in overlapping temporal windows
+distilled, dev, a2vid, ic-lora and dubit profiles generate in overlapping
+temporal windows
 (default 97 frames with a 25-frame carry): each window is denoised with
 the previous window's last carry latent frames pinned at its start (video
 and audio), both stages, stills and generated keyframes landing in each
 window as upstream plans them, then decoded per window with the carried
 frames dropped and the seam crossfaded (linear over `chunk_blend_frames`,
 default the carry; audio over 40 ms equal-power). The clip may then be up
-to 1024 frames; the window must fit the profile's envelope.
+to 1024 frames; the window must fit the profile's envelope. On the IC-LoRA
+and Dub-It profiles each window encodes its own stretch of the reference
+video (by frame index) and drops the reference latents the incoming carry
+already covers, as upstream; Dub-It keeps the clip's own length.
 
 `ltx25-alpha` (upstream's AlphaGenPipeline) takes `video_conditioning` (the
 clip to matte) and the Alpha-Gen adapter in `loras`
@@ -465,12 +469,15 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 | `chunks.py` | long clips in overlapping temporal windows: layouts, carry, keyframe plans, seam blends |
 | `../server.py`, `../cli.py` | the job queue and HTTP API; `slimserve` integration |
 
-## Not implemented yet
+## Not verified yet
 
-Of upstream's pipelines and options (ledger section 30): chunked long clips
-on the IC-LoRA and Dub-It pipelines (distilled, dev and a2vid have them).
-The I2V
-first-frame path is wired but its end-to-end output has not been compared
-against upstream on this machine.
+Every upstream pipeline and option (ledger section 30) is ported; what
+remains is evidence, not code:
+
+- The I2V first-frame path is wired but its end-to-end output has not been
+  compared against upstream on this machine.
+- The IC-LoRA, Dub-It, Alpha-Gen and HDR IC-LoRA flows ran their mechanics
+  with a stand-in adapter; their real adapters are gated Lightricks repos
+  (accept the terms on Hugging Face, then `slimserve <profile> -y`).
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
   hardware and are separate profile records when they exist.

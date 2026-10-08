@@ -644,19 +644,25 @@ class LTX25Engine:
         num_frames: int | None = None,
         fps: float | None = None,
         color_space: str | None = None,
+        start_frame: int | None = None,
     ) -> mx.array:
         """Upstream video_latent_from_file: the frames in [start_time, start_time
         + num_frames / fps) decoded (`media.read_frames`), resized to fill and
         center-cropped to height x width and mapped to [-1, 1] as the stills
         are, tiled-encoded (frames 80/24, 768/64 px), the latent length
-        conformed to the clip's (trimmed, or zero-padded at the end)."""
+        conformed to the clip's (trimmed, or zero-padded at the end). With
+        `start_frame` the window is taken by frame index instead (a chunked
+        Dub-It reference window, upstream SequentialVideoFrameSource.take)."""
         from slimserve.video.ltx25 import media
         from slimserve.video.ltx25.vae import Tiling
 
         fps = fps or info.fps
         num_frames = num_frames or info.frames
         with tm.span("encode_video"):
-            frames = media.read_frames(path, info, start_time, num_frames / fps)
+            if start_frame is None:
+                frames = media.read_frames(path, info, start_time, num_frames / fps)
+            else:
+                frames = media.read_frames_by_index(path, info, start_frame, num_frames)
             if frames.shape[0] == 0:
                 raise ValueError(f"{path}: no frames from {start_time:.3f} s")
             pixels = self._frames_to_pixels(frames, height, width, color_space)
@@ -1003,7 +1009,7 @@ class LTX25Engine:
                 stage1_sigmas=fast.sigmas1(sampling.DISTILLED_SIGMAS),
                 stage2_sigmas=fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS),
                 ancestral=True,
-                stage2_lora=None,
+                stage_loras=((), ()),
                 freeze_stage2_audio=False,
                 source_audio=None,
                 fast=fast,
@@ -1863,7 +1869,7 @@ class LTX25Engine:
                 stage1_sigmas=sampling.ltx2_schedule(steps, 4096),
                 stage2_sigmas=fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS),
                 ancestral=False,
-                stage2_lora=lora,
+                stage_loras=((), [(lora, 1.0)]),
                 freeze_stage2_audio=True,
                 source_audio=source_audio,
                 fast=fast,
@@ -2325,6 +2331,7 @@ class LTX25Engine:
         temporal_scale: int,
         tm: Timings,
         color_space: str | None = None,
+        start_frame: int = 0,
     ) -> tuple[mx.array, tuple[int, int, int]]:
         """Upstream append_ic_lora_reference_video_conditionings: the first
         num_frames frames of the reference (by index), resized to fill and
@@ -2340,11 +2347,14 @@ class LTX25Engine:
             )
         rh, rw = height // downscale, width // downscale
         with tm.span("reference"):
-            frames = media.read_frames(path, info, 0.0, num_frames / info.fps)[
-                :num_frames
-            ]
+            frames = media.read_frames_by_index(path, info, start_frame, num_frames)
             if frames.shape[0] == 0:
-                raise ValueError(f"{path}: no frames")
+                raise ValueError(f"{path}: no frames from frame {start_frame}")
+            if frames.shape[0] < num_frames:
+                raise ValueError(
+                    f"{path}: reference frames [{start_frame}, "
+                    f"{start_frame + num_frames}) run past its {info.frames} frames"
+                )
             if temporal_scale > 1:
                 frames = frames[[0, *range(1, frames.shape[0], temporal_scale)]]
             # EXR references are reflect-padded (ResizeMode.REFLECT_PAD upstream)
@@ -2356,6 +2366,92 @@ class LTX25Engine:
             del pixels, frames
         _, _, f, h, w = latent.shape
         return sampling.patchify(latent), (f, h, w)
+
+    def _window_references(
+        self,
+        video_conditioning,
+        infos,
+        fps: float,
+        downscale: int,
+        temporal_scale: int,
+        attention_strength: float,
+        mask_video,
+        tm: Timings,
+        hdr: str | None,
+        stage_2: bool,
+        tiled: bool = False,
+        strength_override: float | None = None,
+    ):
+        """A `_chunked` references hook (upstream reference_video_conditionings_
+        for_chunk): each window encodes the reference frames of its own pixel
+        window at the stage size, drops the leading reference latents whose
+        span touches the incoming carry (1 + (prefix + stride - 2) // stride
+        of them; the kept ones stay at their temporal indices) and appends
+        them; `tiled` encodes with the source tiling (Dub-It)."""
+
+        def hook(video, layout, h, w, kind, sigma, stage_seed):
+            if kind == "stage2" and not stage_2:
+                return video
+            n_noisy = layout.latent_frames * h * w
+            start, count = layout.start_pixel_frame, layout.pixel_frames
+            stride = 8 * temporal_scale
+            prefix = layout.prev_carry
+            first = 0 if prefix == 0 else 1 + (prefix + stride - 2) // stride
+            for path, strength in video_conditioning:
+                if strength_override is not None:
+                    strength = strength_override
+                if tiled:
+                    latent = self._source_video_latent(
+                        path,
+                        infos[path],
+                        h * 32 // downscale,
+                        w * 32 // downscale,
+                        tm,
+                        num_frames=count,
+                        fps=fps,
+                        color_space=hdr,
+                        start_frame=start,
+                    )
+                    tokens, (rf, rh, rw) = sampling.patchify(latent), latent.shape[2:]
+                else:
+                    tokens, (rf, rh, rw) = self._reference_tokens(
+                        path,
+                        infos[path],
+                        h * 32,
+                        w * 32,
+                        count,
+                        downscale,
+                        temporal_scale,
+                        tm,
+                        color_space=hdr,
+                        start_frame=start,
+                    )
+                if first >= rf:
+                    raise ValueError("the carry removes the whole reference window")
+                positions = sampling.video_positions(rf, rh, rw, fps)
+                keep = first * rh * rw
+                weights = None
+                if mask_video is not None:
+                    win = mask_video[start : start + count]
+                    weights = sampling.mask_video_to_tokens(win, rf, rh, rw)[keep:]
+                    weights = weights * attention_strength
+                elif attention_strength < 1.0:
+                    weights = attention_strength
+                video = sampling.append_reference(
+                    video,
+                    tokens[:, keep:],
+                    positions[:, keep:],
+                    downscale,
+                    strength,
+                    temporal_scale,
+                    fps,
+                    weights,
+                    n_noisy,
+                )
+            mx.eval(video.latent, video.clean, video.positions)
+            return video
+
+        return hook
 
     def ic_lora(
         self,
@@ -2384,6 +2480,8 @@ class LTX25Engine:
         max_num_frames: int | None = None,
         generated_keyframes: int | list[int] = 0,
         decode_with_keyframes: bool = False,
+        chunk=None,
+        decoder: str | None = None,
     ) -> Result:
         """Lightricks' ICLoraPipeline, the CLI's two-stage recipe: stage 1 at
         half resolution on the distilled transformer under the IC-LoRA
@@ -2469,7 +2567,7 @@ class LTX25Engine:
         if attention_mask is not None:
             # upstream _load_mask_video: decoded at the stage-1 size, grey, [0, 1]
             minfo = media.probe(attention_mask)
-            frames = media.read_frames(attention_mask, minfo)[:num_frames]
+            frames = media.read_frames_by_index(attention_mask, minfo, 0, num_frames)
             from slimserve.video.ltx25 import image as image_mod
 
             mask_video = np.stack(
@@ -2486,6 +2584,46 @@ class LTX25Engine:
         apos = sampling.audio_positions(audio_t)
         stepper = self._stepper(tm, on_step)
         stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
+        if chunk is not None:
+            if tile:
+                raise ValueError("chunked IC-LoRA does not take tile here")
+            return self._chunked(
+                config=chunk,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                fps=fps,
+                seed=seed,
+                stills=stills,
+                generated_keyframes=generated_keyframes,
+                decode_with_keyframes=decode_with_keyframes,
+                video_text=video_text,
+                audio_text=audio_text,
+                guided=None,
+                stage1_sigmas=fast.sigmas1(sampling.DISTILLED_SIGMAS),
+                stage2_sigmas=fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS),
+                ancestral=False,
+                stage_loras=(adapters, adapters if stage_2_ic_lora else []),
+                freeze_stage2_audio=False,
+                source_audio=None,
+                fast=fast,
+                tm=tm,
+                stepper=stepper,
+                decoder=decoder or self.decoder,
+                hdr=hdr,
+                references=self._window_references(
+                    video_conditioning,
+                    infos,
+                    fps,
+                    downscale,
+                    temporal_scale,
+                    attention_strength,
+                    mask_video,
+                    tm,
+                    hdr,
+                    stage_2_ic_lora,
+                ),
+            )
 
         def conditioned(video, h, w, sigma, stage_seed, with_reference):
             """The stage's conditioned state and, for the tiled stages, every
@@ -2701,6 +2839,8 @@ class LTX25Engine:
         fast: Fast | None = None,
         generated_keyframes: int | list[int] = 0,
         decode_with_keyframes: bool = False,
+        chunk=None,
+        decoder: str | None = None,
     ) -> Result:
         """Lightricks' DubItPipeline: the distilled transformer with one Dub-It
         IC-LoRA in both stages; the reference clip (its frame count, snapped
@@ -2750,6 +2890,60 @@ class LTX25Engine:
         )
         if ref_audio is None:
             raise ValueError(f"no audio stream in {reference_video}")
+        if chunk is not None:
+            from slimserve.video.ltx25 import chunks as ch
+
+            ref_audio_np = np.array(ref_audio)
+
+            def audio_extra(audio, layout, kind, a1):
+                tokens = sampling.audio_token_count(layout.pixel_frames, fps)
+                if kind == "stage1":  # the reference clip's audio for this window
+                    ref = mx.array(ch.audio_window(ref_audio_np, layout, fps, tokens))
+                else:  # stage 2: the window's own stage-1 audio as its reference
+                    ref = a1
+                audio = sampling.append_audio_reference(audio, ref)
+                mx.eval(audio.latent, audio.positions)
+                return audio
+
+            return self._chunked(
+                config=chunk,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                fps=fps,
+                seed=seed,
+                stills=stills,
+                generated_keyframes=generated_keyframes,
+                decode_with_keyframes=decode_with_keyframes,
+                video_text=video_text,
+                audio_text=audio_text,
+                guided=None,
+                stage1_sigmas=fast.sigmas1(sampling.DISTILLED_SIGMAS),
+                stage2_sigmas=fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS),
+                ancestral=False,
+                stage_loras=([(lora, lora_strength)], [(lora, lora_strength)]),
+                freeze_stage2_audio=True,
+                source_audio=None,
+                fast=fast,
+                tm=tm,
+                stepper=stepper,
+                decoder=decoder or self.decoder,
+                hdr=hdr,
+                references=self._window_references(
+                    [(reference_video, reference_strength)],
+                    {reference_video: info},
+                    fps,
+                    downscale,
+                    1,
+                    1.0,
+                    None,
+                    tm,
+                    hdr,
+                    True,
+                    tiled=True,
+                ),
+                audio_extra=audio_extra,
+            )
 
         def with_reference(video, h, w, sigma, stage_seed):
             video = self._condition(
@@ -2989,7 +3183,7 @@ class LTX25Engine:
         stage1_sigmas: list[float],
         stage2_sigmas: list[float],
         ancestral: bool,
-        stage2_lora,
+        stage_loras,
         freeze_stage2_audio: bool,
         source_audio: tuple[mx.array, np.ndarray, int] | None,
         fast: Fast,
@@ -2997,6 +3191,8 @@ class LTX25Engine:
         stepper,
         decoder: str,
         hdr: str | None = None,
+        references=None,
+        audio_extra=None,
     ) -> Result:
         """The two-stage flow over overlapping temporal windows (upstream
         generate_uniform_chunks -> denoise_chunks -> spatially_upsample_chunks
@@ -3005,7 +3201,12 @@ class LTX25Engine:
         with one slot at each seam), the previous window's slots inside the
         carry as pinned keyframe tokens, and the previous window's last carry
         latent frames pinned at index 0 (video and audio); decoded per window
-        with the incoming carry dropped and the seam crossfaded."""
+        with the incoming carry dropped and the seam crossfaded.
+        `stage_loras` is (stage-1 adapters, stage-2 adapters) as (Lora,
+        strength) lists; `references(video, layout, h, w, stage, sigma, seed)`
+        appends a window's reference tokens after the stills (IC-LoRA,
+        Dub-It), `audio_extra(audio, layout, stage, a1)` its audio reference
+        tokens (Dub-It)."""
         from slimserve.video.ltx25 import chunks as ch
 
         dit = self.load_dit()
@@ -3048,6 +3249,8 @@ class LTX25Engine:
                 if (local := layout.local_frame(g)) is not None
             ]
             video = self._condition(video, local_stills, fps, sigma, stage_seed)
+            if references is not None:
+                video = references(video, layout, h, w, kind, sigma, stage_seed)
             slot_frames = [
                 local for g in kf_global if (local := layout.local_frame(g)) is not None
             ]
@@ -3147,6 +3350,8 @@ class LTX25Engine:
         stage1: list[tuple] = []
         carry_v = carry_a = None
         incoming = None
+        for lora, strength in stage_loras[0]:
+            lora.attach(dit, strength)
         with tm.span("stage1"):
             for i, layout in enumerate(plan):
                 stage_seed = seed + 1000 * i
@@ -3163,6 +3368,8 @@ class LTX25Engine:
                     "stage1",
                 )
                 audio = audio_state(layout, stage_seed, 1.0, None, carry_a, False)
+                if audio_extra is not None:
+                    audio = audio_extra(audio, layout, "stage1", None)
                 n = video.latent.shape[1]
                 if guided is None:
                     den = Denoiser(dit, video_text, audio_text)
@@ -3194,6 +3401,9 @@ class LTX25Engine:
                 stage1.append((lat, a, planes, slot_frames))
                 del n
 
+        for lora, _ in stage_loras[0]:
+            lora.detach(dit)
+
         # ---- upscale ----
         with tm.span("upscale"):
             ups = []
@@ -3213,8 +3423,8 @@ class LTX25Engine:
         outputs: list[tuple] = []
         carry_v = carry_a = None
         incoming = None
-        if stage2_lora is not None:
-            stage2_lora.attach(dit)
+        for lora, strength in stage_loras[1]:
+            lora.attach(dit, strength)
         try:
             with tm.span("stage2"):
                 for i, (layout, (up, a1, planes_up, _)) in enumerate(zip(plan, ups)):
@@ -3234,6 +3444,8 @@ class LTX25Engine:
                     audio = audio_state(
                         layout, stage_seed, s0, a1, carry_a, freeze_stage2_audio
                     )
+                    if audio_extra is not None:
+                        audio = audio_extra(audio, layout, "stage2", a1)
                     den = Denoiser(
                         dit,
                         video_text,
@@ -3292,8 +3504,8 @@ class LTX25Engine:
                     incoming = outgoing(planes, slot_frames, layout)
                     outputs.append((lat, a, keyframes))
         finally:
-            if stage2_lora is not None:
-                stage2_lora.detach(dit)
+            for lora, _ in stage_loras[1]:
+                lora.detach(dit)
         del ups
 
         # ---- decode and stitch (upstream decode_chunks) ----
@@ -3619,9 +3831,7 @@ class LTX25Engine:
                 seams = [2 * p for p in seams]
             generated_kf, guides_kf = list(seams), list(seams)
         with tm.span("encode_video"):
-            frames = media.read_frames(video_path, info, 0.0, num_frames / src_fps)[
-                :num_frames
-            ]
+            frames = media.read_frames_by_index(video_path, info, 0, num_frames)
             if is_exr:
                 px = np.stack(
                     [image_mod.resize_and_reflect_pad(f, gen_h, gen_w) for f in frames]

@@ -659,6 +659,9 @@ def normalize_dubit_request(
             still_field(item, frames, "dubit") for item in _list(body["images"])
         ]
     params.update(keyframe_fields(body, "dubit"))
+    chunk = chunk_config(body, "dubit")
+    if chunk is not None:
+        params["chunk"] = chunk
     if fps_hint is not None:
         params["fps_hint"] = fps_hint
     hdr_field(body, params)
@@ -845,7 +848,7 @@ def a2vid_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]
     return out
 
 
-CHUNK_PIPELINES = ("distilled", "dev", "a2vid")
+CHUNK_PIPELINES = ("distilled", "dev", "a2vid", "ic_lora", "dubit")
 CHUNK_KEYS = (
     "chunked",
     "chunk_pixel_frames",
