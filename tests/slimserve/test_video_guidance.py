@@ -224,4 +224,4 @@ def test_the_engine_attaches_user_loras_around_a_request():
     import inspect
 
     src = inspect.getsource(server.VideoService._generate)
-    assert 'engine.user_loras(p.pop("loras", None))' in src
+    assert "with engine.user_loras(loras):" in src
