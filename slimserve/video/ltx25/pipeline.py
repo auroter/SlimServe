@@ -811,6 +811,67 @@ class LTX25Engine:
         mx.eval(video.latent, video.clean, video.denoise_mask)
         return video
 
+    # ---- generated keyframe slots (upstream --num-generated-keyframes) --------
+    @staticmethod
+    def _slot_frames(generated_keyframes, num_frames: int) -> list[int]:
+        """Upstream resolve_generated_keyframes: an int asks for that many
+        evenly spaced interior pixel frames (linspace over [0, F - 1] rounded,
+        endpoints dropped); a sequence gives the frames; 0 / empty is off."""
+        if isinstance(generated_keyframes, bool):
+            raise ValueError("generated_keyframes is a count or a list of frames")
+        if isinstance(generated_keyframes, int):
+            n = generated_keyframes
+            if n < 0:
+                raise ValueError("generated_keyframes must be non-negative")
+            if n == 0:
+                return []
+            if num_frames < n + 2:
+                raise ValueError(
+                    f"{n} generated keyframes need at least {n + 2} frames, "
+                    f"got {num_frames}"
+                )
+            return [
+                int(x) for x in np.rint(np.linspace(0, num_frames - 1, n + 2))[1:-1]
+            ]
+        frames = sorted({int(x) for x in generated_keyframes})
+        if frames and (frames[0] < 0 or frames[-1] >= num_frames):
+            raise ValueError(f"generated keyframes must lie in [0, {num_frames})")
+        return frames
+
+    def _slots_stage1(self, video, frames, h, w, fps, seed):
+        if not frames:
+            return video, None
+        return sampling.append_slots(video, frames, h, w, fps, None, 1.0, seed)
+
+    def _slots_upscaled(self, v1, slots, frames, h1, w1):
+        """The stage-1 slot planes, x2 upscaled, as stage 2's initial content."""
+        if slots is None:
+            return None
+        vae, upscaler = self.load_vae(), self.load_upscaler()
+        planes = sampling.slots_to_latent(v1, slots, len(frames), h1, w1)
+        up = vae.normalize(upscaler(vae.denormalize(planes)))
+        mx.eval(up)
+        return up
+
+    def _slots_stage2(self, video, frames, h, w, fps, initial, sigma, seed):
+        if not frames:
+            return video, None
+        return sampling.append_slots(video, frames, h, w, fps, initial, sigma, seed)
+
+    @staticmethod
+    def _decode_keyframes(v, slots, frames, h, w, num_frames, decode_with_keyframes):
+        """The denoised slot planes for the keyframe-aware decode (upstream
+        decode_keyframes_from_slots), or None."""
+        if slots is None or not decode_with_keyframes:
+            return None
+        planes = sampling.slots_to_latent(v, slots, len(frames), h, w)
+        kept = [i for i, fr in enumerate(frames) if 0 <= fr < num_frames]
+        if not kept:
+            return None
+        planes = mx.concatenate([planes[:, :, i : i + 1] for i in kept], axis=2)
+        mx.eval(planes)
+        return planes, [frames[i] for i in kept]
+
     # ---- distilled --------------------------------------------------------
     def distilled(
         self,
@@ -828,13 +889,19 @@ class LTX25Engine:
         fast: Fast | None = None,
         max_num_frames: int | None = None,
         images: list[sampling.Still] | None = None,
+        generated_keyframes: int | list[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> Result:
         """`image` (a path or encoded image bytes) conditions the first frame
         (image-to-video) at `image_strength` in both stages; `images` are
         further stills at any pixel frame (upstream's repeatable --image: frame
         0 replaces latent frame 0, other frames become appended keyframe
         tokens). `fast` stacks the output-changing fast tier (see `Fast`).
-        `num_frames` None: the duration head decides (see `resolve_frames`)."""
+        `num_frames` None: the duration head decides (see `resolve_frames`).
+        `generated_keyframes` (upstream --num-generated-keyframes): that many
+        evenly spaced generated keyframe slots (or the frames given) ride in
+        both stages as in DFR; `decode_with_keyframes` anchors the diffusion
+        decode on them."""
         fast = fast or Fast()
         tm = Timings()
         if text_embeds is None:
@@ -873,6 +940,8 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, cond1, fps, 1.0, seed)
+            slot_frames = self._slot_frames(generated_keyframes, num_frames)
+            video, slots = self._slots_stage1(video, slot_frames, h1, w1, fps, seed)
             audio = sampling.noised_state(
                 (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
             )
@@ -891,6 +960,7 @@ class LTX25Engine:
             half = sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1))
             up = vae.normalize(upscaler(vae.denormalize(half)))
             mx.eval(up)
+            slots_up = self._slots_upscaled(v1, slots, slot_frames, h1, w1)
         h2, w2 = h1 * 2, w1 * 2
         cond2 = self._image_latents(stills, h2, w2, tm)
 
@@ -909,6 +979,9 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, cond2, fps, s0, seed + 2)
+            video, slots2 = self._slots_stage2(
+                video, slot_frames, h2, w2, fps, slots_up, s0, seed + 2
+            )
             denoise = Denoiser(
                 dit,
                 video_text,
@@ -941,6 +1014,9 @@ class LTX25Engine:
             width,
             fps,
             tm,
+            keyframes=self._decode_keyframes(
+                v2, slots2, slot_frames, h2, w2, num_frames, decode_with_keyframes
+            ),
             predicted_seconds=predicted,
         )
 
@@ -1628,6 +1704,8 @@ class LTX25Engine:
         images: list[sampling.Still] | None = None,
         keyframes_only: bool = False,
         source_audio: tuple[mx.array, np.ndarray, int] | None = None,
+        generated_keyframes: int | list[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> Result:
         """Lightricks' TI2VidTwoStagesPipeline: guided dev stage 1 at half
         resolution, 2x latent upscale, 3-step stage 2 with the distilled LoRA
@@ -1689,6 +1767,8 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, cond1, fps, 1.0, seed, keyframes_only)
+            slot_frames = self._slot_frames(generated_keyframes, num_frames)
+            video, slots = self._slots_stage1(video, slot_frames, h1, w1, fps, seed)
             if source_audio is not None:
                 tokens = source_audio[0][:, :audio_t]
                 if tokens.shape[1] < audio_t:
@@ -1724,6 +1804,7 @@ class LTX25Engine:
             half = sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1))
             up = vae.normalize(upscaler(vae.denormalize(half)))
             mx.eval(up)
+            slots_up = self._slots_upscaled(v1, slots, slot_frames, h1, w1)
         h2, w2 = h1 * 2, w1 * 2
         cond2 = self._image_latents(stills, h2, w2, tm)
 
@@ -1740,6 +1821,9 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, cond2, fps, s0, seed + 2, keyframes_only)
+            video, slots2 = self._slots_stage2(
+                video, slot_frames, h2, w2, fps, slots_up, s0, seed + 2
+            )
             if keyframes_only and source_audio is None:
                 # Upstream keyframe_interpolation.py re-noises the stage-1 audio
                 # to sigma 0.909 and refines it with the video; it ships from
@@ -1789,6 +1873,9 @@ class LTX25Engine:
             width,
             fps,
             tm,
+            keyframes=self._decode_keyframes(
+                v2, slots2, slot_frames, h2, w2, num_frames, decode_with_keyframes
+            ),
             predicted_seconds=predicted,
             source_audio=None if source_audio is None else source_audio[1:],
         )
@@ -1873,6 +1960,8 @@ class LTX25Engine:
         fast: Fast | None = None,
         max_num_frames: int | None = None,
         images: list[sampling.Still] | None = None,
+        generated_keyframes: int | list[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> Result:
         """Lightricks' TI2VidOneStagePipeline: one guided dev stage at the
         output size (sizes snap to 32), no upsampler, audio from the same
@@ -1921,6 +2010,8 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, conds, fps, 1.0, seed)
+            slot_frames = self._slot_frames(generated_keyframes, num_frames)
+            video, slots = self._slots_stage1(video, slot_frames, h, w, fps, seed)
             audio = sampling.noised_state(
                 (1, audio_t, 128),
                 sampling.audio_positions(audio_t),
@@ -1946,6 +2037,9 @@ class LTX25Engine:
             width,
             fps,
             tm,
+            keyframes=self._decode_keyframes(
+                v, slots, slot_frames, h, w, num_frames, decode_with_keyframes
+            ),
             predicted_seconds=predicted,
         )
 
@@ -2168,6 +2262,8 @@ class LTX25Engine:
         on_step: Callable[[str, int, float], None] | None = None,
         fast: Fast | None = None,
         max_num_frames: int | None = None,
+        generated_keyframes: int | list[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> Result:
         """Lightricks' ICLoraPipeline, the CLI's two-stage recipe: stage 1 at
         half resolution on the distilled transformer under the IC-LoRA
@@ -2371,6 +2467,12 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video, extents = conditioned(video, h1, w1, 1.0, seed, True)
+            slot_frames = self._slot_frames(generated_keyframes, num_frames)
+            video, slots = self._slots_stage1(video, slot_frames, h1, w1, fps, seed)
+            if slots is not None:
+                extents = np.concatenate(
+                    [extents, *([extents[: h1 * w1]] * len(slot_frames))]
+                )
             audio = sampling.noised_state(
                 (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
             )
@@ -2394,12 +2496,16 @@ class LTX25Engine:
                 width // 2,
                 fps,
                 tm,
+                keyframes=self._decode_keyframes(
+                    v1, slots, slot_frames, h1, w1, num_frames, decode_with_keyframes
+                ),
                 predicted_seconds=predicted,
             )
         with tm.span("upscale"):
             half = sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1))
             up = vae.normalize(upscaler(vae.denormalize(half)))
             mx.eval(up)
+            slots_up = self._slots_upscaled(v1, slots, slot_frames, h1, w1)
         h2, w2 = h1 * 2, w1 * 2
         with tm.span("stage2"):
             sigmas2 = fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS)
@@ -2414,6 +2520,13 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video, extents = conditioned(video, h2, w2, s0, seed + 2, stage_2_ic_lora)
+            video, slots2 = self._slots_stage2(
+                video, slot_frames, h2, w2, fps, slots_up, s0, seed + 2
+            )
+            if slots2 is not None:
+                extents = np.concatenate(
+                    [extents, *([extents[: h2 * w2]] * len(slot_frames))]
+                )
             audio = sampling.noised_state(
                 (1, audio_t, 128),
                 apos,
@@ -2441,6 +2554,9 @@ class LTX25Engine:
             width,
             fps,
             tm,
+            keyframes=self._decode_keyframes(
+                v2, slots2, slot_frames, h2, w2, num_frames, decode_with_keyframes
+            ),
             predicted_seconds=predicted,
         )
 
@@ -2460,6 +2576,8 @@ class LTX25Engine:
         keep_text: bool = True,
         on_step: Callable[[str, int, float], None] | None = None,
         fast: Fast | None = None,
+        generated_keyframes: int | list[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> Result:
         """Lightricks' DubItPipeline: the distilled transformer with one Dub-It
         IC-LoRA in both stages; the reference clip (its frame count, snapped
@@ -2551,6 +2669,8 @@ class LTX25Engine:
                     bf16_noise=self.bf16_noise,
                 )
                 video = with_reference(video, h1, w1, 1.0, seed)
+                slot_frames = self._slot_frames(generated_keyframes, num_frames)
+                video, slots = self._slots_stage1(video, slot_frames, h1, w1, fps, seed)
                 audio = sampling.noised_state(
                     (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
                 )
@@ -2569,6 +2689,7 @@ class LTX25Engine:
                 half = sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1))
                 up = vae.normalize(upscaler(vae.denormalize(half)))
                 mx.eval(up)
+                slots_up = self._slots_upscaled(v1, slots, slot_frames, h1, w1)
             h2, w2 = h1 * 2, w1 * 2
             with tm.span("stage2"):
                 sigmas2 = fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS)
@@ -2583,6 +2704,9 @@ class LTX25Engine:
                     bf16_noise=self.bf16_noise,
                 )
                 video = with_reference(video, h2, w2, s0, seed + 2)
+                video, slots2 = self._slots_stage2(
+                    video, slot_frames, h2, w2, fps, slots_up, s0, seed + 2
+                )
                 # stage-1 audio frozen, and appended as its own reference
                 audio = sampling.LatentState(
                     latent=a1,
@@ -2616,6 +2740,9 @@ class LTX25Engine:
             width,
             fps,
             tm,
+            keyframes=self._decode_keyframes(
+                v2, slots2, slot_frames, h2, w2, num_frames, decode_with_keyframes
+            ),
         )
 
     # ---- text to audio ----------------------------------------------------------
@@ -2718,6 +2845,8 @@ class LTX25Engine:
         images: list[sampling.Still] | None = None,
         lora_stage_1: float = HQ_LORA_STAGE_1,
         lora_stage_2: float = HQ_LORA_STAGE_2,
+        generated_keyframes: int | list[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> Result:
         """Lightricks' TI2VidTwoStagesHQPipeline: the dev transformer with the
         distilled LoRA at 0.25, 15 guided res_2s steps (CFG 3 / 7, no STG,
@@ -2767,6 +2896,8 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, cond1, fps, 1.0, seed)
+            slot_frames = self._slot_frames(generated_keyframes, num_frames)
+            video, slots = self._slots_stage1(video, slot_frames, h1, w1, fps, seed)
             audio = sampling.noised_state(
                 (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
             )
@@ -2791,6 +2922,7 @@ class LTX25Engine:
             half = sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1))
             up = vae.normalize(upscaler(vae.denormalize(half)))
             mx.eval(up)
+            slots_up = self._slots_upscaled(v1, slots, slot_frames, h1, w1)
         h2, w2 = h1 * 2, w1 * 2
         cond2 = self._image_latents(stills, h2, w2, tm)
 
@@ -2807,6 +2939,9 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, cond2, fps, s0, seed + 2)
+            video, slots2 = self._slots_stage2(
+                video, slot_frames, h2, w2, fps, slots_up, s0, seed + 2
+            )
             audio = sampling.noised_state(
                 (1, audio_t, 128),
                 apos,
@@ -2837,6 +2972,9 @@ class LTX25Engine:
             width,
             fps,
             tm,
+            keyframes=self._decode_keyframes(
+                v2, slots2, slot_frames, h2, w2, num_frames, decode_with_keyframes
+            ),
             predicted_seconds=predicted,
         )
 

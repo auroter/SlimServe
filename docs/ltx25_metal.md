@@ -127,6 +127,15 @@ runs with no video modality (each block's audio half only, as upstream's
 `video=None`), the audio guider as the guided profiles, and the job's
 content is a 48 kHz stereo WAV (`audio/wav`).
 
+`generated_keyframes` (upstream's `--num-generated-keyframes`; CLI flag of the
+same name) on the distilled, dev, hq, one-stage, a2vid, ic-lora and dubit
+profiles asks for that many generated keyframe slots at evenly spaced
+interior frames (or a list of frames): extra single-pixel-frame tokens the
+model denoises with the clip in both stages (stage 2 seeded from the
+upscaled stage-1 slots), the DFR mechanism on the plain flows;
+`decode_with_keyframes` (`--decode-with-keyframes`) then anchors the
+diffusion decode on them (the conv decoder ignores them, as upstream).
+
 `ltx25-dfr` takes two more options (upstream's `--temporal-upscalings` and
 `--spatial-upscalings`; CLI flags of the same names): `temporal_upscalings`
 1 or 2 doubles the frame rate per round (the canvas is x2 temporally
@@ -403,8 +412,7 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 ## Not implemented yet
 
 Of upstream's pipelines and options (ledger section 30): HDRICLoraPipeline
-and the native `--hdr` EXR path, alpha_gen; generated keyframes on the
-distilled flow and chunked long clips. The I2V
+and the native `--hdr` EXR path, alpha_gen; chunked long clips. The I2V
 first-frame path is wired but its end-to-end output has not been compared
 against upstream on this machine.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on

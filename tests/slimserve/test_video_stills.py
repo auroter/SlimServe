@@ -210,3 +210,34 @@ def test_cli_image_groups_follow_upstreams_path_frame_strength_crf(tmp_path):
         cli._add_images(
             {}, SimpleNamespace(image=[[str(tmp_path / "no.png")]], image_strength=None)
         )
+
+
+def test_generated_keyframe_frames_match_upstreams_spacing():
+    """evenly_spaced_keyframe_positions on Lightricks/LTX-2 9ec55f9."""
+    from slimserve.video.ltx25.pipeline import LTX25Engine
+
+    f = LTX25Engine._slot_frames
+    assert f(1, 49) == [24] and f(2, 49) == [16, 32]
+    assert f(3, 121) == [30, 60, 90] and f(5, 121) == [20, 40, 60, 80, 100]
+    assert f(4, 33) == [6, 13, 19, 26]
+    assert f(0, 49) == [] and f([40, 8, 8], 49) == [8, 40]
+    with pytest.raises(ValueError):
+        f(2, 3)
+    with pytest.raises(ValueError):
+        f([49], 49)
+    params = server.normalize_request(
+        {
+            "prompt": "x",
+            "seconds": 2,
+            "generated_keyframes": 2,
+            "decode_with_keyframes": True,
+        },
+        CFG,
+    )
+    assert params["generated_keyframes"] == 2 and params["decode_with_keyframes"]
+    with pytest.raises(server.BadRequest, match="needs generated_keyframes"):
+        server.normalize_request({"prompt": "x", "decode_with_keyframes": True}, CFG)
+    with pytest.raises(server.BadRequest, match="applies to"):
+        server.normalize_request(
+            {"prompt": "x", "generated_keyframes": 2}, {**CFG, "pipeline": "dfr"}
+        )

@@ -1714,3 +1714,19 @@ with video None, 18 audio tokens): rel-L2 **1.6e-3**, the plain forward's
 fp16 error. Smoke (`n12/t2a.wav`): "gentle rain on a tin roof with distant
 thunder", 3 s: 21.7 s (stage 1 8.0 s for 30 steps x 3 passes on 73 tokens),
 a 3.01 s 48 kHz stereo WAV, broadband (centroid 6 kHz).
+
+## 37. Generated keyframes on the plain flows (2026-10-08)
+
+Upstream's `--num-generated-keyframes` / `--decode-with-keyframes` on
+distilled, dev (and so keyframes-interpolation's dev flow is untouched:
+upstream offers none there), hq, one-stage, a2vid, ic_lora and dubit:
+`LTX25Engine._slot_frames` = resolve_generated_keyframes (a count ->
+linspace over [0, F - 1] rounded without the endpoints; [1, 49] -> 24, [2,
+49] -> 16, 32, [3, 121] -> 30, 60, 90, [4, 33] -> 6, 13, 19, 26, as
+upstream prints), the DFR slot machinery (`append_slots`, marked, noised
+from seed + 20000) appended after the pipeline's own conditionings in
+stage 1, the x2-upscaled stage-1 planes as stage 2's initial slots, and the
+denoised stage-2 planes handed to the keyframe-aware diffusion decode (the
+conv decoder ignores them, as upstream warns and does). IC-LoRA's tiled
+stages get the slots' extents. Smoke: distilled 768x512x49 with two slots
+(frames 16 and 32) and the keyframe decode: 58.8 s (decode 8.7 s).

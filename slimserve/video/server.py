@@ -263,6 +263,7 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         )
     if body.get("loras") is not None:
         params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
+    params.update(keyframe_fields(body, cfg["pipeline"]))
     if cfg["pipeline"] == "ic_lora":
         params.update(ic_lora_fields(body, params))
     elif any(key in body for key in IC_LORA_KEYS):
@@ -689,6 +690,55 @@ def a2vid_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]
         raise BadRequest(
             "audio_max_duration and a clip length (seconds / num_frames) are exclusive"
         )
+    return out
+
+
+KEYFRAME_PIPELINES = (
+    "distilled",
+    "dev",
+    "hq",
+    "one_stage",
+    "a2vid",
+    "ic_lora",
+    "dubit",
+)
+
+
+def keyframe_fields(body: dict[str, Any], pipeline: str) -> dict[str, Any]:
+    """`generated_keyframes` (a count of evenly spaced interior keyframe slots,
+    or a list of pixel frames; upstream --num-generated-keyframes) and
+    `decode_with_keyframes` (anchor the diffusion decode on them; needs
+    slots) on the pipelines upstream offers them on (DFR has its own)."""
+    out: dict[str, Any] = {}
+    if "generated_keyframes" in body:
+        if pipeline not in KEYFRAME_PIPELINES:
+            raise BadRequest(
+                f"generated_keyframes applies to {', '.join(KEYFRAME_PIPELINES)}"
+            )
+        value = body["generated_keyframes"]
+        if isinstance(value, bool) or not (
+            (isinstance(value, int) and value >= 0)
+            or (
+                isinstance(value, list)
+                and value
+                and all(
+                    isinstance(v, int) and not isinstance(v, bool) and v >= 0
+                    for v in value
+                )
+            )
+        ):
+            raise BadRequest(
+                "generated_keyframes is a non-negative count or a list of pixel frames"
+            )
+        if value:
+            out["generated_keyframes"] = value
+    if "decode_with_keyframes" in body:
+        if not isinstance(body["decode_with_keyframes"], bool):
+            raise BadRequest("decode_with_keyframes must be true or false")
+        if body["decode_with_keyframes"]:
+            if not out.get("generated_keyframes"):
+                raise BadRequest("decode_with_keyframes needs generated_keyframes")
+            out["decode_with_keyframes"] = True
     return out
 
 

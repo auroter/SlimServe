@@ -148,9 +148,11 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     ):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
-    for key in ("skip_stage_2", "stage_2_ic_lora", "tile"):
+    for key in ("skip_stage_2", "stage_2_ic_lora", "tile", "decode_with_keyframes"):
         if getattr(args, key, False):
             body[key] = True
+    if getattr(args, "num_generated_keyframes", None):
+        body["generated_keyframes"] = args.num_generated_keyframes
     if getattr(args, "video_conditioning", None):
         body["video_conditioning"] = []
         for group in args.video_conditioning:

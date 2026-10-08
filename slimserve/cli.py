@@ -127,6 +127,17 @@ def _parser() -> argparse.ArgumentParser:
     video.add_argument(
         "--end-time", type=float, help="retake: end of the region to regenerate (s)"
     )
+    video.add_argument(
+        "--num-generated-keyframes",
+        type=int,
+        help="extra generated keyframe slots at evenly spaced interior frames "
+        "(distilled, dev, hq, one-stage, a2vid, ic-lora, dubit; DFR has its own)",
+    )
+    video.add_argument(
+        "--decode-with-keyframes",
+        action="store_true",
+        help="anchor the diffusion decode on the generated keyframes",
+    )
     video.add_argument("--audio-path", help="a2vid: the driving audio (any container)")
     video.add_argument(
         "--audio-start-time", type=float, help="a2vid: where in the audio to start (s)"
