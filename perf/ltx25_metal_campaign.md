@@ -1787,3 +1787,32 @@ applied (the IC-LoRA / Dub-It adapters were popped into the request-wide
 LoRA context instead of reaching the pipeline, and chunked requests did not
 receive the decoder); `test_adapter_and_chunk_arguments_reach_the_right_place`
 now pins both through the service.
+
+## 40. The native HDR path (2026-10-08)
+
+Upstream's `--hdr` on every profile (`hdr.py`): `to_working_space` /
+`to_linear` = ltx_core/hdr.py's ACEScct compress / decompress with
+colour-science's CAT02 Rec.709 <-> ACEScg and -> Rec.2020 matrices dumped
+as constants (identical to upstream to 2e-8), the sRGB EOTF (identical),
+`linear_to_hlg_planes` = HlgGpuConverter + rgb_to_yuv420p10 (Rec.2020,
+diffuse white to signal 0.75 = linear 0.2650 with highlights rolled, the
+BT.2100 OETF, BT.2020 Y'CbCr limited range 4:2:0 10-bit: identical planes
+bit for bit on a random HDR frame, `tests/slimserve/data/ltx25_hdr_ref.npz`),
+EXR frames through the OpenEXR 3.5 wheel (OpenImageIO upstream; half floats,
+ZIP, chromaticities and colorSpace tags), the HLG master through ffmpeg's
+libx265 with upstream's x265 parameters and colour tags (PyAV upstream).
+Inputs: EXR stills by path (`image.HDRFrame`, resized then compressed per
+stage as upstream), EXR frame folders as retake sources (center crop) and
+references (reflect pad, `image.resize_and_reflect_pad`), `fps` required
+for a folder. Output: the decode kept in fp32 (`_codes`: the diffusion or
+the conv decoder's floats), `hdr.write_hdr_outputs` writes the EXR folder
+in the request's colour space and the HLG master; chunked clips too.
+
+Smoke (`n12/retake_hdr.*`): the fox clip as 33 EXR frames (display-linear
+Rec.709 x2), `ltx25-retake --hdr srgb_linear --frame-rate 24` on
+0.5-1.0 s: 51.6 s; 33 EXR frames out (sRGB tag, Rec.709 chromaticities)
+and an HEVC yuv420p10le master tagged bt2020 / arib-std-b67 / bt2020nc tv.
+The kept frames come back through the SDR model's VAE at 15% rel-L2 in
+linear (the log space amplifies code error at highlights: a 2.0 input
+reaches 29 at a pixel) - the SDR-To-HDR IC-LoRA pipeline (next) is what
+makes HDR content.

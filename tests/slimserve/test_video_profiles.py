@@ -328,7 +328,7 @@ class _FakeEngine:
 
         return _Result()
 
-    def render(self, result, path, seed=42, decoder=None):
+    def render(self, result, path, seed=42, decoder=None, hdr=None):
         self.decoders = getattr(self, "decoders", []) + [decoder]
         path.write_bytes(b"mp4")
         return path

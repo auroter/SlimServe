@@ -60,7 +60,17 @@ class VideoInfo:
     audio_channels: int | None = None
 
 
-def probe(path: str | os.PathLike) -> VideoInfo:
+def probe(path: str | os.PathLike, fps: float | None = None) -> VideoInfo:
+    """Upstream get_videostream_metadata; an EXR frame folder has no container
+    rate, so `fps` is required for one (`--frame-rate`)."""
+    from slimserve.video.ltx25 import hdr
+
+    if hdr.is_exr_dir(path):
+        if fps is None:
+            raise ValueError(f"{path} is an EXR frame folder; its frame rate is needed")
+        files = hdr.exr_paths(path)
+        h, w = hdr.read_exr(files[0]).shape[:2]
+        return VideoInfo(len(files), h, w, float(fps), has_audio=False)
     ffprobe = _ffmpeg_binary().replace("ffmpeg", "ffprobe")
     out = _run(
         [
@@ -123,7 +133,17 @@ def read_frames(
     max_duration: float | None = None,
 ) -> np.ndarray:
     """Decoded frames as uint8 (F, H, W, 3), the frames whose presentation
-    time lies in [start_time, start_time + max_duration)."""
+    time lies in [start_time, start_time + max_duration). An EXR folder gives
+    float32 scene-linear frames by index instead (upstream
+    load_exr_as_hdr_conditioning: frame_start round(start * fps), frame_cap
+    round(duration * fps))."""
+    from slimserve.video.ltx25 import hdr
+
+    if hdr.is_exr_dir(path):
+        files = hdr.exr_paths(path)[round(start_time * info.fps) :]
+        if max_duration is not None:
+            files = files[: max(1, round(max_duration * info.fps))]
+        return np.stack([hdr.read_exr(f) for f in files])
     args = [_ffmpeg_binary(), "-loglevel", "error"]
     if start_time > 0:
         args += ["-accurate_seek", "-ss", f"{start_time:.6f}"]

@@ -231,13 +231,68 @@ def resize_and_center_crop(image: np.ndarray, height: int, width: int) -> np.nda
     return resized[top : top + height, left : left + width]
 
 
-def prepare_image(source: str | bytes | os.PathLike, crf: int = DEFAULT_IMAGE_CRF):
-    """Decode and CRF round-trip once; the result is resized per stage."""
+def resize_and_reflect_pad(image: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Upstream resize.py resize_and_reflect_pad (the HDR reference frames):
+    keep the aspect, scale to fit inside (no interpolation when the target
+    already holds the source), pad bottom / right by reflection (replicate
+    when the pad would exceed the content)."""
+    src_h, src_w = image.shape[:2]
+    if height >= src_h and width >= src_w:
+        x = np.asarray(image, dtype=np.float32)
+    else:
+        scale = min(height / src_h, width / src_w)
+        x = resize_bilinear(image, round(src_h * scale), round(src_w * scale))
+    pad_b, pad_r = height - x.shape[0], width - x.shape[1]
+    if pad_b > 0 or pad_r > 0:
+        mode = "reflect" if pad_b < x.shape[0] and pad_r < x.shape[1] else "edge"
+        x = np.pad(x, [(0, pad_b), (0, pad_r), (0, 0)], mode=mode)
+    return x
+
+
+class HDRFrame:
+    """A scene-linear (or ACEScct-coded) float still from an EXR, with the
+    colour space it was declared in; resized per stage and compressed into
+    the model's ACEScct working space there (as upstream resizes the linear
+    pixels before compressing)."""
+
+    def __init__(self, linear: np.ndarray, color_space: str):
+        self.linear, self.color_space = linear, color_space
+        self.shape = linear.shape
+
+
+def hdr_conditioning_frame(frame: HDRFrame, height: int, width: int) -> mx.array:
+    """EXR still -> (1, 3, 1, height, width) fp32 in [-1, 1] (upstream
+    load_exr_image_as_hdr_conditioning: center crop, to_working_space,
+    to_vae_range)."""
+    from slimserve.video.ltx25 import hdr
+
+    px = resize_and_center_crop(frame.linear, height, width)
+    codes = hdr.to_working_space(px, frame.color_space) * 2.0 - 1.0
+    return mx.array(np.ascontiguousarray(codes.transpose(2, 0, 1)))[None, :, None]
+
+
+def prepare_image(
+    source: str | bytes | os.PathLike,
+    crf: int = DEFAULT_IMAGE_CRF,
+    color_space: str | None = None,
+):
+    """Decode and CRF round-trip once; the result is resized per stage. An
+    `.exr` path (needs `color_space`) is read scene-linear and skips the
+    round trip (upstream load_image_and_preprocess)."""
+    if isinstance(source, (str, os.PathLike)) and str(source).lower().endswith(".exr"):
+        if color_space is None:
+            raise ValueError("an EXR still needs the hdr colour space")
+        from slimserve.video.ltx25 import hdr
+
+        return HDRFrame(hdr.read_exr(source), color_space)
     return recompress(decode_image(source), crf)
 
 
-def conditioning_frame(image: np.ndarray, height: int, width: int) -> mx.array:
-    """Prepared uint8 (H, W, 3) -> (1, 3, 1, height, width) fp32 in [-1, 1]."""
+def conditioning_frame(image, height: int, width: int) -> mx.array:
+    """Prepared uint8 (H, W, 3) -> (1, 3, 1, height, width) fp32 in [-1, 1]
+    (an HDRFrame through the ACEScct working space)."""
+    if isinstance(image, HDRFrame):
+        return hdr_conditioning_frame(image, height, width)
     frame = resize_and_center_crop(image, height, width) / 127.5 - 1.0
     return mx.array(np.ascontiguousarray(frame.transpose(2, 0, 1)))[None, :, None]
 

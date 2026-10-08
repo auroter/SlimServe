@@ -194,7 +194,9 @@ def crossfade_video(previous: np.ndarray, overlap: np.ndarray) -> np.ndarray:
     a = previous[-count:].astype(np.float32)
     b = overlap[-count:].astype(np.float32)
     blended = a + (b - a) * w
-    return np.concatenate([previous[:-count], np.rint(blended).astype(previous.dtype)])
+    if previous.dtype == np.uint8:
+        blended = np.rint(blended)
+    return np.concatenate([previous[:-count], blended.astype(previous.dtype)])
 
 
 AUDIO_SEAM_CROSSFADE_MS = 40.0

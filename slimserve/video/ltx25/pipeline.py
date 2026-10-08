@@ -49,6 +49,13 @@ HQ_LORA_STAGE_1, HQ_LORA_STAGE_2 = 0.25, 0.5
 RES2S_NOISE_SEED_OFFSET = 40000
 
 
+def _codes(pixels: mx.array) -> np.ndarray:
+    """(1, 3, T, H, W) in [-1, 1] -> float32 (T, H, W, 3) ACEScct codes in
+    [0, 1] (the HDR decode keeps the floats; upstream's decoded_video)."""
+    x = (mx.clip(pixels[0], -1.0, 1.0) + 1.0) * 0.5
+    return np.array(x.transpose(1, 2, 3, 0)).astype(np.float32)
+
+
 @dataclass
 class Timings:
     spans: dict[str, float] = field(default_factory=dict)
@@ -101,6 +108,9 @@ class Result:
     # chunked long clips: already decoded and stitched (uint8 frames (F, H, W,
     # 3), waveform (channels, samples), rate); render only muxes
     decoded: tuple[np.ndarray, np.ndarray, int] | None = None
+    # the request's HDR colour space: render decodes in fp32 and writes the EXR
+    # folder and the HLG master instead of an H.264 mp4
+    hdr: str | None = None
 
 
 class Denoiser:
@@ -586,6 +596,32 @@ class LTX25Engine:
     # ---- source clips (retake, IC-LoRA, A2Vid, DubIt) ----------------------------
     SOURCE_ENCODE_TILING = ((768, 64), (80, 24))  # upstream TileSizeConfig.default()
 
+    @staticmethod
+    def _frames_to_pixels(
+        frames: np.ndarray, height, width, color_space, reflect=False
+    ):
+        """Decoded frames -> (1, 3, F, height, width) fp32 in [-1, 1]: uint8
+        frames resized to fill and center-cropped then x / 127.5 - 1; float
+        (EXR) frames resized (reflect-padded for references, as upstream)
+        and compressed into the ACEScct working space."""
+        from slimserve.video.ltx25 import hdr
+        from slimserve.video.ltx25 import image as image_mod
+
+        resize = (
+            image_mod.resize_and_reflect_pad
+            if reflect
+            else image_mod.resize_and_center_crop
+        )
+        if frames.dtype == np.uint8:
+            px = np.stack([resize(f.astype(np.float32), height, width) for f in frames])
+            px = px / 127.5 - 1.0
+        else:
+            if color_space is None:
+                raise ValueError("EXR frames need the hdr colour space")
+            px = np.stack([resize(f, height, width) for f in frames])
+            px = hdr.to_working_space(px, color_space) * 2.0 - 1.0
+        return mx.array(px.transpose(3, 0, 1, 2))[None]
+
     def _source_video_latent(
         self,
         path: str,
@@ -596,13 +632,13 @@ class LTX25Engine:
         start_time: float = 0.0,
         num_frames: int | None = None,
         fps: float | None = None,
+        color_space: str | None = None,
     ) -> mx.array:
         """Upstream video_latent_from_file: the frames in [start_time, start_time
         + num_frames / fps) decoded (`media.read_frames`), resized to fill and
         center-cropped to height x width and mapped to [-1, 1] as the stills
         are, tiled-encoded (frames 80/24, 768/64 px), the latent length
         conformed to the clip's (trimmed, or zero-padded at the end)."""
-        from slimserve.video.ltx25 import image as image_mod
         from slimserve.video.ltx25 import media
         from slimserve.video.ltx25.vae import Tiling
 
@@ -612,15 +648,7 @@ class LTX25Engine:
             frames = media.read_frames(path, info, start_time, num_frames / fps)
             if frames.shape[0] == 0:
                 raise ValueError(f"{path}: no frames from {start_time:.3f} s")
-            pixels = np.stack(
-                [
-                    image_mod.resize_and_center_crop(
-                        f.astype(np.float32), height, width
-                    )
-                    for f in frames
-                ]
-            )
-            pixels = mx.array((pixels / 127.5 - 1.0).transpose(3, 0, 1, 2))[None]
+            pixels = self._frames_to_pixels(frames, height, width, color_space)
             spatial, temporal = self.SOURCE_ENCODE_TILING
             latent = self.load_vae().encode_tiled(
                 pixels, Tiling(spatial=spatial, temporal=temporal)
@@ -751,6 +779,7 @@ class LTX25Engine:
         image_strength: float,
         images: list[sampling.Still] | None,
         num_frames: int,
+        color_space: str | None = None,
     ) -> list[tuple[np.ndarray, int, float]]:
         """Decode and CRF-round-trip every still once: (uint8 pixels, pixel
         frame, strength) in request order. `image` is the one-still shorthand
@@ -773,7 +802,9 @@ class LTX25Engine:
             crf = image_mod.DEFAULT_IMAGE_CRF if still.crf is None else still.crf
             out.append(
                 (
-                    image_mod.prepare_image(still.image, crf=crf),
+                    image_mod.prepare_image(
+                        still.image, crf=crf, color_space=color_space
+                    ),
                     still.frame,
                     still.strength,
                 )
@@ -886,6 +917,7 @@ class LTX25Engine:
     def distilled(
         self,
         prompt: str,
+        hdr: str | None = None,
         height: int = 1024,
         width: int = 1536,
         num_frames: int | None = 121,
@@ -942,7 +974,7 @@ class LTX25Engine:
         apos = sampling.audio_positions(audio_t)
 
         stepper = self._stepper(tm, on_step)
-        stills = self._prepare_images(image, image_strength, images, num_frames)
+        stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
         if chunk is not None:
             return self._chunked(
                 config=chunk,
@@ -967,6 +999,7 @@ class LTX25Engine:
                 tm=tm,
                 stepper=stepper,
                 decoder=decoder or self.decoder,
+                hdr=hdr,
             )
         cond1 = self._image_latents(stills, h1, w1, tm)
 
@@ -1071,6 +1104,7 @@ class LTX25Engine:
     def dfr(
         self,
         prompt: str,
+        hdr: str | None = None,
         height: int = 1024,
         width: int = 1536,
         num_frames: int | None = 121,
@@ -1138,7 +1172,7 @@ class LTX25Engine:
         audio_t = sampling.audio_token_count(canvas, fps)
         apos = sampling.audio_positions(audio_t)
         k = len(slot_frames)
-        stills = self._prepare_images(image, image_strength, images, num_frames)
+        stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
         cond1 = self._image_latents(stills, h1, w1, tm)
 
         with tm.span("stage1"):
@@ -1725,6 +1759,7 @@ class LTX25Engine:
     def dev(
         self,
         prompt: str,
+        hdr: str | None = None,
         height: int = 1024,
         width: int = 1536,
         num_frames: int | None = 121,
@@ -1797,7 +1832,7 @@ class LTX25Engine:
         audio_t = sampling.audio_token_count(num_frames, fps)
         apos = sampling.audio_positions(audio_t)
         stepper = self._stepper(tm, on_step)
-        stills = self._prepare_images(image, image_strength, images, num_frames)
+        stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
         if chunk is not None:
             if keyframes_only:
                 raise ValueError("keyframe interpolation is not chunked upstream")
@@ -1824,6 +1859,7 @@ class LTX25Engine:
                 tm=tm,
                 stepper=stepper,
                 decoder=decoder or self.decoder,
+                hdr=hdr,
             )
         cond1 = self._image_latents(stills, h1, w1, tm)
 
@@ -1954,6 +1990,7 @@ class LTX25Engine:
         self,
         prompt: str,
         audio_path: str,
+        hdr: str | None = None,
         audio_start_time: float = 0.0,
         audio_max_duration: float | None = None,
         num_frames: int | None = None,
@@ -1985,6 +2022,7 @@ class LTX25Engine:
         mx.eval(tm_tokens)
         return self.dev(
             prompt,
+            hdr=hdr,
             num_frames=num_frames,
             fps=fps,
             source_audio=(tm_tokens, wav, rate),
@@ -1996,6 +2034,7 @@ class LTX25Engine:
         self,
         prompt: str,
         images: list[sampling.Still],
+        hdr: str | None = None,
         **kwargs,
     ) -> Result:
         """Lightricks' KeyframeInterpolationPipeline: the dev flow with every
@@ -2006,12 +2045,13 @@ class LTX25Engine:
             raise ValueError("keyframe interpolation needs at least one still")
         if kwargs.get("image") is not None:
             raise ValueError("pass the stills as `images` (frame indices)")
-        return self.dev(prompt, images=images, keyframes_only=True, **kwargs)
+        return self.dev(prompt, hdr=hdr, images=images, keyframes_only=True, **kwargs)
 
     # ---- one stage ------------------------------------------------------------
     def one_stage(
         self,
         prompt: str,
+        hdr: str | None = None,
         height: int = 512,
         width: int = 768,
         num_frames: int | None = 121,
@@ -2067,7 +2107,7 @@ class LTX25Engine:
         f, h, w = sampling.video_latent_shape(num_frames, height, width)
         audio_t = sampling.audio_token_count(num_frames, fps)
         stepper = self._stepper(tm, on_step)
-        stills = self._prepare_images(image, image_strength, images, num_frames)
+        stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
         conds = self._image_latents(stills, h, w, tm)
 
         with tm.span("stage1"):
@@ -2119,6 +2159,8 @@ class LTX25Engine:
         video_path: str,
         start_time: float,
         end_time: float,
+        hdr: str | None = None,
+        fps: float | None = None,
         seed: int = 42,
         negative_prompt: str | None = None,
         steps: int = 40,
@@ -2151,7 +2193,7 @@ class LTX25Engine:
         if fast.guidance:
             video_guidance = replace(video_guidance, **fast.guidance)
             audio_guidance = replace(audio_guidance, **fast.guidance)
-        info = media.probe(video_path)
+        info = media.probe(video_path, fps)
         if (info.frames - 1) % 8:
             snapped = (info.frames - 1) // 8 * 8 + 1
             raise ValueError(
@@ -2186,7 +2228,7 @@ class LTX25Engine:
         num_frames, fps = info.frames, info.fps
         f, h, w = sampling.video_latent_shape(num_frames, info.height, info.width)
         source = self._source_video_latent(
-            video_path, info, info.height, info.width, tm
+            video_path, info, info.height, info.width, tm, color_space=hdr
         )
         audio_src = self._source_audio_tokens(video_path, info, num_frames, fps, tm)
         audio_t = sampling.audio_token_count(num_frames, fps)
@@ -2271,13 +2313,13 @@ class LTX25Engine:
         downscale: int,
         temporal_scale: int,
         tm: Timings,
+        color_space: str | None = None,
     ) -> tuple[mx.array, tuple[int, int, int]]:
         """Upstream append_ic_lora_reference_video_conditionings: the first
         num_frames frames of the reference (by index), resized to fill and
         center-cropped to the stage's size over `downscale`, frame 0 then every
         `temporal_scale`th frame kept, encoded untiled. Returns the patchified
         tokens and the latent (f, h, w)."""
-        from slimserve.video.ltx25 import image as image_mod
         from slimserve.video.ltx25 import media
 
         if height % downscale or width % downscale:
@@ -2294,13 +2336,10 @@ class LTX25Engine:
                 raise ValueError(f"{path}: no frames")
             if temporal_scale > 1:
                 frames = frames[[0, *range(1, frames.shape[0], temporal_scale)]]
-            pixels = np.stack(
-                [
-                    image_mod.resize_and_center_crop(fr.astype(np.float32), rh, rw)
-                    for fr in frames
-                ]
+            # EXR references are reflect-padded (ResizeMode.REFLECT_PAD upstream)
+            pixels = self._frames_to_pixels(
+                frames, rh, rw, color_space, reflect=frames.dtype != np.uint8
             )
-            pixels = mx.array((pixels / 127.5 - 1.0).transpose(3, 0, 1, 2))[None]
             latent = self.load_vae().encode(pixels)
             mx.eval(latent)
             del pixels, frames
@@ -2312,6 +2351,7 @@ class LTX25Engine:
         prompt: str,
         video_conditioning: list[tuple[str, float]],
         loras: list[tuple[str, float]],
+        hdr: str | None = None,
         height: int = 1024,
         width: int = 1536,
         num_frames: int | None = 121,
@@ -2413,7 +2453,7 @@ class LTX25Engine:
         height, width = sampling.snap_dimensions(
             height, width, two_stage=not skip_stage_2
         )
-        infos = {path: media.probe(path) for path, _ in video_conditioning}
+        infos = {path: media.probe(path, fps) for path, _ in video_conditioning}
         mask_video = None
         if attention_mask is not None:
             # upstream _load_mask_video: decoded at the stage-1 size, grey, [0, 1]
@@ -2434,7 +2474,7 @@ class LTX25Engine:
         audio_t = sampling.audio_token_count(num_frames, fps)
         apos = sampling.audio_positions(audio_t)
         stepper = self._stepper(tm, on_step)
-        stills = self._prepare_images(image, image_strength, images, num_frames)
+        stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
 
         def conditioned(video, h, w, sigma, stage_seed, with_reference):
             """The stage's conditioned state and, for the tiled stages, every
@@ -2460,6 +2500,7 @@ class LTX25Engine:
                         downscale,
                         temporal_scale,
                         tm,
+                        color_space=hdr,
                     )
                     weights = None
                     if mask_video is not None:
@@ -2635,6 +2676,8 @@ class LTX25Engine:
         prompt: str,
         reference_video: str,
         loras: list[tuple[str, float]],
+        hdr: str | None = None,
+        fps_hint: float | None = None,
         height: int = 1024,
         width: int = 1536,
         seed: int = 42,
@@ -2672,7 +2715,7 @@ class LTX25Engine:
             lora = self.user_lora_cache[key] = Lora.from_path(key).load()
         lora_strength = loras[0][1]
         downscale = lora.reference_downscale
-        info = media.probe(reference_video)
+        info = media.probe(reference_video, fps_hint)
         num_frames = max(1, (info.frames - 1) // 8 * 8 + 1)
         fps = info.fps
         tm = Timings()
@@ -2690,7 +2733,7 @@ class LTX25Engine:
         audio_t = sampling.audio_token_count(num_frames, fps)
         apos = sampling.audio_positions(audio_t)
         stepper = self._stepper(tm, on_step)
-        stills = self._prepare_images(image, image_strength, images, num_frames)
+        stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
         ref_audio = self._source_audio_tokens(
             reference_video, info, num_frames, fps, tm
         )
@@ -2715,6 +2758,7 @@ class LTX25Engine:
                 0.0,
                 num_frames,
                 fps,
+                color_space=hdr,
             )
             _, _, rf, rh, rw = latent.shape
             video = sampling.append_reference(
@@ -2894,9 +2938,12 @@ class LTX25Engine:
         return Result(None, a, num_frames, 0, 0, fps, tm, predicted_seconds=predicted)
 
     # ---- chunked long clips (upstream ltx_pipelines.chunks) ------------------------
-    def _decode_frames(self, latent: mx.array, keyframes, seed: int, decoder: str):
+    def _decode_frames(
+        self, latent: mx.array, keyframes, seed: int, decoder: str, hdr: str | None
+    ):
         """One window's pixels as uint8 (F, H, W, 3) through the configured
-        decoder (the diffusion one keyframe-aware when given)."""
+        decoder (the diffusion one keyframe-aware when given); float ACEScct
+        codes for an HDR request."""
         from slimserve.video.ltx25 import vae as vae_mod
 
         if decoder == "diffusion":
@@ -2904,10 +2951,14 @@ class LTX25Engine:
                 latent, seed=seed, keyframes=keyframes
             )
             mx.eval(pixels)
-            frames = vae_mod.to_uint8(pixels)
+            frames = _codes(pixels) if hdr else vae_mod.to_uint8(pixels)
             del pixels
             return frames
-        return self.load_vae().decode(latent, budget_bytes=self.decode_budget())
+        vae = self.load_vae()
+        if hdr:
+            chunks = vae.decode_chunks(latent, budget_bytes=self.decode_budget())
+            return np.concatenate([_codes(px) for px in chunks], axis=0)
+        return vae.decode(latent, budget_bytes=self.decode_budget())
 
     def _chunked(
         self,
@@ -2934,6 +2985,7 @@ class LTX25Engine:
         tm: Timings,
         stepper,
         decoder: str,
+        hdr: str | None = None,
     ) -> Result:
         """The two-stage flow over overlapping temporal windows (upstream
         generate_uniform_chunks -> denoise_chunks -> spatially_upsample_chunks
@@ -3242,7 +3294,7 @@ class LTX25Engine:
             rate = None
             fade = None
             for i, (layout, (lat, a, keyframes)) in enumerate(zip(plan, outputs)):
-                decoded = self._decode_frames(lat, keyframes, seed + i, decoder)
+                decoded = self._decode_frames(lat, keyframes, seed + i, decoder, hdr)
                 kept = decoded[layout.prev_carry :]
                 if source_audio is None:
                     wav, rate = self.load_audio().decode(a)
@@ -3300,6 +3352,7 @@ class LTX25Engine:
             fps,
             tm,
             decoded=(frames, waveform, rate),
+            hdr=hdr,
         )
 
     # ---- alpha-gen ----------------------------------------------------------------
@@ -3312,6 +3365,7 @@ class LTX25Engine:
         prompt: str,
         video_conditioning: list[tuple[str, float]],
         loras: list[tuple[str, float]],
+        hdr: str | None = None,
         height: int = 512,
         width: int = 768,
         num_frames: int | None = None,
@@ -3395,8 +3449,8 @@ class LTX25Engine:
         height, width = sampling.snap_dimensions(height, width, two_stage=False)
         f, h, w = sampling.video_latent_shape(num_frames, height, width)
         stepper = self._stepper(tm, on_step)
-        stills = self._prepare_images(image, image_strength, images, num_frames)
-        infos = {path: media.probe(path) for path, _ in video_conditioning}
+        stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
+        infos = {path: media.probe(path, fps) for path, _ in video_conditioning}
         with tm.span("stage1"):
             video = sampling.noised_state(
                 (1, f * h * w, 128),
@@ -3418,6 +3472,7 @@ class LTX25Engine:
                     downscale,
                     temporal_scale,
                     tm,
+                    color_space=hdr,
                 )
                 video = sampling.append_reference(
                     video,
@@ -3465,6 +3520,7 @@ class LTX25Engine:
     def hq(
         self,
         prompt: str,
+        hdr: str | None = None,
         height: int = 1024,
         width: int = 1536,
         num_frames: int | None = 121,
@@ -3521,7 +3577,7 @@ class LTX25Engine:
         audio_t = sampling.audio_token_count(num_frames, fps)
         apos = sampling.audio_positions(audio_t)
         stepper = self._stepper(tm, on_step)
-        stills = self._prepare_images(image, image_strength, images, num_frames)
+        stills = self._prepare_images(image, image_strength, images, num_frames, hdr)
         cond1 = self._image_latents(stills, h1, w1, tm)
 
         with tm.span("stage1"):
@@ -3629,17 +3685,28 @@ class LTX25Engine:
         path: str | Path,
         seed: int = 42,
         decoder: str | None = None,
+        hdr: str | None = None,
     ) -> Path:
         """Decode and mux. `decoder`: "diffusion" (Lightricks' default: sharper
-        faces, textures and text; ~4x the decode time) or "conv"."""
+        faces, textures and text; ~4x the decode time) or "conv". `hdr` (the
+        request's colour space) keeps the decode in fp32 and writes upstream's
+        HDR outputs: `<stem>_<hdr>_exr/` EXR frames and an HLG master at
+        `path` (see hdr.write_hdr_outputs)."""
+        from slimserve.video.ltx25 import hdr as hdr_mod
         from slimserve.video.ltx25 import mux
 
         decoder = decoder or self.decoder
         tm = result.timings
+        hdr = hdr or result.hdr
         if result.decoded is not None:  # chunked: decoded per window already
             frames, waveform, sample_rate = result.decoded
             with tm.span("mux"):
-                mux.write_mp4(str(path), frames, result.fps, waveform, sample_rate)
+                if hdr is not None:
+                    hdr_mod.write_hdr_outputs(
+                        path, frames, result.fps, hdr, waveform, sample_rate
+                    )
+                else:
+                    mux.write_mp4(str(path), frames, result.fps, waveform, sample_rate)
             return Path(path)
         if result.video_latent is None:  # T2A: a WAV (upstream encode_audio)
             with tm.span("audio_decode"):
@@ -3687,7 +3754,7 @@ class LTX25Engine:
                 finally:
                     mx.set_cache_limit(CACHE_BYTES)
                     mx.set_memory_limit(total - OS_RESERVE_BYTES - CACHE_BYTES)
-                frames = vae_mod.to_uint8(pixels)
+                frames = _codes(pixels) if hdr is not None else vae_mod.to_uint8(pixels)
                 del pixels
             else:
                 vae = self.load_vae()
@@ -3699,11 +3766,24 @@ class LTX25Engine:
                     > self.decode_budget()
                 ):
                     self.unload_text()
-                frames = vae.decode(
-                    result.video_latent,
-                    frame_rate=result.fps,
-                    budget_bytes=self.decode_budget(),
-                )
+                if hdr is not None:
+                    frames = np.concatenate(
+                        [
+                            _codes(px)
+                            for px in vae.decode_chunks(
+                                result.video_latent,
+                                frame_rate=result.fps,
+                                budget_bytes=self.decode_budget(),
+                            )
+                        ],
+                        axis=0,
+                    )
+                else:
+                    frames = vae.decode(
+                        result.video_latent,
+                        frame_rate=result.fps,
+                        budget_bytes=self.decode_budget(),
+                    )
         with tm.span("audio_decode"):
             if result.source_audio is not None:
                 waveform, sample_rate = result.source_audio
@@ -3715,5 +3795,10 @@ class LTX25Engine:
                 waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
         with tm.span("mux"):
             frames = frames[: result.num_frames]
-            mux.write_mp4(str(path), frames, result.fps, waveform, sample_rate)
+            if hdr is not None:
+                hdr_mod.write_hdr_outputs(
+                    path, frames, result.fps, hdr, waveform, sample_rate
+                )
+            else:
+                mux.write_mp4(str(path), frames, result.fps, waveform, sample_rate)
         return Path(path)

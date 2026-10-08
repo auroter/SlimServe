@@ -295,6 +295,7 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
             f"{', '.join(k for k in A2VID_KEYS if k in body)}: audio-to-video "
             "options apply to the a2vid pipeline only"
         )
+    hdr_field(body, params)
     if cfg["pipeline"] == "keyframes":
         if "image" in params:  # the shorthand is a frame-0 keyframe here
             from slimserve.video.ltx25.sampling import Still
@@ -379,7 +380,6 @@ def normalize_source_request(
         "height",
         "seconds",
         "num_frames",
-        "fps",
         "image",
         "images",
     ):
@@ -389,7 +389,7 @@ def normalize_source_request(
             )
     if body.get("video_path") is not None:
         path = Path(str(body["video_path"])).expanduser()
-        if not path.is_file():
+        if not path.is_file() and not path.is_dir():  # a clip, or an EXR frame folder
             raise BadRequest(f"video_path {path} is not a file")
         video_path = str(path)
     elif body.get("video") is not None:
@@ -401,8 +401,9 @@ def normalize_source_request(
         )
     from slimserve.video.ltx25 import media
 
+    fps_hint = float(body["fps"]) if body.get("fps") is not None else None
     try:
-        info = media.probe(video_path)
+        info = media.probe(video_path, fps_hint)
     except (RuntimeError, ValueError) as exc:
         raise BadRequest(f"cannot read the source clip: {exc}") from exc
     if (info.frames - 1) % 8:
@@ -439,6 +440,7 @@ def normalize_source_request(
         "start_time": start,
         "end_time": end,
         "seed": int(body.get("seed", 42)),
+        **({"fps": fps_hint} if fps_hint is not None else {}),
         "source": {
             "width": info.width,
             "height": info.height,
@@ -464,6 +466,7 @@ def normalize_source_request(
             params["enhance_prompt"] = True
     if body.get("loras") is not None:
         params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
+    hdr_field(body, params)
     return params
 
 
@@ -474,14 +477,14 @@ def normalize_dubit_request(
     exactly one adapter in `loras` (the Dub-It IC-LoRA), `reference_strength`
     (0-1), a size (multiples of 64), stills; the reference's frame count
     (snapped to 8k + 1) and rate are the output's and must fit the envelope."""
-    for key in ("seconds", "num_frames", "fps"):
+    for key in ("seconds", "num_frames"):
         if key in body:
             raise BadRequest(
                 f"{key} does not apply to Dub-It (the reference clip sets it)"
             )
     if body.get("reference_video") is not None:
         path = Path(str(body["reference_video"])).expanduser()
-        if not path.is_file():
+        if not path.is_file() and not path.is_dir():
             raise BadRequest(f"reference_video {path} is not a file")
         ref = str(path)
     elif body.get("video") is not None:
@@ -492,8 +495,9 @@ def normalize_dubit_request(
         )
     from slimserve.video.ltx25 import media
 
+    fps_hint = float(body["fps"]) if body.get("fps") is not None else None
     try:
-        info = media.probe(ref)
+        info = media.probe(ref, fps_hint)
     except (RuntimeError, ValueError) as exc:
         raise BadRequest(f"cannot read the reference clip: {exc}") from exc
     if not info.has_audio:
@@ -556,6 +560,10 @@ def normalize_dubit_request(
         params["images"] = [
             still_field(item, frames, "dubit") for item in _list(body["images"])
         ]
+    params.update(keyframe_fields(body, "dubit"))
+    if fps_hint is not None:
+        params["fps_hint"] = fps_hint
+    hdr_field(body, params)
     return params
 
 
@@ -592,6 +600,35 @@ def _b64(value: Any, name: str = "video") -> bytes:
     if not data:
         raise BadRequest(f"{name} is empty")
     return data
+
+
+def hdr_field(body: dict[str, Any], params: dict[str, Any]) -> None:
+    """`hdr` (upstream --hdr {srgb_linear, acescg, acescct}): the colour space
+    of EXR inputs and of the HDR outputs (an EXR frame folder and an HLG
+    master in place of the H.264 mp4). Required when any input is an EXR
+    still or frame folder."""
+    from slimserve.video.ltx25 import hdr as hdr_mod
+
+    value = body.get("hdr")
+    if value is not None:
+        value = str(value).lower()
+        if value not in hdr_mod.COLOR_SPACES:
+            raise BadRequest(f"hdr must be one of {', '.join(hdr_mod.COLOR_SPACES)}")
+        params["hdr"] = value
+    exr = [
+        str(s.image)
+        for s in params.get("images", [])
+        if isinstance(s.image, str) and s.image.lower().endswith(".exr")
+    ]
+    for key in ("video_path", "reference_video", "attention_mask"):
+        p = params.get(key)
+        if p and hdr_mod.is_exr_dir(p):
+            exr.append(p)
+    for p, _ in params.get("video_conditioning", []):
+        if hdr_mod.is_exr_dir(p):
+            exr.append(p)
+    if exr and "hdr" not in params:
+        raise BadRequest("EXR inputs need `hdr` (srgb_linear, acescg or acescct)")
 
 
 def _list(value: Any, name: str = "images") -> list:
@@ -841,7 +878,7 @@ def ic_lora_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, An
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise BadRequest('each video_conditioning entry needs a "path"')
         path = Path(item["path"]).expanduser()
-        if not path.is_file():
+        if not path.is_file() and not path.is_dir():
             raise BadRequest(f"video_conditioning: {path} is not a file")
         out["video_conditioning"].append(
             (str(path), _strength(item.get("strength", 1.0), "reference strength"))
@@ -896,8 +933,10 @@ def still_field(item: Any, frames: int | None, pipeline: str):
     is known; the engine checks again once the duration head has decided."""
     from slimserve.video.ltx25.sampling import Still
 
-    if not isinstance(item, dict) or item.get("image") is None:
-        raise BadRequest('each images entry needs an "image"')
+    if not isinstance(item, dict) or (item.get("image") is None) == (
+        item.get("path") is None
+    ):
+        raise BadRequest('each images entry needs an "image" (base64) or a "path"')
     frame = item.get("frame", 0)
     if not isinstance(frame, int) or isinstance(frame, bool) or frame < 0:
         raise BadRequest("image frame must be a non-negative integer")
@@ -906,12 +945,14 @@ def still_field(item: Any, frames: int | None, pipeline: str):
     crf = item.get("crf")
     if crf is not None and (not isinstance(crf, int) or not 0 <= crf <= 51):
         raise BadRequest("image crf must be an integer in [0, 51] (0: no round trip)")
-    return Still(
-        decode_image_field(item["image"]),
-        frame,
-        _strength(item.get("strength", 1.0)),
-        crf,
-    )
+    if item.get("path") is not None:
+        path = Path(str(item["path"])).expanduser()
+        if not path.is_file():
+            raise BadRequest(f"images: {path} is not a file")
+        source: Any = str(path)
+    else:
+        source = decode_image_field(item["image"])
+    return Still(source, frame, _strength(item.get("strength", 1.0)), crf)
 
 
 def _first_still(params: dict[str, Any]):
@@ -1081,7 +1122,7 @@ class VideoService:
         job.progress = {"stage": "decode"}
         suffix = ".wav" if getattr(result, "video_latent", 0) is None else ".mp4"
         path = self.output_dir / f"{job.id}{suffix}"
-        engine.render(result, path, seed=p["seed"], decoder=decoder)
+        engine.render(result, path, seed=p["seed"], decoder=decoder, hdr=p.get("hdr"))
         job.path = path
         tm = result.timings
         spans = {k: round(v, 2) for k, v in tm.spans.items()}

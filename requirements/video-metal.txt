@@ -3,3 +3,4 @@
 mlx>=0.31.2
 numpy
 tokenizers
+openexr>=3.3  # HDR: EXR stills and frame folders in, EXR frames out (--hdr)

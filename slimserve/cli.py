@@ -128,6 +128,18 @@ def _parser() -> argparse.ArgumentParser:
         "--end-time", type=float, help="retake: end of the region to regenerate (s)"
     )
     video.add_argument(
+        "--hdr",
+        choices=["srgb_linear", "acescg", "acescct"],
+        help="HDR: the colour space of EXR inputs (stills, frame folders) and of the "
+        "outputs (an EXR frame folder beside an HLG master in place of the mp4)",
+    )
+    video.add_argument(
+        "--frame-rate",
+        type=float,
+        help="the clip's frame rate (default 24; required for EXR frame-folder "
+        "sources, which carry none)",
+    )
+    video.add_argument(
         "--chunked",
         action="store_true",
         help="long clips in overlapping temporal windows (97-frame windows, 25-frame "

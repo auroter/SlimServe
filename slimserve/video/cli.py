@@ -49,17 +49,26 @@ def _add_images(body: dict[str, Any], args: Any) -> None:
         if not 1 <= len(group) <= 4:
             raise ValueError("--image takes PATH [FRAME [STRENGTH [CRF]]]")
         path = Path(group[0]).expanduser()
-        try:
-            data = path.read_bytes()
-        except OSError as error:
-            raise ValueError(f"cannot read --image {path}: {error}") from error
+        if path.suffix.lower() == ".exr":  # HDR stills travel by path
+            if not path.is_file():
+                raise ValueError(f"cannot read --image {path}")
+            data = None
+        else:
+            try:
+                data = path.read_bytes()
+            except OSError as error:
+                raise ValueError(f"cannot read --image {path}: {error}") from error
         try:
             frame = int(group[1]) if len(group) > 1 else 0
             strength = float(group[2]) if len(group) > 2 else None
             crf = int(group[3]) if len(group) > 3 else None
         except ValueError as error:
             raise ValueError(f"--image {path}: {error}") from error
-        stills.append({"image": data, "frame": frame, "strength": strength, "crf": crf})
+        entry = {"frame": frame, "strength": strength, "crf": crf}
+        entry["image" if data is not None else "path"] = (
+            data if data is not None else str(path)
+        )
+        stills.append(entry)
     if not stills:
         return
     first = stills[0]
@@ -70,7 +79,12 @@ def _add_images(body: dict[str, Any], args: Any) -> None:
     for still in stills[1:]:
         if still["strength"] is None:
             still["strength"] = 1.0
-    if len(stills) == 1 and first["frame"] == 0 and first["crf"] is None:
+    if (
+        len(stills) == 1
+        and first["frame"] == 0
+        and first["crf"] is None
+        and "image" in first
+    ):
         body["image"], body["image_strength"] = first["image"], first["strength"]
         return
     body["images"] = stills
@@ -127,6 +141,8 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     from slimserve.video.ltx25.pipeline import LTX25Engine
 
     body = {"prompt": args.prompt}
+    if getattr(args, "frame_rate", None) is not None:
+        body["fps"] = args.frame_rate
     for key in (
         "size",
         "seconds",
@@ -148,6 +164,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         "chunk_pixel_frames",
         "chunk_carry_frames",
         "chunk_blend_frames",
+        "hdr",
     ):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
@@ -230,7 +247,9 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
             on_step=lambda stage, i, s: term.note(f"{stage} step {i + 1}"),
             **params,
         )
-    out = engine.render(result, out, seed=params["seed"], decoder=decoder)
+    out = engine.render(
+        result, out, seed=params["seed"], decoder=decoder, hdr=params.get("hdr")
+    )
     spans = ", ".join(f"{k} {v:.1f}s" for k, v in result.timings.spans.items())
     auto = (
         f"  (duration head: {result.predicted_seconds:.1f} s)"

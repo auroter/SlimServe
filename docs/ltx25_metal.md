@@ -48,7 +48,8 @@ The weights are gated: the Hugging Face token on the machine must have
 accepted `Lightricks/LTX-2.5` and, for `ltx25-dfr`,
 `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`. The prompt enhancer
 (`google/gemma-4-E2B-it`, 10.3 GB, every profile) is public. `ffmpeg` must be
-on PATH.
+on PATH (with libx265 for HDR masters); the `openexr` package
+(`requirements/video-metal.txt`) is needed for EXR input and output.
 
 Serving API (a clip takes minutes, so it is job-shaped):
 
@@ -158,6 +159,22 @@ upstream's "worst quality, inconsistent motion, blurry, jittery,
 distorted"); one video-only stage (no audio modality at all: the
 transformer's audio half and both cross-attentions are skipped) at CFG 1,
 no STG, rescale 0.7 by default; the matte ships as a silent clip.
+
+HDR (upstream's `--hdr {srgb_linear, acescg, acescct}`; API `hdr`, CLI
+`--hdr`) on every profile: EXR stills (`images: [{"path": "a.exr", ...}]`,
+`--image a.exr`) and EXR frame folders as sources and references
+(`--frame-rate` is required for a folder, which carries none) are read
+scene-linear and compressed into the model's ACEScct working space in the
+declared colour space (Rec.709 or ACEScg primaries, or ACEScct codes as
+they are), without the H.264 round trip; the decode stays in fp32 and the
+job writes an EXR frame folder `<stem>_<hdr>_exr/` (half floats, ZIP, the
+primaries' chromaticities and a colorSpace tag; log codes for acescct,
+scene-linear otherwise) beside an HLG master at the output path (HEVC
+Main10, Rec.2020 / BT.2100 HLG / bt2020nc limited, `hvc1`, upstream's x265
+parameters, diffuse white mapped to signal 0.75 with highlights rolled
+toward 1). The colour math matches upstream to float precision and the HLG
+10-bit planes bit for bit. Real HDR output needs the SDR-To-HDR IC-LoRA;
+the plain model reproduces SDR content in the log space.
 
 `ltx25-dfr` takes two more options (upstream's `--temporal-upscalings` and
 `--spatial-upscalings`; CLI flags of the same names): `temporal_upscalings`
@@ -429,14 +446,17 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 | `duration.py` | the duration head (auto clip length from the prompt) |
 | `enhancer.py`, `prompts/` | the prompt enhancer: Gemma-4 E2B-it language model and vision tower, greedy decoding, upstream's system prompts |
 | `audio.py`, `mux.py` | audio VAE (encoder and decoder) + vocoder + bandwidth extension; ffmpeg mux |
-| `media.py` | source clips for the editing pipelines: ffmpeg probe / frame / audio decode as PyAV does, torchaudio's sinc resampler |
+| `media.py` | source clips for the editing pipelines: ffmpeg probe / frame / audio decode as PyAV does, torchaudio's sinc resampler; EXR frame folders |
+| `hdr.py` | the ACEScct working space, primaries, EXR read / write (OpenEXR), the HLG master (BT.2100 OETF, BT.2020 10-bit planes, libx265 through ffmpeg) |
+| `chunks.py` | long clips in overlapping temporal windows: layouts, carry, keyframe plans, seam blends |
 | `../server.py`, `../cli.py` | the job queue and HTTP API; `slimserve` integration |
 
 ## Not implemented yet
 
 Of upstream's pipelines and options (ledger section 30): HDRICLoraPipeline
-and the native `--hdr` EXR path; chunked long clips on the IC-LoRA and
-Dub-It pipelines (distilled, dev and a2vid have them). The I2V
+(SDR video to HDR with the SDR-To-HDR IC-LoRA; the native `--hdr` path is
+in); chunked long clips on the IC-LoRA and Dub-It pipelines (distilled, dev
+and a2vid have them). The I2V
 first-frame path is wired but its end-to-end output has not been compared
 against upstream on this machine.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
