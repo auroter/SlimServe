@@ -4395,6 +4395,34 @@
           ]
         }
       }
+    },
+    "ltx25-alpha": {
+      "title": "LTX-2.5 alpha-gen (matte a clip) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Alpha mattes with Lightricks' AlphaGenPipeline: one video-only stage on the dev transformer under the Alpha-Gen IC-LoRA (Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen, gated; --lora) with the clip to matte appended as reference tokens (--video-conditioning); CFG 1, no STG, rescale 0.7 and upstream's alpha negative prompt by default; the matte ships as a silent clip. Sizes snap to 32.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "alpha",
+            "width": 768,
+            "height": 512,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 6144,
+            "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The envelope is the one-stage profile's (768x512x121): the reference doubles the token count (a same-size reference), so a forward here carries twice the dev stage-1 load. One generation at a time; up to 16 requests queue.",
+            "The transformer runs with no audio modality as upstream (audio=None: the audio half and both cross-attentions are skipped). The reference is decoded by frame index through ffmpeg as PyAV does, resized to the output size over the adapter's reference_downscale_factor and encoded untiled; the schedule is the 4096-anchor one; the clip length is given or the duration head's from the video connector's tokens. Ledger section 39."
+          ]
+        }
+      }
     }
   }
 }

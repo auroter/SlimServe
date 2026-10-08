@@ -1761,3 +1761,29 @@ through both seams, the frame-to-frame change at the seams inside the
 clip's normal range (6-11 levels; no spikes). Not yet chunked: IC-LoRA and
 Dub-It (their references are sliced per window upstream; section 30's
 list).
+
+## 39. Alpha-gen; the modality-less forwards (2026-10-08)
+
+`ltx25-alpha` = AlphaGenPipeline (`pipeline.alpha`): one video-only stage on
+the dev transformer (upstream passes `audio=None`: the block's audio half,
+both cross-attentions and the audio output are skipped; `LTX25DiT` now
+takes either modality alone, `GuidedDenoiser` plans the passes of the one
+present, `sampling.euler_loop_video`), the Alpha-Gen IC-LoRA and the clip
+to matte as reference tokens (the IC-LoRA path), upstream's alpha
+guidance defaults (CFG 1, STG 0, rescale 0.7, its own negative prompt), the
+duration head on the video connector's tokens when no length is given, a
+silent clip out (`mux.write_mp4` without a waveform).
+
+Parity: the video-only forward vs upstream LTXModel(video, None)
+(`n8_dit_parity.py v2v-ref / v2v-ours`): rel-L2 **2.1e-3**; the audio-only
+forward 1.6e-3 (section 36); the plain forward 1.6e-3. Mechanics smoke
+(`n12/alpha.*`, the detailing adapter standing in for the gated Alpha-Gen
+one): 512x320x33 in 72.1 s (30 steps x 1 pass at 1,920 target + 1,920
+reference tokens), a video-only mp4. An alpha-matte check waits for the
+adapter.
+
+Also fixed on the way: two server edits from sections 34 and 38 had not
+applied (the IC-LoRA / Dub-It adapters were popped into the request-wide
+LoRA context instead of reaching the pipeline, and chunked requests did not
+receive the decoder); `test_adapter_and_chunk_arguments_reach_the_right_place`
+now pins both through the service.

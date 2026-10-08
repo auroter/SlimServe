@@ -240,32 +240,37 @@ class GuidedDenoiser:
         rep = lambda x: None if x is None else mx.repeat(x, n, axis=0)  # noqa: E731
         t = mx.full((n,), sigma, dtype=G)
         no_video = video is None  # T2A: an audio-only forward
+        no_audio = audio is None  # alpha-gen: a video-only forward
         vt = (
             None
             if no_video or video.uniform
             else rep((video.denoise_mask * sigma).squeeze(-1))
         )
-        at = None if audio.uniform else rep((audio.denoise_mask * sigma).squeeze(-1))
+        at = (
+            None
+            if no_audio or audio.uniform
+            else rep((audio.denoise_mask * sigma).squeeze(-1))
+        )
         v, a = self.dit(
             None if no_video else rep(vx),
-            rep(ax),
+            None if no_audio else rep(ax),
             t,
             None if no_video else vtext,
-            atext,
+            None if no_audio else atext,
             None if no_video else rep(video.positions),
-            rep(audio.positions),
+            None if no_audio else rep(audio.positions),
             video_keyframes_mask=None if no_video else rep(video.keyframes_mask),
             video_timesteps=vt,
             audio_timesteps=at,
             video_attention_mask=None if no_video else video.attention_mask,
-            audio_attention_mask=audio.attention_mask,
+            audio_attention_mask=None if no_audio else audio.attention_mask,
             stg={k: m[rows] for k, m in self.stg.items()},
             text_rows=trows,
             share_from=self.share if n == self.passes and not no_video else None,
             video_tiles=None if no_video else self.video_tiles,
             step_cache=step_cache if n == self.passes else None,
             run_video=run_video and not no_video,
-            run_audio=run_audio,
+            run_audio=run_audio and not no_audio,
         )
         return (
             None
@@ -291,6 +296,8 @@ class GuidedDenoiser:
         run_v, run_a = not self.video_g.skips(step), not self.audio_g.skips(step)
         if video is None:
             run_v = False
+        if audio is None:
+            run_a = False
         if not (run_v or run_a):
             if self.last is None:
                 raise ValueError("skip_step cannot skip the first step")
@@ -336,7 +343,7 @@ class GuidedDenoiser:
         prev = self.last or (None, None)
         self.last = (
             None if video is None else guided(v0, self.video_g, prev[0]),
-            guided(a0, self.audio_g, prev[1]),
+            None if audio is None else guided(a0, self.audio_g, prev[1]),
         )
         return self.last
 
@@ -3295,6 +3302,165 @@ class LTX25Engine:
             decoded=(frames, waveform, rate),
         )
 
+    # ---- alpha-gen ----------------------------------------------------------------
+    ALPHA_NEGATIVE_PROMPT = (
+        "worst quality, inconsistent motion, blurry, jittery, distorted"
+    )
+
+    def alpha(
+        self,
+        prompt: str,
+        video_conditioning: list[tuple[str, float]],
+        loras: list[tuple[str, float]],
+        height: int = 512,
+        width: int = 768,
+        num_frames: int | None = None,
+        fps: float = 24.0,
+        seed: int = 42,
+        negative_prompt: str | None = None,
+        steps: int = 30,
+        video_guidance: sampling.Guidance | None = None,
+        images: list[sampling.Still] | None = None,
+        image: str | bytes | None = None,
+        image_strength: float = 1.0,
+        batched: bool = True,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+        fast: Fast | None = None,
+        max_num_frames: int | None = None,
+    ) -> Result:
+        """Lightricks' AlphaGenPipeline: one video-only stage on the dev
+        transformer under the Alpha-Gen IC-LoRA with the reference video
+        (the clip to matte) appended as reference tokens, the one-stage
+        schedule, guidance at upstream's alpha defaults (CFG 1, no STG,
+        rescale 0.7; the negative prompt "worst quality, ..."), no audio
+        modality at all; the matte ships as a silent clip."""
+        from slimserve.video.ltx25 import media
+        from slimserve.video.ltx25.lora import Lora
+
+        if self.variant != "dev":
+            raise ValueError("alpha-gen runs on the dev transformer")
+        if not video_conditioning:
+            raise ValueError("alpha-gen needs the reference video")
+        if not loras:
+            raise ValueError("alpha-gen needs the Alpha-Gen IC-LoRA (--lora)")
+        fast = fast or Fast()
+        if fast.steps:
+            steps = fast.steps
+        if video_guidance is None:
+            video_guidance = replace(
+                DEFAULT_VIDEO_GUIDANCE, cfg=1.0, stg=0.0, rescale=0.7, modality=1.0
+            )
+        if fast.guidance:
+            video_guidance = replace(video_guidance, **fast.guidance)
+        video_guidance = replace(video_guidance, modality=1.0)  # no audio to isolate
+        adapters = []
+        downscale = temporal_scale = 1
+        for path, strength in loras:
+            key = str(Path(path).expanduser().resolve())
+            lora = self.user_lora_cache.get(key)
+            if lora is None:
+                lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+            for have, got in (
+                (downscale, lora.reference_downscale),
+                (temporal_scale, lora.reference_temporal_scale),
+            ):
+                if got != 1 and have not in (1, got):
+                    raise ValueError("the adapters' reference scale factors disagree")
+            downscale = max(downscale, lora.reference_downscale)
+            temporal_scale = max(temporal_scale, lora.reference_temporal_scale)
+            adapters.append((lora, strength))
+        tm = Timings()
+        with tm.span("text"):
+            text = self.load_text()
+            cond = text.encode(prompt)[:2]
+            neg = text.encode(
+                self.ALPHA_NEGATIVE_PROMPT
+                if negative_prompt is None
+                else negative_prompt
+            )[:2]
+            mx.eval(cond, neg)
+            predicted = None
+            if num_frames is None:
+                num_frames, predicted = self.load_duration().num_frames(
+                    cond[0], None, fps
+                )
+                if max_num_frames is not None:
+                    num_frames = min(num_frames, max_num_frames)
+            if not keep_text:
+                self.unload_text()
+        with tm.span("load"):
+            dit = self.load_dit()
+            self.load_vae()
+        height, width = sampling.snap_dimensions(height, width, two_stage=False)
+        f, h, w = sampling.video_latent_shape(num_frames, height, width)
+        stepper = self._stepper(tm, on_step)
+        stills = self._prepare_images(image, image_strength, images, num_frames)
+        infos = {path: media.probe(path) for path, _ in video_conditioning}
+        with tm.span("stage1"):
+            video = sampling.noised_state(
+                (1, f * h * w, 128),
+                sampling.video_positions(f, h, w, fps),
+                seed,
+                tokens_per_frame=h * w,
+                bf16_noise=self.bf16_noise,
+            )
+            video = self._condition(
+                video, self._image_latents(stills, h, w, tm), fps, 1.0, seed
+            )
+            for path, strength in video_conditioning:
+                tokens, (rf, rh, rw) = self._reference_tokens(
+                    path,
+                    infos[path],
+                    height,
+                    width,
+                    num_frames,
+                    downscale,
+                    temporal_scale,
+                    tm,
+                )
+                video = sampling.append_reference(
+                    video,
+                    tokens,
+                    sampling.video_positions(rf, rh, rw, fps),
+                    downscale,
+                    strength,
+                    temporal_scale,
+                    fps,
+                )
+            mx.eval(video.latent, video.clean, video.positions)
+            guided = GuidedDenoiser(
+                dit,
+                cond,
+                neg,
+                video_guidance,
+                sampling.Guidance(cfg=1.0, stg=0.0, modality=1.0, rescale=0.0),
+                batched,
+            )
+            for lora, strength in adapters:
+                lora.attach(dit, strength)
+            try:
+                v = sampling.euler_loop_video(
+                    guided,
+                    video,
+                    sampling.ltx2_schedule(steps, 4096),
+                    on_step=stepper("stage1"),
+                    step_cache=fast.cache(),
+                )
+            finally:
+                for lora, _ in adapters:
+                    lora.detach(dit)
+        return Result(
+            sampling.unpatchify(v[:, : f * h * w], (f, h, w)),
+            None,
+            num_frames,
+            height,
+            width,
+            fps,
+            tm,
+            predicted_seconds=predicted,
+        )
+
     # ---- hq (res_2s) --------------------------------------------------------
     def hq(
         self,
@@ -3543,6 +3709,8 @@ class LTX25Engine:
                 waveform, sample_rate = result.source_audio
                 end = round(result.num_frames / result.fps * sample_rate)
                 waveform = waveform[..., :end]
+            elif result.audio_tokens is None:  # alpha-gen: a silent clip
+                waveform, sample_rate = None, None
             else:
                 waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
         with tm.span("mux"):

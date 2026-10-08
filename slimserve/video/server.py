@@ -67,7 +67,7 @@ from typing import Any
 MAX_QUEUED = 16
 KEEP_FINISHED = 32
 # pipelines on the dev transformer (CFG/STG guidance, a negative prompt)
-GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage", "a2vid", "t2a")
+GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage", "a2vid", "t2a", "alpha")
 # pipelines that edit a source clip: its size, length and rate are the output's
 SOURCE_PIPELINES = ("retake", "dubit")
 
@@ -277,6 +277,11 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
     params.update(keyframe_fields(body, cfg["pipeline"]))
     if cfg["pipeline"] == "ic_lora":
+        params.update(ic_lora_fields(body, params))
+    elif cfg["pipeline"] == "alpha":
+        extra = [k for k in IC_LORA_KEYS[1:] if k in body]
+        if extra:
+            raise BadRequest(f"{', '.join(extra)}: not an alpha-gen option")
         params.update(ic_lora_fields(body, params))
     elif any(key in body for key in IC_LORA_KEYS):
         raise BadRequest(
@@ -997,9 +1002,10 @@ class VideoService:
         engine.load_text()
         engine.load_dit()
         engine.load_vae()
-        if pipeline not in ("one_stage", "t2a", *SOURCE_PIPELINES):
+        if pipeline not in ("one_stage", "t2a", "alpha", *SOURCE_PIPELINES):
             engine.load_upscaler()
-        engine.load_audio(encoder=pipeline in (*SOURCE_PIPELINES, "a2vid"))
+        if pipeline != "alpha":
+            engine.load_audio(encoder=pipeline in (*SOURCE_PIPELINES, "a2vid"))
         engine.load_duration()
         if self.cfg.get("decoder", "diffusion") == "diffusion" and pipeline != "t2a":
             engine.load_diffvae()
@@ -1059,7 +1065,15 @@ class VideoService:
         fast = fast_settings(self.cfg)
         if fast is not None:
             p["fast"] = fast
-        with engine.user_loras(p.pop("loras", None)):
+        # the IC-LoRA pipelines manage their adapters per stage themselves
+        loras = (
+            None
+            if self.cfg["pipeline"] in ("ic_lora", "dubit", "alpha")
+            else p.pop("loras", None)
+        )
+        if p.get("chunk") is not None:
+            p["decoder"] = decoder  # chunked clips decode per window inside
+        with engine.user_loras(loras):
             result = getattr(engine, self.cfg["pipeline"])(prompt, on_step=on_step, **p)
         if result.predicted_seconds is not None:  # auto duration: report the pick
             job.params["num_frames"] = result.num_frames

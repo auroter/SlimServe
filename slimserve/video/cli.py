@@ -219,7 +219,9 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     if fast is not None:
         params["fast"] = fast
     loras = (
-        None if cfg["pipeline"] in ("ic_lora", "dubit") else params.pop("loras", None)
+        None
+        if cfg["pipeline"] in ("ic_lora", "dubit", "alpha")
+        else params.pop("loras", None)
     )
     with engine.user_loras(loras):
         result = getattr(engine, cfg["pipeline"])(

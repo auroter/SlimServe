@@ -25,6 +25,7 @@ VIDEO_IDS = (
     "ltx25-a2vid",
     "ltx25-dubit",
     "ltx25-t2a",
+    "ltx25-alpha",
 )
 FAST_IDS = (
     "ltx25-distilled-fast",
@@ -444,3 +445,58 @@ def test_samplers_reach_the_denoisers_answer():
     ):
         assert float(mx.abs(out[0] - target_v).max()) < 1e-5
         assert float(mx.abs(out[1] - target_a).max()) < 1e-5
+
+
+def test_adapter_and_chunk_arguments_reach_the_right_place(tmp_path):
+    """IC-LoRA / Dub-It / alpha get their adapters as a pipeline argument (they
+    attach them per stage), every other pipeline through engine.user_loras;
+    a chunked request also gets the decoder (it decodes per window)."""
+
+    class _Engine(_FakeEngine):
+        def __init__(self):
+            super().__init__()
+            self.kwargs = []
+
+        def _run(self, prompt, on_step=None, **params):
+            self.kwargs.append(params)
+            return self.distilled(prompt, on_step=on_step, **params)
+
+        ic_lora = dubit = alpha = dev = _run
+
+    lora = tmp_path / "a.safetensors"
+    lora.write_bytes(b"x")
+    ref = tmp_path / "r.mp4"
+    ref.write_bytes(b"x")
+    engine = _Engine()
+    service = server.VideoService(
+        {**CFG, "pipeline": "ic_lora"},
+        "LTX-2.5",
+        tmp_path,
+        engine_factory=lambda: engine,
+    )
+    assert service.ready.wait(5)
+    job = service.submit(
+        {
+            "prompt": "x",
+            "seconds": 2,
+            "video_conditioning": [{"path": str(ref)}],
+            "loras": [{"path": str(lora), "strength": 0.5}],
+        }
+    )
+    assert job.done.wait(10) and job.status == "completed", job.error
+    assert engine.kwargs[-1]["loras"] == [(str(lora), 0.5)]
+    assert engine.loras[-1] is None  # not through the request-wide context
+    service.stop()
+    engine = _Engine()
+    service = server.VideoService(
+        {**CFG, "pipeline": "dev"}, "LTX-2.5", tmp_path, engine_factory=lambda: engine
+    )
+    assert service.ready.wait(5)
+    job = service.submit(
+        {"prompt": "x", "seconds": 10, "chunked": True, "loras": [{"path": str(lora)}]}
+    )
+    assert job.done.wait(10) and job.status == "completed", job.error
+    assert "loras" not in engine.kwargs[-1] and engine.loras[-1] == [(str(lora), 1.0)]
+    assert engine.kwargs[-1]["decoder"] == "diffusion"
+    assert engine.kwargs[-1]["chunk"].chunk_pixel_frames == 97
+    service.stop()

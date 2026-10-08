@@ -202,6 +202,30 @@ def euler_loop_audio(
     return ax
 
 
+def euler_loop_video(
+    denoise,
+    video: LatentState,
+    sigmas: list[float],
+    on_step: Callable[[int, float], None] | None = None,
+    step_cache: Any = None,
+) -> mx.array:
+    """`euler_loop` for a video-only state (alpha-gen): the denoiser is called
+    with no audio and returns (video x0, None)."""
+    vx = video.latent
+    for i, (s, s_next) in enumerate(zip(sigmas[:-1], sigmas[1:])):
+        if step_cache is not None:
+            step_cache.force = s_next == 0
+            v0, _ = denoise(video, None, vx, None, s, step_cache=step_cache, step=i)
+        else:
+            v0, _ = denoise(video, None, vx, None, s, step=i)
+        v0 = blend(v0, video)
+        vx = vx + (vx - v0) / s * (s_next - s)
+        mx.async_eval(vx)
+        if on_step:
+            on_step(i, s)
+    return vx
+
+
 def euler_ancestral_loop(
     denoise: Denoiser,
     video: LatentState,

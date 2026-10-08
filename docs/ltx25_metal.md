@@ -18,6 +18,7 @@ H.264 + AAC mp4. One profile per upstream pipeline:
 | `ltx25-a2vid` | A2VidPipelineTwoStage: the dev flow driven by an audio file, which rides frozen and ships | audio-to-video |
 | `ltx25-dubit` | DubItPipeline: re-voice a clip under the Dub-It IC-LoRA, the clip's video and audio as reference tokens | dubbing |
 | `ltx25-t2a` | T2AOneStagePipeline: audio only, the dev transformer's audio half, a WAV | text-to-audio |
+| `ltx25-alpha` | AlphaGenPipeline: a video-only stage under the Alpha-Gen IC-LoRA, the clip to matte as reference | alpha mattes |
 
 Distilled versus dev is a quality-versus-time choice for the person asking,
 not something the server picks.
@@ -37,6 +38,7 @@ slimserve ltx25-ic-lora -p "..." --video-conditioning gray.mp4 --lora colorizati
 slimserve ltx25-a2vid -p "..." --audio-path speech.m4a --size 768x512          # audio-to-video (length from the audio)
 slimserve ltx25-dubit -p "..." --reference-video talk.mp4 --lora dubit.safetensors   # dubbing
 slimserve ltx25-t2a -p "rain on a tin roof" --seconds 5 --output rain.wav   # text-to-audio
+slimserve ltx25-alpha -p "..." --video-conditioning clip.mp4 --lora alpha-gen.safetensors   # alpha matte
 slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
 slimserve ltx25-hq -p "..."                                               # Lightricks' HQ preset (res_2s)
 slimserve ltx25-dev -p "a cat watches rain" --enhance-prompt                # Gemma rewrites the prompt first
@@ -147,6 +149,15 @@ window as upstream plans them, then decoded per window with the carried
 frames dropped and the seam crossfaded (linear over `chunk_blend_frames`,
 default the carry; audio over 40 ms equal-power). The clip may then be up
 to 1024 frames; the window must fit the profile's envelope.
+
+`ltx25-alpha` (upstream's AlphaGenPipeline) takes `video_conditioning` (the
+clip to matte) and the Alpha-Gen adapter in `loras`
+(Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen, gated), a size (snapped to 32),
+stills, `seconds`, `steps`, `guidance.video` and `negative_prompt` (default
+upstream's "worst quality, inconsistent motion, blurry, jittery,
+distorted"); one video-only stage (no audio modality at all: the
+transformer's audio half and both cross-attentions are skipped) at CFG 1,
+no STG, rescale 0.7 by default; the matte ships as a silent clip.
 
 `ltx25-dfr` takes two more options (upstream's `--temporal-upscalings` and
 `--spatial-upscalings`; CLI flags of the same names): `temporal_upscalings`
@@ -424,8 +435,8 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 ## Not implemented yet
 
 Of upstream's pipelines and options (ledger section 30): HDRICLoraPipeline
-and the native `--hdr` EXR path, alpha_gen; chunked long clips on the
-IC-LoRA and Dub-It pipelines (distilled, dev and a2vid have them). The I2V
+and the native `--hdr` EXR path; chunked long clips on the IC-LoRA and
+Dub-It pipelines (distilled, dev and a2vid have them). The I2V
 first-frame path is wired but its end-to-end output has not been compared
 against upstream on this machine.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on

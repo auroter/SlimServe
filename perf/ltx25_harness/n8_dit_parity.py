@@ -471,6 +471,70 @@ def t2a_ours(out, ref_path, operand="fp16"):
     np.savez(out, audio=np.array(a), video=np.zeros(1))
 
 
+def v2v_ref(out):
+    """The video-only forward (audio=None): upstream LTXModel vs ours."""
+    import torch
+
+    sys.path[:0] = [f"{UP}/ltx-core/src"]
+    from ltx_core.model.transformer.modality import Modality
+
+    _, _, vtext, _ = inputs()
+    vstate, _ = _upstream_states()
+    sigma = torch.tensor([SIGMA])
+    video = Modality(
+        latent=vstate.latent,
+        sigma=sigma,
+        timesteps=vstate.denoise_mask * SIGMA,
+        positions=vstate.positions,
+        context=torch.from_numpy(vtext),
+        context_mask=None,
+        attention_mask=None,
+        keyframes_mask=vstate.keyframes_mask,
+    )
+    model = _upstream_model()
+    with torch.inference_mode():
+        vx, _ = model(video, None, None)
+    np.savez(
+        out,
+        video=vx.float().numpy(),
+        video_tokens=vstate.latent.numpy(),
+        keyframes_mask=vstate.keyframes_mask.numpy(),
+    )
+    print("saved", vx.shape)
+
+
+def v2v_ours(out, ref_path, operand="fp16"):
+    import mlx.core as mx
+
+    from slimserve.video.ltx25 import checkpoints, sampling
+    from slimserve.video.ltx25 import dit as dit_mod
+    from slimserve.video.ltx25.dit import DiTConfig, LTX25DiT
+
+    if operand == "fp32":
+        dit_mod.F = mx.float32
+        checkpoints.cast_operands.__defaults__ = (
+            mx.float32,
+        ) + checkpoints.cast_operands.__defaults__[1:]
+    r = np.load(ref_path)
+    _, _, vtext, _ = inputs()
+    vt = mx.array(r["video_tokens"])
+    weights, _, tcfg = checkpoints.load_dit("dev")
+    model = LTX25DiT(weights, DiTConfig.from_checkpoint(tcfg))
+    v, a = model(
+        vt,
+        None,
+        mx.array([SIGMA]),
+        mx.array(vtext),
+        None,
+        sampling.video_positions(F, H, W, FPS),
+        None,
+        video_keyframes_mask=mx.array(r["keyframes_mask"]),
+    )
+    assert a is None
+    mx.eval(v)
+    np.savez(out, video=np.array(v))
+
+
 def cmp(a, b):
     ra, rb = np.load(a), np.load(b)
     for key in ("video", "audio"):
@@ -492,6 +556,8 @@ if __name__ == "__main__":
         "skip-ours": skip_ours,
         "t2a-ref": t2a_ref,
         "t2a-ours": t2a_ours,
+        "v2v-ref": v2v_ref,
+        "v2v-ours": v2v_ours,
         "cmp": cmp,
         "guided-ref": guided_ref,
         "guided-ours": guided_ours,
