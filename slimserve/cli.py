@@ -127,6 +127,23 @@ def _parser() -> argparse.ArgumentParser:
     video.add_argument(
         "--end-time", type=float, help="retake: end of the region to regenerate (s)"
     )
+    video.add_argument("--audio-path", help="a2vid: the driving audio (any container)")
+    video.add_argument(
+        "--audio-start-time", type=float, help="a2vid: where in the audio to start (s)"
+    )
+    video.add_argument(
+        "--audio-max-duration",
+        type=float,
+        help="a2vid: at most this many seconds of audio (not with --seconds)",
+    )
+    video.add_argument(
+        "--reference-video", help="dubit: the clip to dub (video + audio)"
+    )
+    video.add_argument(
+        "--reference-strength",
+        type=float,
+        help="dubit: strength of the video reference tokens (default 1.0)",
+    )
     video.add_argument(
         "--video-conditioning",
         nargs="+",

@@ -4150,7 +4150,7 @@
       "title": "LTX-2.5 retake, fast tier, on Apple Silicon",
       "source": "ltx25",
       "gpus": 1,
-      "summary": "The retake pipeline with the fast tier: the first-block step cache at 0.10 and the conv decoder on the one 8-step stage. Same engine as ltx25-retake. Measured in perf/ltx25_metal_campaign.md section 33.",
+      "summary": "The retake pipeline with the fast tier: the first-block step cache at 0.10, 2x2-tiled video self-attention and the conv decoder on the one full-resolution 8-step stage. 1536x1024x121 in 363 s against 745 s exact (2.05x) on an M1 Ultra. Same engine as ltx25-retake. Measured in perf/ltx25_metal_campaign.md section 33.",
       "speculative": false,
       "variants": {
         "metal": {
@@ -4172,7 +4172,7 @@
           "notes": [
             "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
             "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
-            "What is on: `fast.step_cache` 0.10 (a step whose block-0 residual moved less than 10% accumulated since the last computed step reuses that step's residual) and `decoder: conv`. The source handling is ltx25-retake's."
+            "What is on: `fast.step_cache` 0.10 (a step whose block-0 residual moved less than 10% accumulated since the last computed step reuses that step's residual), `fast.attention_tiles` [2, 2] (each query tile attends to its own rows and columns widened by 2 latent cells; the kept source tokens are keys of every tile) and `decoder: conv`. Measured one lever at a time at 1536x1024x121: step cache + conv 471 s, + tiles 363 s (exact 745 s). The source handling is ltx25-retake's."
           ]
         }
       }
@@ -4238,6 +4238,133 @@
             "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
             "The fast tier is judged by eye and by PSNR against the exact profile at 1536x1024x121, never by parity. What is on: `decoder: conv` (97 -> 34 s at HD, softer fine texture than the diffusion decoder) and `fast.stage2_sigmas` with two refinement steps instead of three. Rejected for this profile: the first-block step cache (never fires on the 8+3 ancestral schedules: the block-0 residual moves 22-70% per step) and tiled stage-2 attention (a visible seam through faces at the frame centre).",
             "References, adapters and options as on ltx25-ic-lora."
+          ]
+        }
+      }
+    },
+    "ltx25-a2vid": {
+      "title": "LTX-2.5 audio-to-video (two-stage, guided) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Video driven by an audio file with Lightricks' A2VidPipelineTwoStage: the audio is encoded through the audio VAE and rides frozen through the dev flow (30 guided steps at half resolution with video guidance only, 2x latent upscale, 3 steps with the distilled LoRA), so the picture follows the sound; the source waveform ships. Without a length the clip follows the audio. Requests give `audio_path` (or `audio` as base64), optional `audio_start_time` and `audio_max_duration`; the CLI --audio-path --audio-start-time --audio-max-duration.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "a2vid",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "The audio stream is decoded through ffmpeg as upstream's PyAV path does, resampled to 16 kHz with torchaudio's sinc kernel, encoded by the audio VAE (ledger section 33: encoder 1e-6 against upstream) and trimmed to the clip's token count; it is the frozen audio modality in both stages (sigma 0 for its tokens, prompt AdaLN and cross gates), the audio guider is upstream's default (no guidance), the video guider the dev profile's. The clip length is int(audio seconds x fps) snapped to 8k + 1 (at most 1024 frames, and the envelope) when not given; `audio_max_duration` and a clip length are exclusive as upstream. Stills and the other dev options apply. Ledger section 35.",
+            "The distilled LoRA (rank 450) is a runtime low-rank term in stage 2: +22% per forward on 3 forwards, 8.3 GiB instead of a second 39 GiB transformer, exact detach. negative_prompt is accepted; the default is Lightricks' DEFAULT_NEGATIVE_PROMPT."
+          ]
+        }
+      }
+    },
+    "ltx25-a2vid-fast": {
+      "title": "LTX-2.5 audio-to-video (two-stage, guided), fast tier, on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "The audio-to-video pipeline with the dev fast tier: 20 guided steps instead of 30, the first-block step cache at 0.10, conv decoder. Same engine as ltx25-a2vid. Measured in perf/ltx25_metal_campaign.md section 35.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "a2vid",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "conv",
+            "served_model_name": "LTX-2.5",
+            "fast": {
+              "steps": 20,
+              "step_cache": 0.1
+            }
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "What is on: `fast.steps` 20, `fast.step_cache` 0.10 (block 0 runs every step; a step whose block-0 residual moved less than 10% accumulated since the last computed step reuses that step's residual: 11 of 30 stage-1 steps at 1536x1024x121, never in stage 2), and `decoder: conv`. The tradeoff, measured: the generated transients come out softer with less denoising work (footsteps about 3 dB below the exact profile's, background and timing unchanged), as the picture's fine detail does; `fast.steps` is the dial back toward exact. Not in the profile: dropping the modality guidance pass (`fast.guidance.modality` 1.0, 3 passes per step, 22% off stage 1), which softens the footsteps a further 4 dB; the 2-step stage 2 (`fast.stage2_sigmas` [0.909375, 0.421875, 0.0]) reviewed slightly worse than the 3-step one and is an opt-in. Each stage-1 lever alone saved 22-27% of the exact 1513 s; stacked, 20 steps leave larger per-step moves so the cache skips 4 of 20 instead of 11 of 30.",
+            "Audio options as on ltx25-a2vid."
+          ]
+        }
+      }
+    },
+    "ltx25-dubit": {
+      "title": "LTX-2.5 Dub-It (re-voice a clip) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Dubbing with Lightricks' DubItPipeline: the reference clip's video rides as IC-LoRA reference tokens and its audio as frozen reference audio tokens (shifted before the timeline) while the distilled transformer, under the Dub-It IC-LoRA in both stages, generates the new speech the prompt describes and re-renders the picture to it. The reference's frame count and rate are the output's. Requests give `reference_video` (or `video` as base64), one adapter in `loras` (Lightricks/LTX-2.3-22b-IC-LoRA-DubIt, gated), optional `reference_strength`; the CLI --reference-video --lora --reference-strength.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-distilled",
+          "engine": {
+            "pipeline": "dubit",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "Both stages carry the adapter; the reference video is tiled-encoded (frames 80/24, 768/64 px) at each stage's size over the adapter's reference_downscale_factor and appended as clean reference tokens; stage 1 appends the reference audio latent after the target audio with negative times (positions - duration - 0.04 s, upstream patchify_audio_reference_latent); stage 2 freezes the stage-1 audio and appends it as its own reference; plain Euler on the distilled sigmas. Stills apply. Ledger section 35.",
+            "Precision as ltx25-distilled: fp32 residual stream, fp16 GEMM and attention operands."
+          ]
+        }
+      }
+    },
+    "ltx25-dubit-fast": {
+      "title": "LTX-2.5 Dub-It, fast tier, on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "The Dub-It pipeline with the distilled fast tier: the 2-step stage 2 and the conv decoder. Same engine as ltx25-dubit. Measured in perf/ltx25_metal_campaign.md section 35.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-distilled",
+          "engine": {
+            "pipeline": "dubit",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "conv",
+            "served_model_name": "LTX-2.5",
+            "fast": {
+              "stage2_sigmas": [
+                0.909375,
+                0.421875,
+                0.0
+              ]
+            }
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "The fast tier is judged by eye and by PSNR against the exact profile at 1536x1024x121, never by parity. What is on: `decoder: conv` (97 -> 34 s at HD, softer fine texture than the diffusion decoder) and `fast.stage2_sigmas` with two refinement steps instead of three. Rejected for this profile: the first-block step cache (never fires on the 8+3 ancestral schedules: the block-0 residual moves 22-70% per step) and tiled stage-2 attention (a visible seam through faces at the frame centre).",
+            "Reference and adapter as on ltx25-dubit."
           ]
         }
       }

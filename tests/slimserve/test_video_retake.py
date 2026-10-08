@@ -181,3 +181,70 @@ def test_retake_requests_take_the_source_clips_geometry(tmp_path):
         CFG,
     )
     assert flags["regenerate_audio"] is False and "regenerate_video" not in flags
+
+
+def test_a2vid_and_dubit_requests(tmp_path):
+    clip = _clip(tmp_path / "c.mp4")
+    a2v = {**CFG, "pipeline": "a2vid", "width": 768, "height": 512}
+    params = server.normalize_request(
+        {"prompt": "x", "audio_path": clip, "audio_start_time": 0.1}, a2v
+    )
+    assert params["audio_path"] == clip and params["audio_start_time"] == 0.1
+    assert params["num_frames"] is None  # the audio decides
+    assert params["max_num_frames"] == 505  # the envelope at 768x512
+    with pytest.raises(server.BadRequest, match="exclusive"):
+        server.normalize_request(
+            {"prompt": "x", "audio_path": clip, "audio_max_duration": 2, "seconds": 2},
+            a2v,
+        )
+    with pytest.raises(server.BadRequest, match="a2vid pipeline only"):
+        server.normalize_request(
+            {"prompt": "x", "audio_path": clip}, {**CFG, "pipeline": "dev"}
+        )
+    lora = tmp_path / "d.safetensors"
+    lora.write_bytes(b"x")
+    dub = {**CFG, "pipeline": "dubit"}
+    params = server.normalize_request(
+        {
+            "prompt": "x",
+            "reference_video": clip,
+            "loras": [{"path": str(lora)}],
+            "size": "768x512",
+            "reference_strength": 0.9,
+        },
+        dub,
+    )
+    assert params["reference_video"] == clip and params["reference_strength"] == 0.9
+    assert (params["width"], params["height"]) == (768, 512)
+    assert params["source"]["num_frames"] == 17 and params["loras"] == [
+        (str(lora), 1.0)
+    ]
+    with pytest.raises(server.BadRequest, match="exactly one adapter"):
+        server.normalize_request({"prompt": "x", "reference_video": clip}, dub)
+    with pytest.raises(server.BadRequest, match="does not apply to Dub-It"):
+        server.normalize_request(
+            {
+                "prompt": "x",
+                "reference_video": clip,
+                "loras": [{"path": str(lora)}],
+                "seconds": 2,
+            },
+            dub,
+        )
+    silent = _clip(tmp_path / "s.mp4", audio=False)
+    with pytest.raises(server.BadRequest, match="no audio stream"):
+        server.normalize_request(
+            {"prompt": "x", "reference_video": silent, "loras": [{"path": str(lora)}]},
+            dub,
+        )
+
+
+def test_audio_reference_tokens_sit_before_the_timeline():
+    state = sampling.noised_state((1, 10, 4), sampling.audio_positions(10), 0)
+    ref = mx.ones((1, 5, 4))
+    out = sampling.append_audio_reference(state, ref)
+    pos = np.array(out.positions[0, 10:, 0])
+    s, e = sampling.audio_time_bounds(5)
+    assert np.allclose(pos, (s + e) / 2 - e.max() - 0.04)
+    assert pos.max() < 0 and np.allclose(np.array(out.denoise_mask[0, 10:, 0]), 0.0)
+    assert np.allclose(np.array(out.clean[0, 10:]), 1.0)

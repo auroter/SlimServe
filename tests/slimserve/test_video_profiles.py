@@ -22,6 +22,8 @@ VIDEO_IDS = (
     "ltx25-one-stage",
     "ltx25-retake",
     "ltx25-ic-lora",
+    "ltx25-a2vid",
+    "ltx25-dubit",
 )
 FAST_IDS = (
     "ltx25-distilled-fast",
@@ -31,6 +33,8 @@ FAST_IDS = (
     "ltx25-one-stage-fast",
     "ltx25-retake-fast",
     "ltx25-ic-lora-fast",
+    "ltx25-a2vid-fast",
+    "ltx25-dubit-fast",
 )
 GIB = 1 << 30
 

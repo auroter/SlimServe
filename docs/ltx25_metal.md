@@ -15,6 +15,8 @@ H.264 + AAC mp4. One profile per upstream pipeline:
 | `ltx25-one-stage` | TI2VidOneStage: 30 guided steps at the output size, no upsampler | prototyping (upstream: educational) |
 | `ltx25-retake` | RetakePipeline: regenerate [start, end) seconds of a source clip, the rest kept | editing an existing clip |
 | `ltx25-ic-lora` | ICLoraPipeline: a reference video drives the clip through an IC-LoRA adapter (colorize, deblur, restore, relight, matte, ...) | video-to-video |
+| `ltx25-a2vid` | A2VidPipelineTwoStage: the dev flow driven by an audio file, which rides frozen and ships | audio-to-video |
+| `ltx25-dubit` | DubItPipeline: re-voice a clip under the Dub-It IC-LoRA, the clip's video and audio as reference tokens | dubbing |
 
 Distilled versus dev is a quality-versus-time choice for the person asking,
 not something the server picks.
@@ -31,6 +33,8 @@ slimserve ltx25-distilled -p "..." --image a.png --image b.png 48 0.8      # a s
 slimserve ltx25-keyframes -p "..." --image a.png 0 --image b.png 96        # interpolate between stills
 slimserve ltx25-retake -p "..." --video-path clip.mp4 --start-time 2 --end-time 3.5   # regenerate a region
 slimserve ltx25-ic-lora -p "..." --video-conditioning gray.mp4 --lora colorization.safetensors   # video-to-video
+slimserve ltx25-a2vid -p "..." --audio-path speech.m4a --size 768x512          # audio-to-video (length from the audio)
+slimserve ltx25-dubit -p "..." --reference-video talk.mp4 --lora dubit.safetensors   # dubbing
 slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
 slimserve ltx25-hq -p "..."                                               # Lightricks' HQ preset (res_2s)
 slimserve ltx25-dev -p "a cat watches rain" --enhance-prompt                # Gemma rewrites the prompt first
@@ -93,6 +97,26 @@ with trapezoids (upstream FixedSizeSpatialTiling); a tiled full-resolution
 stage needs `stage_2_ic_lora`. Stills condition as elsewhere. A tiled stage
 encodes its references with our default source tiling, not upstream's
 machine-dependent decode tiling (the one documented deviation).
+
+`ltx25-a2vid` (upstream's A2VidPipelineTwoStage) takes `audio_path` (a file
+with an audio stream on the server) or `audio` (base64), `audio_start_time`
+and `audio_max_duration` in seconds (CLI flags of the same names). The
+samples are resampled to 16 kHz, encoded by the audio VAE and ride frozen
+through both dev stages (video guidance only, the audio guider upstream's
+default), so the picture is generated to the sound; without `seconds` /
+`num_frames` the clip is int(audio seconds x fps) snapped to 8k + 1 (capped
+at the envelope; `audio_max_duration` and a length are exclusive, as
+upstream); the source waveform ships, cut to the clip.
+
+`ltx25-dubit` (upstream's DubItPipeline) takes `reference_video` (or
+`video`), exactly one adapter in `loras` (Lightricks/LTX-2.3-22b-IC-LoRA-
+DubIt, gated), `reference_strength`, and a size; the reference's frame count
+(snapped to 8k + 1) and rate are the output's. Both distilled stages carry
+the adapter; the reference video is tiled-encoded at each stage's size and
+appended as reference tokens; its audio is encoded and appended after the
+target audio as frozen reference tokens at negative times (stage 1), and
+stage 2 freezes the stage-1 audio and appends it as its own reference. The
+stage-1 audio ships.
 
 `ltx25-dfr` takes two more options (upstream's `--temporal-upscalings` and
 `--spatial-upscalings`; CLI flags of the same names): `temporal_upscalings`
@@ -369,8 +393,7 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 
 ## Not implemented yet
 
-Of upstream's pipelines and options (ledger section 30): A2VidPipelineTwoStage
-(audio-driven), DubItPipeline, T2AOneStagePipeline, HDRICLoraPipeline and the
+Of upstream's pipelines and options (ledger section 30): T2AOneStagePipeline, HDRICLoraPipeline and the
 native `--hdr` EXR path, alpha_gen; generated keyframes on the distilled flow
 and chunked long clips. The I2V
 first-frame path is wired but its end-to-end output has not been compared

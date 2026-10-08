@@ -93,6 +93,29 @@ def probe(path: str | os.PathLike) -> VideoInfo:
     )
 
 
+def probe_audio(path: str | os.PathLike) -> VideoInfo:
+    """A file that may be audio-only (A2Vid's --audio-path): the audio
+    stream's rate and layout, the video fields zero when there is none."""
+    ffprobe = _ffmpeg_binary().replace("ffmpeg", "ffprobe")
+    out = _run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(path)])
+    streams = json.loads(out)["streams"]
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if audio is None:
+        raise ValueError(f"{path}: no audio stream")
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    return VideoInfo(
+        frames=int(video.get("nb_frames") or 0) if video else 0,
+        height=int(video["height"]) if video else 0,
+        width=int(video["width"]) if video else 0,
+        fps=float(Fraction(video["avg_frame_rate"]))
+        if video and video.get("avg_frame_rate", "0/0") != "0/0"
+        else 0.0,
+        has_audio=True,
+        audio_rate=int(audio["sample_rate"]),
+        audio_channels=int(audio["channels"]),
+    )
+
+
 def read_frames(
     path: str | os.PathLike,
     info: VideoInfo,

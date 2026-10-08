@@ -1663,3 +1663,38 @@ repository the account has not been granted (403 on Colorization, 0.9
 GB); an end-to-end "follows the reference" check waits for one of them to
 be accepted. The mechanism itself (`append_reference` + an IC-LoRA) is what
 DFR stage 2 runs, parity-checked in sections 21 and 26.
+
+## 35. A2Vid, Dub-It; retake-fast with tiles (2026-10-08)
+
+**`ltx25-a2vid`** = A2VidPipelineTwoStage (`pipeline.a2vid` -> `dev(source_
+audio=...)`): the audio file's samples from `audio_start_time` (at most
+`audio_max_duration`), decoded as section 33's path and encoded by the audio
+VAE, are the frozen audio modality in both stages (sigma 0 for its tokens,
+prompt AdaLN and cross gates; the audio guider upstream's default: no
+passes); the clip length is int(seconds x fps) snapped to 8k + 1 when not
+given (at most 1024 frames; capped at the envelope here); the source
+waveform ships in place of the decoded tokens (`Result.source_audio`, cut
+to the clip as upstream's replace_chunks_audio). Smoke (`n12/a2vid.*`,
+the fox clip's 1.375 s of audio as `--audio-path`, 768x512): 33 frames
+derived, 133.3 s (stage 1 102.4, stage 2 13.6, audio decode 0), the shipped
+audio is the source (5% AAC round-trip difference), a clean frame.
+
+**`ltx25-dubit`** = DubItPipeline (`pipeline.dubit`): one Dub-It IC-LoRA
+attached across both distilled stages; the reference clip sets the length
+(snapped) and rate; the reference video tiled-encoded at each stage's size
+over the adapter's downscale and appended as reference tokens (strength
+`reference_strength`); `sampling.append_audio_reference` = Audio
+ConditionByReferenceLatent with patchify_audio_reference_latent's negative
+positions (midpoints - the reference's end - 0.04 s): the reference audio
+latent after the target audio in stage 1, the frozen stage-1 audio as its
+own reference in stage 2; the stage-1 audio ships. Mechanics smoke
+(`n12/dubit.*`, the detailing adapter standing in for the gated
+LTX-2.3-22b-IC-LoRA-DubIt): 768x512x33 in 50.4 s, both stages with the
+appended video and audio references. A dubbing check waits for the adapter.
+
+**retake-fast** gains the 2x2 attention tiles: at 1536x1024x121 step cache +
+conv 471 s, + tiles **363 s** (stage 239 s; exact 745 s, 2.05x).
+
+Request parsing for both in `test_video_retake.py`; the keyframe
+interpolation, one-stage, retake, IC-LoRA, A2Vid and Dub-It profiles all
+have fast tiers now (the dev or distilled block they stack on).

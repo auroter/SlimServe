@@ -94,6 +94,10 @@ class Result:
     keyframes: tuple[mx.array, list[int]] | None = None
     # set when the clip length came from the duration head
     predicted_seconds: float | None = None
+    # A2Vid / DubIt: the source waveform ((channels, samples) float, rate) that
+    # ships in place of the decoded audio tokens (upstream replace_chunks_audio:
+    # the samples covering the clip's frames)
+    source_audio: tuple[np.ndarray, int] | None = None
 
 
 class Denoiser:
@@ -1616,6 +1620,7 @@ class LTX25Engine:
         max_num_frames: int | None = None,
         images: list[sampling.Still] | None = None,
         keyframes_only: bool = False,
+        source_audio: tuple[mx.array, np.ndarray, int] | None = None,
     ) -> Result:
         """Lightricks' TI2VidTwoStagesPipeline: guided dev stage 1 at half
         resolution, 2x latent upscale, 3-step stage 2 with the distilled LoRA
@@ -1623,9 +1628,16 @@ class LTX25Engine:
         `images` condition the clip in both stages (see `distilled`). `fast`
         stacks the fast tier (see `Fast`). `keyframes_only` is the
         KeyframeInterpolationPipeline: every still is appended as keyframe
-        tokens (frame 0 too) and the audio is re-noised and refined in stage 2."""
+        tokens (frame 0 too) and the audio is re-noised and refined in stage 2.
+        `source_audio` (tokens (1, T, 128), waveform, rate) is the A2Vid
+        pipeline: the encoded source audio rides frozen through both stages
+        (audio guidance off) and the source waveform ships."""
         if self.variant != "dev":
             raise ValueError("the dev pipeline needs LTX25Engine(variant='dev')")
+        if source_audio is not None:
+            audio_guidance = sampling.Guidance(
+                cfg=1.0, stg=0.0, modality=1.0, rescale=0.0
+            )
         fast = fast or Fast()
         if fast.steps:
             steps = fast.steps
@@ -1670,9 +1682,23 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, cond1, fps, 1.0, seed, keyframes_only)
-            audio = sampling.noised_state(
-                (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
-            )
+            if source_audio is not None:
+                tokens = source_audio[0][:, :audio_t]
+                if tokens.shape[1] < audio_t:
+                    tokens = mx.concatenate(
+                        [tokens, mx.zeros((1, audio_t - tokens.shape[1], 128))], axis=1
+                    )
+                audio = sampling.LatentState(
+                    latent=tokens,
+                    clean=tokens,
+                    denoise_mask=mx.zeros((1, audio_t, 1), dtype=G),
+                    positions=apos,
+                    frozen=True,
+                )
+            else:
+                audio = sampling.noised_state(
+                    (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
+                )
             guided = GuidedDenoiser(
                 dit, cond, neg, video_guidance, audio_guidance, batched
             )
@@ -1707,7 +1733,7 @@ class LTX25Engine:
                 bf16_noise=self.bf16_noise,
             )
             video = self._condition(video, cond2, fps, s0, seed + 2, keyframes_only)
-            if keyframes_only:
+            if keyframes_only and source_audio is None:
                 # Upstream keyframe_interpolation.py re-noises the stage-1 audio
                 # to sigma 0.909 and refines it with the video; it ships from
                 # stage 2.
@@ -1750,13 +1776,56 @@ class LTX25Engine:
 
         return Result(
             sampling.unpatchify(v2[:, : f * h2 * w2], (f, h2, w2)),
-            a2 if keyframes_only else a1,
+            a2 if keyframes_only and source_audio is None else a1,
             num_frames,
             height,
             width,
             fps,
             tm,
             predicted_seconds=predicted,
+            source_audio=None if source_audio is None else source_audio[1:],
+        )
+
+    # ---- audio to video ---------------------------------------------------------
+    def a2vid(
+        self,
+        prompt: str,
+        audio_path: str,
+        audio_start_time: float = 0.0,
+        audio_max_duration: float | None = None,
+        num_frames: int | None = None,
+        fps: float = 24.0,
+        **kwargs,
+    ) -> Result:
+        """Lightricks' A2VidPipelineTwoStage: the dev flow driven by an audio
+        file. The stream's samples from `audio_start_time` (at most
+        `audio_max_duration` s) are encoded through the audio VAE and ride
+        frozen through both stages (video guidance only); the clip length
+        follows the audio when `num_frames` is not given (int(duration * fps),
+        at most 1024, snapped to 8k + 1); the source waveform ships, cut to the
+        clip. Takes `dev`'s other arguments."""
+        from slimserve.video.ltx25 import media
+
+        info = media.probe_audio(audio_path)
+        audio = media.read_audio(audio_path, info, audio_start_time, audio_max_duration)
+        if audio is None:
+            raise ValueError(f"{audio_path}: no audio from {audio_start_time:.3f} s")
+        wav, rate = audio
+        if num_frames is None:
+            raw = int(wav.shape[1] / rate * fps)
+            num_frames = max(1, min(raw, 1024))
+            cap = kwargs.get("max_num_frames")
+            if cap is not None:  # the profile's envelope at this size
+                num_frames = min(num_frames, cap)
+        num_frames = max(1, (num_frames - 1) // 8 * 8 + 1)
+        tm_tokens = self.load_audio(encoder=True).encode(wav, rate)
+        mx.eval(tm_tokens)
+        return self.dev(
+            prompt,
+            num_frames=num_frames,
+            fps=fps,
+            source_audio=(tm_tokens, wav, rate),
+            **kwargs,
         )
 
     # ---- keyframe interpolation ---------------------------------------------
@@ -2368,6 +2437,180 @@ class LTX25Engine:
             predicted_seconds=predicted,
         )
 
+    # ---- Dub-It ------------------------------------------------------------------
+    def dubit(
+        self,
+        prompt: str,
+        reference_video: str,
+        loras: list[tuple[str, float]],
+        height: int = 1024,
+        width: int = 1536,
+        seed: int = 42,
+        reference_strength: float = 1.0,
+        images: list[sampling.Still] | None = None,
+        image: str | bytes | None = None,
+        image_strength: float = 1.0,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+        fast: Fast | None = None,
+    ) -> Result:
+        """Lightricks' DubItPipeline: the distilled transformer with one Dub-It
+        IC-LoRA in both stages; the reference clip (its frame count, snapped
+        to 8k + 1, and rate are the output's) is encoded with the default
+        tiling at each stage's size and appended as video reference tokens;
+        its audio is encoded and appended after the target audio as frozen
+        reference tokens with negative times (stage 1), and stage 2 freezes
+        the stage-1 audio and appends it as its own reference. The new speech
+        is generated by the model in stage 1 (the prompt's words, the
+        reference's voice and scene) and the picture re-rendered to it, lips
+        included; the stage-1 audio ships."""
+        from slimserve.video.ltx25 import media
+        from slimserve.video.ltx25.lora import Lora
+
+        if self.variant != "distilled":
+            raise ValueError("Dub-It runs on the distilled transformer")
+        if len(loras) != 1:
+            raise ValueError("Dub-It takes exactly one adapter (the Dub-It IC-LoRA)")
+        fast = fast or Fast()
+        key = str(Path(loras[0][0]).expanduser().resolve())
+        lora = self.user_lora_cache.get(key)
+        if lora is None:
+            lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+        lora_strength = loras[0][1]
+        downscale = lora.reference_downscale
+        info = media.probe(reference_video)
+        num_frames = max(1, (info.frames - 1) // 8 * 8 + 1)
+        fps = info.fps
+        tm = Timings()
+        with tm.span("text"):
+            video_text, audio_text = self.load_text().encode(prompt)[:2]
+            mx.eval(video_text, audio_text)
+            if not keep_text:
+                self.unload_text()
+        with tm.span("load"):
+            dit = self.load_dit()
+            vae = self.load_vae()
+            upscaler = self.load_upscaler()
+        height, width = sampling.snap_dimensions(height, width, two_stage=True)
+        f, h1, w1 = sampling.video_latent_shape(num_frames, height // 2, width // 2)
+        audio_t = sampling.audio_token_count(num_frames, fps)
+        apos = sampling.audio_positions(audio_t)
+        stepper = self._stepper(tm, on_step)
+        stills = self._prepare_images(image, image_strength, images, num_frames)
+        ref_audio = self._source_audio_tokens(
+            reference_video, info, num_frames, fps, tm
+        )
+        if ref_audio is None:
+            raise ValueError(f"no audio stream in {reference_video}")
+
+        def with_reference(video, h, w, sigma, stage_seed):
+            video = self._condition(
+                video, self._image_latents(stills, h, w, tm), fps, sigma, stage_seed
+            )
+            if (h * 32) % downscale or (w * 32) % downscale:
+                raise ValueError(
+                    f"{w * 32}x{h * 32} must be divisible by the adapter's "
+                    f"reference_downscale_factor {downscale}"
+                )
+            latent = self._source_video_latent(
+                reference_video,
+                info,
+                h * 32 // downscale,
+                w * 32 // downscale,
+                tm,
+                0.0,
+                num_frames,
+                fps,
+            )
+            _, _, rf, rh, rw = latent.shape
+            video = sampling.append_reference(
+                video,
+                sampling.patchify(latent),
+                sampling.video_positions(rf, rh, rw, fps),
+                downscale,
+                reference_strength,
+            )
+            mx.eval(video.latent, video.clean, video.positions)
+            return video
+
+        lora.attach(dit, lora_strength)
+        try:
+            with tm.span("stage1"):
+                video = sampling.noised_state(
+                    (1, f * h1 * w1, 128),
+                    sampling.video_positions(f, h1, w1, fps),
+                    seed,
+                    tokens_per_frame=h1 * w1,
+                    bf16_noise=self.bf16_noise,
+                )
+                video = with_reference(video, h1, w1, 1.0, seed)
+                audio = sampling.noised_state(
+                    (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
+                )
+                audio = sampling.append_audio_reference(audio, ref_audio)
+                mx.eval(audio.latent, audio.positions)
+                v1, a1 = sampling.euler_loop(
+                    Denoiser(dit, video_text, audio_text),
+                    video,
+                    audio,
+                    fast.sigmas1(sampling.DISTILLED_SIGMAS),
+                    on_step=stepper("stage1"),
+                    step_cache=fast.cache(),
+                )
+                a1 = a1[:, :audio_t]
+            with tm.span("upscale"):
+                half = sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1))
+                up = vae.normalize(upscaler(vae.denormalize(half)))
+                mx.eval(up)
+            h2, w2 = h1 * 2, w1 * 2
+            with tm.span("stage2"):
+                sigmas2 = fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS)
+                s0 = sigmas2[0]
+                video = sampling.noised_state(
+                    (1, f * h2 * w2, 128),
+                    sampling.video_positions(f, h2, w2, fps),
+                    seed + 2,
+                    sigma=s0,
+                    initial=sampling.patchify(up),
+                    tokens_per_frame=h2 * w2,
+                    bf16_noise=self.bf16_noise,
+                )
+                video = with_reference(video, h2, w2, s0, seed + 2)
+                # stage-1 audio frozen, and appended as its own reference
+                audio = sampling.LatentState(
+                    latent=a1,
+                    clean=a1,
+                    denoise_mask=mx.zeros((1, audio_t, 1), dtype=G),
+                    positions=apos,
+                    frozen=True,
+                )
+                audio = sampling.append_audio_reference(audio, a1)
+                mx.eval(audio.latent, audio.positions)
+                v2, _ = sampling.euler_loop(
+                    Denoiser(
+                        dit,
+                        video_text,
+                        audio_text,
+                        video_tiles=fast.tiles(f, h2, w2, video.latent.shape[1]),
+                    ),
+                    video,
+                    audio,
+                    sigmas2,
+                    on_step=stepper("stage2"),
+                    step_cache=fast.cache(),
+                )
+        finally:
+            lora.detach(dit)
+        return Result(
+            sampling.unpatchify(v2[:, : f * h2 * w2], (f, h2, w2)),
+            a1,
+            num_frames,
+            height,
+            width,
+            fps,
+            tm,
+        )
+
     # ---- hq (res_2s) --------------------------------------------------------
     def hq(
         self,
@@ -2587,7 +2830,12 @@ class LTX25Engine:
                     budget_bytes=self.decode_budget(),
                 )
         with tm.span("audio_decode"):
-            waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
+            if result.source_audio is not None:
+                waveform, sample_rate = result.source_audio
+                end = round(result.num_frames / result.fps * sample_rate)
+                waveform = waveform[..., :end]
+            else:
+                waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
         with tm.span("mux"):
             frames = frames[: result.num_frames]
             mux.write_mp4(str(path), frames, result.fps, waveform, sample_rate)

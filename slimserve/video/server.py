@@ -67,9 +67,9 @@ from typing import Any
 MAX_QUEUED = 16
 KEEP_FINISHED = 32
 # pipelines on the dev transformer (CFG/STG guidance, a negative prompt)
-GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage")
+GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage", "a2vid")
 # pipelines that edit a source clip: its size, length and rate are the output's
-SOURCE_PIPELINES = ("retake",)
+SOURCE_PIPELINES = ("retake", "dubit")
 
 
 class BadRequest(ValueError):
@@ -268,6 +268,13 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
             f"{', '.join(k for k in IC_LORA_KEYS if k in body)}: IC-LoRA options "
             "apply to the ic_lora pipeline only"
         )
+    if cfg["pipeline"] == "a2vid":
+        params.update(a2vid_fields(body, params))
+    elif any(key in body for key in A2VID_KEYS):
+        raise BadRequest(
+            f"{', '.join(k for k in A2VID_KEYS if k in body)}: audio-to-video "
+            "options apply to the a2vid pipeline only"
+        )
     if cfg["pipeline"] == "keyframes":
         if "image" in params:  # the shorthand is a frame-0 keyframe here
             from slimserve.video.ltx25.sampling import Still
@@ -289,7 +296,11 @@ def normalize_source_request(
     (base64 mp4, written next to the outputs), `start_time` / `end_time` in
     seconds, `regenerate_video` / `regenerate_audio` (default true). The
     source's size, frame count and rate are the output's; it must fit the
-    profile's token envelope. No size / seconds / fps / images here."""
+    profile's token envelope. No size / seconds / fps / images here. A Dub-It
+    request (`reference_video` / `video`, `loras`, `reference_strength`)
+    takes a size (the reference sets the length and rate)."""
+    if cfg["pipeline"] == "dubit":
+        return normalize_dubit_request(body, cfg, prompt)
     for key in (
         "size",
         "width",
@@ -384,17 +395,114 @@ def normalize_source_request(
     return params
 
 
+def normalize_dubit_request(
+    body: dict[str, Any], cfg: dict[str, Any], prompt: str
+) -> dict[str, Any]:
+    """Dub-It: `reference_video` (a file on the server) or `video` (base64),
+    exactly one adapter in `loras` (the Dub-It IC-LoRA), `reference_strength`
+    (0-1), a size (multiples of 64), stills; the reference's frame count
+    (snapped to 8k + 1) and rate are the output's and must fit the envelope."""
+    for key in ("seconds", "num_frames", "fps"):
+        if key in body:
+            raise BadRequest(
+                f"{key} does not apply to Dub-It (the reference clip sets it)"
+            )
+    if body.get("reference_video") is not None:
+        path = Path(str(body["reference_video"])).expanduser()
+        if not path.is_file():
+            raise BadRequest(f"reference_video {path} is not a file")
+        ref = str(path)
+    elif body.get("video") is not None:
+        ref = str(_store_video(body["video"]))
+    else:
+        raise BadRequest(
+            "Dub-It needs `reference_video` (a file on the server) or `video`"
+        )
+    from slimserve.video.ltx25 import media
+
+    try:
+        info = media.probe(ref)
+    except (RuntimeError, ValueError) as exc:
+        raise BadRequest(f"cannot read the reference clip: {exc}") from exc
+    if not info.has_audio:
+        raise BadRequest("the reference clip has no audio stream")
+    frames = max(1, (info.frames - 1) // 8 * 8 + 1)
+    width, height = cfg["width"], cfg["height"]
+    if size := body.get("size"):
+        try:
+            width, height = (int(x) for x in str(size).lower().split("x"))
+        except ValueError as exc:
+            raise BadRequest("`size` must look like 1536x1024") from exc
+    width, height = int(body.get("width", width)), int(body.get("height", height))
+    if width % 64 or height % 64 or width < 256 or height < 256:
+        raise BadRequest("width and height must be multiples of 64, at least 256")
+    per_frame = (height // 32) * (width // 32)
+    tokens = ((frames - 1) // 8 + 1) * per_frame
+    if tokens > cfg["max_video_tokens"] or per_frame > (cfg["height"] // 32) * (
+        cfg["width"] // 32
+    ):
+        raise BadRequest(
+            f"{width}x{height}x{frames} is {tokens} latent tokens; this profile is "
+            f"validated up to {cfg['max_video_tokens']} "
+            f"({cfg['width']}x{cfg['height']}x{cfg['num_frames']})"
+        )
+    params: dict[str, Any] = {
+        "prompt": prompt,
+        "reference_video": ref,
+        "width": width,
+        "height": height,
+        "seed": int(body.get("seed", 42)),
+        "source": {
+            "width": info.width,
+            "height": info.height,
+            "num_frames": frames,
+            "fps": info.fps,
+        },
+    }
+    if "reference_strength" in body:
+        params["reference_strength"] = _strength(
+            body["reference_strength"], "reference_strength"
+        )
+    loras = body.get("loras")
+    if not loras or not isinstance(loras, list) or len(loras) != 1:
+        raise BadRequest(
+            "Dub-It needs exactly one adapter in `loras` (the Dub-It IC-LoRA)"
+        )
+    params["loras"] = [lora_field(loras[0])]
+    decoder = str(body.get("decoder", cfg.get("decoder", "diffusion")))
+    if decoder not in ("diffusion", "conv"):
+        raise BadRequest(
+            "decoder must be 'diffusion' (default, sharper) or 'conv' (faster)"
+        )
+    params["decoder"] = decoder
+    if body.get("enhance_prompt") is True:
+        params["enhance_prompt"] = True
+    if body.get("image") is not None:
+        params["image"] = decode_image_field(body["image"])
+        params["image_strength"] = _strength(body.get("image_strength", 1.0))
+    if body.get("images") is not None:
+        params["images"] = [
+            still_field(item, frames, "dubit") for item in _list(body["images"])
+        ]
+    return params
+
+
 def _store_video(value: Any) -> Path:
-    """`video`: base64 mp4 (optionally a data: URL) -> a file under the output
-    directory (the engine reads clips from disk)."""
-    data = _b64(value)
-    target = output_dir() / f"source_{uuid.uuid4().hex[:16]}.mp4"
+    return _store_blob(value, "video", "source")
+
+
+def _store_blob(value: Any, name: str, stem: str) -> Path:
+    """`video` / `audio`: base64 (optionally a data: URL) -> a file under the
+    output directory (the engine reads sources from disk; ffmpeg probes the
+    container)."""
+    data = _b64(value, name)
+    target = output_dir() / f"{stem}_{uuid.uuid4().hex[:16]}.bin"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     return target
 
 
-def _b64(value: Any) -> bytes:
+def _b64(value: Any, name: str = "video") -> bytes:
     if isinstance(value, (bytes, bytearray)):
         data = bytes(value)
     elif isinstance(value, str):
@@ -402,15 +510,15 @@ def _b64(value: Any) -> bytes:
         if text.startswith("data:"):
             header, sep, text = text.partition(",")
             if not sep or ";base64" not in header:
-                raise BadRequest("video data: URL must be base64 encoded")
+                raise BadRequest(f"{name} data: URL must be base64 encoded")
         try:
             data = base64.b64decode(text, validate=True)
         except (binascii.Error, ValueError) as exc:
-            raise BadRequest("video must be base64 (optionally a data: URL)") from exc
+            raise BadRequest(f"{name} must be base64 (optionally a data: URL)") from exc
     else:
-        raise BadRequest("video must be a base64 string")
+        raise BadRequest(f"{name} must be a base64 string")
     if not data:
-        raise BadRequest("video is empty")
+        raise BadRequest(f"{name} is empty")
     return data
 
 
@@ -490,6 +598,43 @@ def guidance_fields(value: Any, pipeline: str) -> dict[str, Any]:
                 if key != "rescale" and clean[key] < 0.0:
                     raise BadRequest(f"{key} must be non-negative")
         out[f"{modality}_guidance"] = dc_replace(defaults[modality], **clean)
+    return out
+
+
+A2VID_KEYS = ("audio_path", "audio", "audio_start_time", "audio_max_duration")
+
+
+def a2vid_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    """The A2Vid request: `audio_path` (a file on the server; any container
+    with an audio stream) or `audio` (base64), `audio_start_time` (s),
+    `audio_max_duration` (s; not with a clip length, as upstream). Without a
+    length the clip follows the audio (capped at the envelope)."""
+    out: dict[str, Any] = {}
+    if body.get("audio_path") is not None:
+        path = Path(str(body["audio_path"])).expanduser()
+        if not path.is_file():
+            raise BadRequest(f"audio_path {path} is not a file")
+        out["audio_path"] = str(path)
+    elif body.get("audio") is not None:
+        out["audio_path"] = str(_store_blob(body["audio"], "audio", "source"))
+    else:
+        raise BadRequest(
+            "the a2vid pipeline needs `audio_path` (a file on the server) "
+            "or `audio` (base64)"
+        )
+    for key in ("audio_start_time", "audio_max_duration"):
+        if key in body:
+            try:
+                value = float(body[key])
+            except (TypeError, ValueError) as exc:
+                raise BadRequest(f"{key} must be a number of seconds") from exc
+            if value < 0 or (key == "audio_max_duration" and value <= 0):
+                raise BadRequest(f"{key} must be positive")
+            out[key] = value
+    if "audio_max_duration" in out and params.get("num_frames") is not None:
+        raise BadRequest(
+            "audio_max_duration and a clip length (seconds / num_frames) are exclusive"
+        )
     return out
 
 
@@ -686,11 +831,11 @@ class VideoService:
         engine.load_vae()
         if pipeline not in ("one_stage", *SOURCE_PIPELINES):
             engine.load_upscaler()
-        engine.load_audio(encoder=pipeline in SOURCE_PIPELINES)
+        engine.load_audio(encoder=pipeline in (*SOURCE_PIPELINES, "a2vid"))
         engine.load_duration()
         if self.cfg.get("decoder", "diffusion") == "diffusion":
             engine.load_diffvae()
-        if pipeline in ("dev", "hq", "keyframes"):
+        if pipeline in ("dev", "hq", "keyframes", "a2vid"):
             engine.load_distilled_lora()
         elif pipeline == "dfr":
             engine.load_detail_lora()

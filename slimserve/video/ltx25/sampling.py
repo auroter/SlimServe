@@ -634,6 +634,36 @@ def append_reference(
     )
 
 
+AUDIO_REFERENCE_GAP = 0.04  # upstream patchify_audio_reference_latent
+
+
+def append_audio_reference(
+    state: LatentState, tokens: mx.array, strength: float = 1.0
+) -> LatentState:
+    """Upstream AudioConditionByReferenceLatent with patchify_audio_reference_
+    latent(negative_positions=True): clean reference audio tokens appended
+    after the target's, their times shifted before 0 by the reference's own
+    duration plus 0.04 s (so they never overlap the target's timeline)."""
+    b, n, _ = state.latent.shape
+    count = tokens.shape[1]
+    tokens = tokens.astype(G)
+    starts, ends = audio_time_bounds(count)
+    pos = mx.array(
+        ((starts + ends) / 2.0 - ends.max() - AUDIO_REFERENCE_GAP).astype(np.float32)
+    )
+    pos = mx.broadcast_to(pos.reshape(1, count, 1), (b, count, 1))
+    return replace(
+        state,
+        latent=mx.concatenate([state.latent, tokens], axis=1),
+        clean=mx.concatenate([state.clean, tokens], axis=1),
+        denoise_mask=mx.concatenate(
+            [state.denoise_mask, mx.full((b, count, 1), 1.0 - strength, dtype=G)],
+            axis=1,
+        ),
+        positions=mx.concatenate([state.positions, pos], axis=1),
+    )
+
+
 def attention_bias(
     existing: mx.array | None,
     n_existing: int,
