@@ -128,6 +128,25 @@ def _parser() -> argparse.ArgumentParser:
         "--end-time", type=float, help="retake: end of the region to regenerate (s)"
     )
     video.add_argument(
+        "--chunked",
+        action="store_true",
+        help="long clips in overlapping temporal windows (97-frame windows, 25-frame "
+        "carry, crossfade over the carry); distilled, dev, a2vid",
+    )
+    video.add_argument(
+        "--chunk-pixel-frames", type=int, help="chunked: frames per window (8k + 1)"
+    )
+    video.add_argument(
+        "--chunk-carry-frames",
+        type=int,
+        help="chunked: frames each window hands to the next (8k + 1, at least 17)",
+    )
+    video.add_argument(
+        "--chunk-blend-frames",
+        type=int,
+        help="chunked: decoded frames crossfaded at each seam (default: the carry)",
+    )
+    video.add_argument(
         "--num-generated-keyframes",
         type=int,
         help="extra generated keyframe slots at evenly spaced interior frames "

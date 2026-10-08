@@ -159,6 +159,16 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         )
     # the longest 8k + 1 clip at this size inside the validated token envelope
     max_frames = (cfg["max_video_tokens"] // per_frame - 1) * 8 + 1
+    chunk = chunk_config(body, cfg["pipeline"])
+    if chunk is not None:
+        # chunked: the window is what must fit; the clip may be long (1024
+        # frames, the model's maximum)
+        if chunk.chunk_pixel_frames > max_frames:
+            raise BadRequest(
+                f"chunk_pixel_frames {chunk.chunk_pixel_frames} is larger than this "
+                f"profile's envelope at {width}x{height} ({max_frames} frames)"
+            )
+        max_frames = 1024
     if "num_frames" in body:
         frames = int(body["num_frames"])
     elif "seconds" in body:
@@ -188,6 +198,8 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
     }
     if frames is None:
         params["max_num_frames"] = max_frames
+    if chunk is not None:
+        params["chunk"] = chunk
     decoder = str(body.get("decoder", cfg.get("decoder", "diffusion")))
     if decoder not in ("diffusion", "conv"):
         raise BadRequest(
@@ -691,6 +703,58 @@ def a2vid_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]
             "audio_max_duration and a clip length (seconds / num_frames) are exclusive"
         )
     return out
+
+
+CHUNK_PIPELINES = ("distilled", "dev", "a2vid")
+CHUNK_KEYS = (
+    "chunked",
+    "chunk_pixel_frames",
+    "chunk_carry_frames",
+    "chunk_blend_frames",
+)
+
+
+def chunk_config(body: dict[str, Any], pipeline: str):
+    """Upstream chunk_config_from_args: `chunked` (the default layout: 97-frame
+    windows, 25-frame carry, a crossfade over the whole carry) or
+    `chunk_pixel_frames` / `chunk_carry_frames` (either implies the other's
+    default) and `chunk_blend_frames`; None when none is given."""
+    given = [k for k in CHUNK_KEYS if k in body]
+    if not given:
+        return None
+    if pipeline not in CHUNK_PIPELINES:
+        raise BadRequest(
+            f"{', '.join(given)}: chunked generation applies to "
+            f"{', '.join(CHUNK_PIPELINES)}"
+        )
+    from slimserve.video.ltx25.chunks import ChunkConfig
+
+    def count(key, default):
+        if key not in body:
+            return default
+        value = body[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise BadRequest(f"{key} must be a non-negative integer")
+        return value
+
+    if "chunked" in body and not isinstance(body["chunked"], bool):
+        raise BadRequest("chunked must be true or false")
+    if body.get("chunked") is False and len(given) == 1:
+        return None
+    frames = count("chunk_pixel_frames", 97)
+    carry = count("chunk_carry_frames", 25)
+    blend = count("chunk_blend_frames", None)
+    for name, value in (("chunk_pixel_frames", frames), ("chunk_carry_frames", carry)):
+        if (value - 1) % 8:
+            raise BadRequest(f"{name} must be on the 8k + 1 grid (e.g. 97, 25)")
+    if carry < 17 or carry >= frames:
+        raise BadRequest(
+            "chunk_carry_frames must be at least 17 and less than chunk_pixel_frames"
+        )
+    try:
+        return ChunkConfig(frames, carry, blend)
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
 
 
 KEYFRAME_PIPELINES = (

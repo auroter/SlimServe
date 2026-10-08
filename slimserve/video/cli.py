@@ -145,10 +145,19 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         "audio_max_duration",
         "reference_video",
         "reference_strength",
+        "chunk_pixel_frames",
+        "chunk_carry_frames",
+        "chunk_blend_frames",
     ):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
-    for key in ("skip_stage_2", "stage_2_ic_lora", "tile", "decode_with_keyframes"):
+    for key in (
+        "skip_stage_2",
+        "stage_2_ic_lora",
+        "tile",
+        "decode_with_keyframes",
+        "chunked",
+    ):
         if getattr(args, key, False):
             body[key] = True
     if getattr(args, "num_generated_keyframes", None):
@@ -199,6 +208,8 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         term.note(f"enhanced prompt: {prompt}")
         engine.unload_enhancer()
     decoder = params.pop("decoder", None)
+    if params.get("chunk") is not None:
+        params["decoder"] = decoder
     if source:
         term.note(
             f"source {source['width']}x{source['height']}x{source['num_frames']} "

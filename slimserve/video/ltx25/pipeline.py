@@ -98,6 +98,9 @@ class Result:
     # ships in place of the decoded audio tokens (upstream replace_chunks_audio:
     # the samples covering the clip's frames)
     source_audio: tuple[np.ndarray, int] | None = None
+    # chunked long clips: already decoded and stitched (uint8 frames (F, H, W,
+    # 3), waveform (channels, samples), rate); render only muxes
+    decoded: tuple[np.ndarray, np.ndarray, int] | None = None
 
 
 class Denoiser:
@@ -891,6 +894,8 @@ class LTX25Engine:
         images: list[sampling.Still] | None = None,
         generated_keyframes: int | list[int] = 0,
         decode_with_keyframes: bool = False,
+        chunk=None,
+        decoder: str | None = None,
     ) -> Result:
         """`image` (a path or encoded image bytes) conditions the first frame
         (image-to-video) at `image_strength` in both stages; `images` are
@@ -901,7 +906,10 @@ class LTX25Engine:
         `generated_keyframes` (upstream --num-generated-keyframes): that many
         evenly spaced generated keyframe slots (or the frames given) ride in
         both stages as in DFR; `decode_with_keyframes` anchors the diffusion
-        decode on them."""
+        decode on them. `chunk` (a chunks.ChunkConfig; upstream
+        --chunk-pixel-frames / --chunk-carry-frames / --chunk-blend-frames)
+        generates in overlapping temporal windows and returns the clip
+        decoded (`decoder`)."""
         fast = fast or Fast()
         tm = Timings()
         if text_embeds is None:
@@ -928,6 +936,31 @@ class LTX25Engine:
 
         stepper = self._stepper(tm, on_step)
         stills = self._prepare_images(image, image_strength, images, num_frames)
+        if chunk is not None:
+            return self._chunked(
+                config=chunk,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                fps=fps,
+                seed=seed,
+                stills=stills,
+                generated_keyframes=generated_keyframes,
+                decode_with_keyframes=decode_with_keyframes,
+                video_text=video_text,
+                audio_text=audio_text,
+                guided=None,
+                stage1_sigmas=fast.sigmas1(sampling.DISTILLED_SIGMAS),
+                stage2_sigmas=fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS),
+                ancestral=True,
+                stage2_lora=None,
+                freeze_stage2_audio=False,
+                source_audio=None,
+                fast=fast,
+                tm=tm,
+                stepper=stepper,
+                decoder=decoder or self.decoder,
+            )
         cond1 = self._image_latents(stills, h1, w1, tm)
 
         # Stage 1: half resolution, from pure noise, ancestral Euler.
@@ -1706,6 +1739,8 @@ class LTX25Engine:
         source_audio: tuple[mx.array, np.ndarray, int] | None = None,
         generated_keyframes: int | list[int] = 0,
         decode_with_keyframes: bool = False,
+        chunk=None,
+        decoder: str | None = None,
     ) -> Result:
         """Lightricks' TI2VidTwoStagesPipeline: guided dev stage 1 at half
         resolution, 2x latent upscale, 3-step stage 2 with the distilled LoRA
@@ -1756,6 +1791,33 @@ class LTX25Engine:
         apos = sampling.audio_positions(audio_t)
         stepper = self._stepper(tm, on_step)
         stills = self._prepare_images(image, image_strength, images, num_frames)
+        if chunk is not None:
+            if keyframes_only:
+                raise ValueError("keyframe interpolation is not chunked upstream")
+            return self._chunked(
+                config=chunk,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                fps=fps,
+                seed=seed,
+                stills=stills,
+                generated_keyframes=generated_keyframes,
+                decode_with_keyframes=decode_with_keyframes,
+                video_text=cond[0],
+                audio_text=cond[1],
+                guided=(neg, video_guidance, audio_guidance, batched),
+                stage1_sigmas=sampling.ltx2_schedule(steps, 4096),
+                stage2_sigmas=fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS),
+                ancestral=False,
+                stage2_lora=lora,
+                freeze_stage2_audio=True,
+                source_audio=source_audio,
+                fast=fast,
+                tm=tm,
+                stepper=stepper,
+                decoder=decoder or self.decoder,
+            )
         cond1 = self._image_latents(stills, h1, w1, tm)
 
         with tm.span("stage1"):
@@ -2824,6 +2886,415 @@ class LTX25Engine:
             )
         return Result(None, a, num_frames, 0, 0, fps, tm, predicted_seconds=predicted)
 
+    # ---- chunked long clips (upstream ltx_pipelines.chunks) ------------------------
+    def _decode_frames(self, latent: mx.array, keyframes, seed: int, decoder: str):
+        """One window's pixels as uint8 (F, H, W, 3) through the configured
+        decoder (the diffusion one keyframe-aware when given)."""
+        from slimserve.video.ltx25 import vae as vae_mod
+
+        if decoder == "diffusion":
+            pixels = self.load_diffvae().decode_raw(
+                latent, seed=seed, keyframes=keyframes
+            )
+            mx.eval(pixels)
+            frames = vae_mod.to_uint8(pixels)
+            del pixels
+            return frames
+        return self.load_vae().decode(latent, budget_bytes=self.decode_budget())
+
+    def _chunked(
+        self,
+        *,
+        config,
+        num_frames: int,
+        height: int,
+        width: int,
+        fps: float,
+        seed: int,
+        stills,
+        generated_keyframes,
+        decode_with_keyframes: bool,
+        video_text: mx.array,
+        audio_text: mx.array,
+        guided: tuple | None,
+        stage1_sigmas: list[float],
+        stage2_sigmas: list[float],
+        ancestral: bool,
+        stage2_lora,
+        freeze_stage2_audio: bool,
+        source_audio: tuple[mx.array, np.ndarray, int] | None,
+        fast: Fast,
+        tm: Timings,
+        stepper,
+        decoder: str,
+    ) -> Result:
+        """The two-stage flow over overlapping temporal windows (upstream
+        generate_uniform_chunks -> denoise_chunks -> spatially_upsample_chunks
+        -> denoise_chunks -> decode_chunks): per window and stage the images
+        that land in it, its generated slots (a count is a per-window budget
+        with one slot at each seam), the previous window's slots inside the
+        carry as pinned keyframe tokens, and the previous window's last carry
+        latent frames pinned at index 0 (video and audio); decoded per window
+        with the incoming carry dropped and the seam crossfaded."""
+        from slimserve.video.ltx25 import chunks as ch
+
+        dit = self.load_dit()
+        vae = self.load_vae()
+        upscaler = self.load_upscaler()
+        plan = ch.layouts(num_frames, config)
+        kf_global = ch.plan_keyframes(generated_keyframes, num_frames, plan)
+        h1, w1 = height // 64, width // 64
+        h2, w2 = h1 * 2, w1 * 2
+        audio_src = None if source_audio is None else np.array(source_audio[0])
+
+        def window_state(
+            layout,
+            h,
+            w,
+            stage_seed,
+            sigma,
+            initial,
+            slots_initial,
+            incoming,
+            carry,
+            kind,
+        ):
+            """One window's conditioned video state at (h, w): images, slots,
+            incoming keyframes, the carry; returns (state, slot slice, slot
+            frames, keyframe planes for the decode)."""
+            f = layout.latent_frames
+            video = sampling.noised_state(
+                (1, f * h * w, 128),
+                sampling.video_positions(f, h, w, fps),
+                stage_seed,
+                sigma=sigma,
+                initial=None if initial is None else sampling.patchify(initial),
+                tokens_per_frame=h * w,
+                bf16_noise=self.bf16_noise,
+            )
+            local_stills = [
+                (lat, local, strength)
+                for lat, g, strength in self._image_latents(stills, h, w, tm)
+                if (local := layout.local_frame(g)) is not None
+            ]
+            video = self._condition(video, local_stills, fps, sigma, stage_seed)
+            slot_frames = [
+                local for g in kf_global if (local := layout.local_frame(g)) is not None
+            ]
+            slots = None
+            if slot_frames:
+                video, slots = sampling.append_slots(
+                    video, slot_frames, h, w, fps, slots_initial, sigma, stage_seed
+                )
+            decode_kf = []
+            if incoming is not None:
+                planes, frames_in = incoming
+                video = sampling.append_anchor_keyframes(
+                    video, planes, frames_in, h, w, fps, sigma, stage_seed, strength=1.0
+                )
+                decode_kf = list(zip(range(planes.shape[2]), frames_in))
+            if carry is not None:
+                video = sampling.condition_latent_frame(video, carry, 1.0, 0)
+            mx.eval(video.latent, video.clean, video.denoise_mask)
+            return video, slots, slot_frames, decode_kf
+
+        def audio_state(layout, stage_seed, sigma, initial_tokens, carry, frozen):
+            tokens = sampling.audio_token_count(layout.pixel_frames, fps)
+            apos = sampling.audio_positions(tokens)
+            if audio_src is not None:  # A2Vid: the source slice, frozen
+                piece = mx.array(ch.audio_window(audio_src, layout, fps, tokens))
+                return sampling.LatentState(
+                    latent=piece,
+                    clean=piece,
+                    denoise_mask=mx.zeros((1, tokens, 1), dtype=G),
+                    positions=apos,
+                    frozen=True,
+                )
+            if frozen:
+                return sampling.LatentState(
+                    latent=initial_tokens,
+                    clean=initial_tokens,
+                    denoise_mask=mx.zeros((1, tokens, 1), dtype=G),
+                    positions=apos,
+                    frozen=True,
+                )
+            audio = sampling.noised_state(
+                (1, tokens, 128),
+                apos,
+                stage_seed + 1,
+                sigma=sigma,
+                initial=initial_tokens,
+                bf16_noise=self.bf16_noise,
+            )
+            if carry is not None:  # (1, ca, 128) tokens as a (1, 128, ca, 1, 1) latent
+                audio = sampling.condition_latent_frame(
+                    audio, carry.transpose(0, 2, 1)[:, :, :, None, None], 1.0, 0
+                )
+            return audio
+
+        def run_loop(denoise, video, audio, sigmas, stage_seed, offset, stage):
+            if ancestral:
+                return sampling.euler_ancestral_loop(
+                    denoise,
+                    video,
+                    audio,
+                    sigmas,
+                    noise_seed=stage_seed + offset,
+                    on_step=stepper(stage),
+                    step_cache=fast.cache(),
+                )
+            return sampling.euler_loop(
+                denoise,
+                video,
+                audio,
+                sigmas,
+                on_step=stepper(stage),
+                step_cache=fast.cache(),
+            )
+
+        def carry_of(latent5d, tokens, layout):
+            if layout.next_carry == 0:
+                return None, None
+            c = (layout.next_carry - 1) // 8 + 1
+            ca = ch.carry_audio_frames(layout.next_carry, fps)
+            return latent5d[:, :, -c:], tokens[:, -ca:]
+
+        def outgoing(planes, frames, layout):
+            """The window's slots inside its outgoing carry, rebased for the
+            next window (upstream _keyframes_for_next_chunk)."""
+            if planes is None or layout.next_carry <= 0:
+                return None
+            start = layout.pixel_frames - layout.next_carry
+            keep = [i for i, p in enumerate(frames) if start <= p < layout.pixel_frames]
+            if not keep:
+                return None
+            return (
+                mx.concatenate([planes[:, :, i : i + 1] for i in keep], axis=2),
+                [frames[i] - start for i in keep],
+            )
+
+        # ---- stage 1 ----
+        stage1: list[tuple] = []
+        carry_v = carry_a = None
+        incoming = None
+        with tm.span("stage1"):
+            for i, layout in enumerate(plan):
+                stage_seed = seed + 1000 * i
+                video, slots, slot_frames, _ = window_state(
+                    layout,
+                    h1,
+                    w1,
+                    stage_seed,
+                    1.0,
+                    None,
+                    None,
+                    incoming,
+                    carry_v,
+                    "stage1",
+                )
+                audio = audio_state(layout, stage_seed, 1.0, None, carry_a, False)
+                n = video.latent.shape[1]
+                if guided is None:
+                    den = Denoiser(dit, video_text, audio_text)
+                else:
+                    neg, vg, ag, batched = guided
+                    den = GuidedDenoiser(
+                        dit, (video_text, audio_text), neg, vg, ag, batched
+                    )
+                v, a = run_loop(
+                    den,
+                    video,
+                    audio,
+                    stage1_sigmas,
+                    stage_seed,
+                    sampling.ANCESTRAL_NOISE_SEED_OFFSET,
+                    "stage1",
+                )
+                f = layout.latent_frames
+                lat = sampling.unpatchify(v[:, : f * h1 * w1], (f, h1, w1))
+                a = a[:, : sampling.audio_token_count(layout.pixel_frames, fps)]
+                planes = (
+                    sampling.slots_to_latent(v, slots, len(slot_frames), h1, w1)
+                    if slots is not None
+                    else None
+                )
+                mx.eval(lat, a, *(() if planes is None else (planes,)))
+                carry_v, carry_a = carry_of(lat, a, layout)
+                incoming = outgoing(planes, slot_frames, layout)
+                stage1.append((lat, a, planes, slot_frames))
+                del n
+
+        # ---- upscale ----
+        with tm.span("upscale"):
+            ups = []
+            for lat, a, planes, slot_frames in stage1:
+                up = vae.normalize(upscaler(vae.denormalize(lat)))
+                planes_up = (
+                    None
+                    if planes is None
+                    else vae.normalize(upscaler(vae.denormalize(planes)))
+                )
+                mx.eval(up, *(() if planes_up is None else (planes_up,)))
+                ups.append((up, a, planes_up, slot_frames))
+            del stage1
+
+        # ---- stage 2 ----
+        s0 = stage2_sigmas[0]
+        outputs: list[tuple] = []
+        carry_v = carry_a = None
+        incoming = None
+        if stage2_lora is not None:
+            stage2_lora.attach(dit)
+        try:
+            with tm.span("stage2"):
+                for i, (layout, (up, a1, planes_up, _)) in enumerate(zip(plan, ups)):
+                    stage_seed = seed + 1000 * i + 2
+                    video, slots, slot_frames, decode_kf = window_state(
+                        layout,
+                        h2,
+                        w2,
+                        stage_seed,
+                        s0,
+                        up,
+                        planes_up,
+                        incoming,
+                        carry_v,
+                        "stage2",
+                    )
+                    audio = audio_state(
+                        layout, stage_seed, s0, a1, carry_a, freeze_stage2_audio
+                    )
+                    den = Denoiser(
+                        dit,
+                        video_text,
+                        audio_text,
+                        video_tiles=fast.tiles(
+                            layout.latent_frames, h2, w2, video.latent.shape[1]
+                        ),
+                    )
+                    v, a = run_loop(
+                        den,
+                        video,
+                        audio,
+                        stage2_sigmas,
+                        stage_seed,
+                        sampling.ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
+                        "stage2",
+                    )
+                    f = layout.latent_frames
+                    lat = sampling.unpatchify(v[:, : f * h2 * w2], (f, h2, w2))
+                    tokens = sampling.audio_token_count(layout.pixel_frames, fps)
+                    a = (
+                        a1
+                        if freeze_stage2_audio or audio_src is not None
+                        else a[:, :tokens]
+                    )
+                    planes = (
+                        sampling.slots_to_latent(v, slots, len(slot_frames), h2, w2)
+                        if slots is not None
+                        else None
+                    )
+                    mx.eval(lat, a, *(() if planes is None else (planes,)))
+                    carry_v, carry_a = carry_of(lat, a, layout)
+                    # the decode's anchors: incoming carried slots and this window's
+                    keyframes = None
+                    if decode_with_keyframes:
+                        parts, frames_kf = [], []
+                        if incoming is not None:
+                            parts.append(incoming[0])
+                            frames_kf += incoming[1]
+                        if planes is not None:
+                            parts.append(planes)
+                            frames_kf += slot_frames
+                        kept = [
+                            (k, fr)
+                            for k, fr in enumerate(frames_kf)
+                            if 0 <= fr < layout.pixel_frames
+                        ]
+                        if kept:
+                            allp = mx.concatenate(parts, axis=2)
+                            keyframes = (
+                                mx.concatenate(
+                                    [allp[:, :, k : k + 1] for k, _ in kept], axis=2
+                                ),
+                                [fr for _, fr in kept],
+                            )
+                    incoming = outgoing(planes, slot_frames, layout)
+                    outputs.append((lat, a, keyframes))
+        finally:
+            if stage2_lora is not None:
+                stage2_lora.detach(dit)
+        del ups
+
+        # ---- decode and stitch (upstream decode_chunks) ----
+        with tm.span("vae_decode"):
+            self.unload_text()
+            frames_out: list[np.ndarray] = []
+            audio_out: list[np.ndarray] = []
+            pending_v = pending_a = None
+            rate = None
+            fade = None
+            for i, (layout, (lat, a, keyframes)) in enumerate(zip(plan, outputs)):
+                decoded = self._decode_frames(lat, keyframes, seed + i, decoder)
+                kept = decoded[layout.prev_carry :]
+                if source_audio is None:
+                    wav, rate = self.load_audio().decode(a)
+                    fade = max(1, round(ch.AUDIO_SEAM_CROSSFADE_MS / 1000.0 * rate))
+                    extra = 0 if pending_a is None else min(fade, pending_a.shape[-1])
+                    keep = min(wav.shape[-1], round(kept.shape[0] / fps * rate) + extra)
+                    wav = wav[..., -keep:] if keep else wav[..., :0]
+                    seam = max(
+                        0, keep - min(wav.shape[-1], round(kept.shape[0] / fps * rate))
+                    )
+                    if pending_a is not None:
+                        pending_a, wav = ch.crossfade_audio(pending_a, wav, seam)
+                else:
+                    wav = None
+                if pending_v is not None:
+                    blended = ch.crossfade_video(
+                        pending_v,
+                        decoded[
+                            layout.prev_carry - pending_v.shape[0] : layout.prev_carry
+                        ],
+                    )
+                    frames_out.append(blended)
+                    if pending_a is not None:
+                        audio_out.append(pending_a)
+                    pending_v = pending_a = None
+                if layout.blend:
+                    frames_out.append(kept[: -layout.blend])
+                    pending_v = kept[-layout.blend :]
+                    if wav is not None:
+                        tail = round(layout.blend / fps * rate)
+                        cut = max(0, wav.shape[-1] - tail)
+                        audio_out.append(wav[..., :cut])
+                        pending_a = wav[..., cut:]
+                else:
+                    frames_out.append(kept)
+                    if wav is not None:
+                        audio_out.append(wav)
+                del decoded
+            if pending_v is not None:
+                frames_out.append(pending_v)
+                if pending_a is not None:
+                    audio_out.append(pending_a)
+            frames = np.concatenate(frames_out, axis=0)
+            if source_audio is not None:
+                waveform, rate = source_audio[1], source_audio[2]
+                waveform = waveform[..., : round(frames.shape[0] / fps * rate)]
+            else:
+                waveform = np.concatenate(audio_out, axis=-1)
+        return Result(
+            None,
+            None,
+            int(frames.shape[0]),
+            height,
+            width,
+            fps,
+            tm,
+            decoded=(frames, waveform, rate),
+        )
+
     # ---- hq (res_2s) --------------------------------------------------------
     def hq(
         self,
@@ -2999,6 +3470,11 @@ class LTX25Engine:
 
         decoder = decoder or self.decoder
         tm = result.timings
+        if result.decoded is not None:  # chunked: decoded per window already
+            frames, waveform, sample_rate = result.decoded
+            with tm.span("mux"):
+                mux.write_mp4(str(path), frames, result.fps, waveform, sample_rate)
+            return Path(path)
         if result.video_latent is None:  # T2A: a WAV (upstream encode_audio)
             with tm.span("audio_decode"):
                 waveform, sample_rate = self.load_audio().decode(result.audio_tokens)

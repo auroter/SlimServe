@@ -1730,3 +1730,34 @@ denoised stage-2 planes handed to the keyframe-aware diffusion decode (the
 conv decoder ignores them, as upstream warns and does). IC-LoRA's tiled
 stages get the slots' extents. Smoke: distilled 768x512x49 with two slots
 (frames 16 and 32) and the keyframe decode: 58.8 s (decode 8.7 s).
+
+## 38. Chunked long clips (2026-10-08)
+
+Upstream's `chunks` package ported for the distilled, dev and A2Vid flows
+(`chunks.py` the arithmetic, `LTX25Engine._chunked` the driver):
+`chunk_lengths` / `layouts` = _split_target_pixel_frames_into_chunk_lengths
+/ uniform_chunk_layouts (six cases identical to upstream's printed layouts,
+`tests/slimserve/data/ltx25_chunk_layout.json`), `plan_keyframes` =
+plan_chunk_keyframes (a count is a per-window budget, one slot at each
+non-final seam; identical), `carry_audio_frames`, `audio_window`
+(A2Vid's frozen source slice per window), the seam blends (video lerp with
+weights k / (n + 1), audio 40 ms cos / sin). Per window and stage: images
+remapped to the window (`local_frame_index`), the window's slots, the
+previous window's slots inside its outgoing carry pinned as keyframe
+tokens, and the previous window's last carry latent frames pinned clean at
+index 0 (video; audio by its own carry count), the window's own noise
+(seed + 1000 i, stage 2 + 2; the ancestral stream per window as upstream
+advances it); stage 2 initial from the x2-upscaled window and slots;
+decoded per window (keyframe-aware when asked, the incoming and own slots
+as anchors), the incoming carry dropped, the pending tail blended with the
+next window's re-rendered overlap, audio kept from the vocoded tail and
+crossfaded; A2Vid ships the source waveform. `Result.decoded` carries the
+stitched frames and waveform, `render` only muxes.
+
+Smoke (`n12/chunked.*`): distilled 512x320, 10 s = 241 frames in three
+97-frame windows (carry 25): 113.7 s (stage 1 43.3, stage 2 36.8, decode
+23.4), 241 frames out; the scene (a fox pack crossing the snow) continues
+through both seams, the frame-to-frame change at the seams inside the
+clip's normal range (6-11 levels; no spikes). Not yet chunked: IC-LoRA and
+Dub-It (their references are sliced per window upstream; section 30's
+list).
