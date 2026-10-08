@@ -1459,3 +1459,64 @@ Order: multiple stills + keyframe interpolation + one-stage (same mechanism)
 -> guidance knobs + user LoRAs -> retake -> IC-LoRA -> A2Vid -> DubIt -> T2A
 -> generated keyframes on distilled -> chunked long clips -> HDR / HDR IC-LoRA
 -> alpha. Each lands with its own ledger section.
+
+## 31. Stills at any frame; keyframe interpolation; one stage (2026-10-08)
+
+The first batch of section 30, the three that share one mechanism.
+
+**Stills at any pixel frame, every profile.** Upstream's repeatable `--image
+PATH FRAME_IDX STRENGTH [CRF]` (`ImageConditioningInput`), API `images:
+[{image, frame, strength, crf}]`, CLI `--image PATH [FRAME [STRENGTH
+[CRF]]]` repeated (`--image PATH` alone stays the I2V shorthand). Port of
+`combined_image_conditionings`: a frame-0 still is `VideoConditionByLatent
+Index` into latent frame 0 as before; any other frame is encoded as a
+one-frame latent and appended as a clean keyframe token block at the single
+pixel frame `[frame, frame + 1)` (`VideoConditionByKeyframeIndex`, our
+`append_anchor_keyframes` with its own seed offset 50000 + index for a
+strength below 1), unmarked in keyframes_mask, in request order, before the
+generated slots and reference tokens. `sampling.condition_stills`,
+`sampling.Still`, `pipeline._prepare_images` / `_image_latents` /
+`_condition` (each still encoded at each stage's size, as upstream re-encodes
+per chunk). Per-still CRF (0 = no H.264 round trip). The stage outputs are
+now trimmed to the target tokens everywhere (`v[:, : f*h*w]`) and the
+stage-2 attention tiles take the full token count. In DFR the stills follow
+upstream's `rebase_image_conditionings` into every temporal-round window
+(frame x 2**round, kept inside [start, end], window-local) and epilogue
+window (plus the resume-pixel filter), and the epilogue's generated opening
+plane is only used when no still sits at frame 0. Geometry checked against
+values printed by ltx_core for frames 0 / 5 / 16 at 24 fps (temporal
+midpoints 0.0208 / 0.2292 / 0.6875, the 16 + 32 i spatial grid, mask
+1 - strength, clean = the plane, zeros in the noisy latent) and against
+`rebase_image_conditionings` on three (scale, window) cases
+(`tests/slimserve/test_video_stills.py`).
+
+**`ltx25-keyframes`** = KeyframeInterpolationPipeline: `pipeline.keyframes`
+-> `dev(keyframes_only=True)`: every still appended (frame 0 too, through
+the causal fix: the same `[0, 1)` position), and stage 2 re-noises the
+stage-1 audio to 0.909 and refines it (the dev pipeline freezes it); the
+clip ships stage-2 audio. Requires `images`; the `image` shorthand becomes a
+frame-0 keyframe.
+
+**`ltx25-one-stage`** = TI2VidOneStagePipeline: one guided dev stage at the
+output size (sizes snap to 32), the 4096-anchor schedule, no upsampler,
+audio from the stage; envelope 768x512x121 (6,144 tokens: the dev profile's
+stage-1 load, now with four passes at the output size).
+
+**Smoke, 768x512x49, seed 7, conv decoder, `n12/`** (stills: frames 0 and 48
+of the earlier fox clip `n2/e2e_4/clip.mp4`):
+- distilled, `--image f0.png --image f48.png 48`: 51.5 s (stage 1 16.3,
+  stage 2 17.1); output frame 0 vs its still 28.8 dB, frame 48 vs its still
+  24.1 dB, unrelated frame pairs 12-14 dB: the appended block pins the
+  moment.
+- keyframes, both stills as keyframes: 214.7 s (stage 1 167.6, stage 2
+  24.5); frame 0 27.9 dB, frame 48 24.0 dB.
+- one-stage, frame-0 still: 494.8 s (30 steps x 4 passes at 2,688 tokens,
+  16 s per step).
+
+**Fast tiers** (`ltx25-keyframes-fast`, `ltx25-one-stage-fast`: the dev
+fast block, 20 steps, step cache 0.10, conv decoder): keyframes 111.8 s
+(1.92x; frame 48 is 35.4 dB from the exact clip's, the keyframe pins it),
+one-stage 227.4 s (2.18x; the same shot, the fox placed differently, 14.8
+dB from exact at frame 48 - without a stage 2 to re-anchor on, fewer steps
+move the one-stage result further than dev's). Contact sheet
+`n12/compare_fast.png`.

@@ -36,6 +36,46 @@ def run(plan: Plan, args: Any) -> int:
     return server.serve(cfg, name, args.host, args.port)
 
 
+def _add_images(body: dict[str, Any], args: Any) -> None:
+    """--image PATH [FRAME [STRENGTH [CRF]]] (repeatable, upstream's form): a
+    lone frame-0 still is the `image` shorthand (with --image-strength), the
+    rest go through `images`."""
+    groups = getattr(args, "image", None) or []
+    strength_flag = getattr(args, "image_strength", None)
+    if strength_flag is not None and not groups:
+        raise ValueError("--image-strength needs --image")
+    stills = []
+    for group in groups:
+        if not 1 <= len(group) <= 4:
+            raise ValueError("--image takes PATH [FRAME [STRENGTH [CRF]]]")
+        path = Path(group[0]).expanduser()
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise ValueError(f"cannot read --image {path}: {error}") from error
+        try:
+            frame = int(group[1]) if len(group) > 1 else 0
+            strength = float(group[2]) if len(group) > 2 else None
+            crf = int(group[3]) if len(group) > 3 else None
+        except ValueError as error:
+            raise ValueError(f"--image {path}: {error}") from error
+        stills.append({"image": data, "frame": frame, "strength": strength, "crf": crf})
+    if not stills:
+        return
+    first = stills[0]
+    if first["strength"] is None:
+        first["strength"] = 1.0 if strength_flag is None else strength_flag
+    elif strength_flag is not None:
+        raise ValueError("give the strength inline or with --image-strength, not both")
+    for still in stills[1:]:
+        if still["strength"] is None:
+            still["strength"] = 1.0
+    if len(stills) == 1 and first["frame"] == 0 and first["crf"] is None:
+        body["image"], body["image_strength"] = first["image"], first["strength"]
+        return
+    body["images"] = stills
+
+
 def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     from slimserve.video import server
     from slimserve.video.ltx25.pipeline import LTX25Engine
@@ -54,33 +94,23 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
             body[key] = getattr(args, key)
     if getattr(args, "enhance_prompt", False):
         body["enhance_prompt"] = True
-    if getattr(args, "image", None):
-        try:
-            body["image"] = Path(args.image).expanduser().read_bytes()
-        except OSError as error:
-            term.fail(f"cannot read --image: {error}")
-            return 2
-        if getattr(args, "image_strength", None) is not None:
-            body["image_strength"] = args.image_strength
-    elif getattr(args, "image_strength", None) is not None:
-        term.fail("--image-strength needs --image")
-        return 2
     try:
+        _add_images(body, args)
         params = server.normalize_request(body, cfg)
-    except server.BadRequest as error:
+    except ValueError as error:
         term.fail(str(error))
         return 2
     out = Path(args.output or f"{cfg['pipeline']}-{params['seed']}.mp4").expanduser()
     started = time.perf_counter()
     engine = LTX25Engine(
         root=cfg["root"],
-        variant="dev" if cfg["pipeline"] in ("dev", "hq") else "distilled",
+        variant="dev" if cfg["pipeline"] in server.GUIDED_PIPELINES else "distilled",
     )
     prompt = params.pop("prompt")
     extra = ""
     if params.pop("enhance_prompt", False):
         t0 = time.perf_counter()
-        prompt = engine.enhance(prompt, params.get("image"))
+        prompt = engine.enhance(prompt, server._first_still(params))
         extra = f"enhance {time.perf_counter() - t0:.1f}s, "
         term.note(f"enhanced prompt: {prompt}")
         engine.unload_enhancer()

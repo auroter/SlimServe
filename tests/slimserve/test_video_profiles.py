@@ -13,8 +13,21 @@ from slimserve import registry
 from slimserve.registry import files_for, resolve
 from slimserve.video import server
 
-VIDEO_IDS = ("ltx25-distilled", "ltx25-dev", "ltx25-dfr", "ltx25-hq")
-FAST_IDS = ("ltx25-distilled-fast", "ltx25-dev-fast", "ltx25-dfr-fast")
+VIDEO_IDS = (
+    "ltx25-distilled",
+    "ltx25-dev",
+    "ltx25-dfr",
+    "ltx25-hq",
+    "ltx25-keyframes",
+    "ltx25-one-stage",
+)
+FAST_IDS = (
+    "ltx25-distilled-fast",
+    "ltx25-dev-fast",
+    "ltx25-dfr-fast",
+    "ltx25-keyframes-fast",
+    "ltx25-one-stage-fast",
+)
 GIB = 1 << 30
 
 
@@ -27,7 +40,7 @@ def test_video_profiles_resolve_on_metal_only():
         entry = registry.describe(profile_id)
         assert entry["platforms"] == ["metal"]
         plan = _plan(profile_id)
-        assert plan.engine["pipeline"] == profile_id.split("-")[1]
+        assert plan.engine["pipeline"] == profile_id.split("-", 1)[1].replace("-", "_")
         assert not registry.is_language_model(plan.source)
 
 
@@ -80,6 +93,8 @@ def test_each_pipeline_fetches_its_own_transformer_and_adapter():
     assert dev in paths["ltx25-dev"] and distilled not in paths["ltx25-dev"]
     assert "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors" in paths["ltx25-dev"]
     assert paths["ltx25-hq"] == paths["ltx25-dev"]  # the same transformer and adapter
+    assert paths["ltx25-keyframes"] == paths["ltx25-dev"]
+    assert paths["ltx25-one-stage"] == paths["ltx25-dev"]
     detail = "loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors"
     assert detail in paths["ltx25-dfr"] and detail not in paths["ltx25-distilled"]
     for pid in VIDEO_IDS:

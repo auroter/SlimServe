@@ -3,13 +3,16 @@
 SlimServe serves Lightricks' LTX-2.5 (22B audio+video diffusion transformer)
 on Apple Silicon through its own engine, `slimserve/video/ltx25/`. It loads
 the official Lightricks safetensors directly, runs on MLX, and produces an
-H.264 + AAC mp4. Three profiles, one per upstream pipeline:
+H.264 + AAC mp4. One profile per upstream pipeline:
 
 | profile | pipeline | what it is for |
 | --- | --- | --- |
 | `ltx25-distilled` | DistilledPipeline: 8 + 3 steps, no guidance | fast iteration |
 | `ltx25-dev` | TI2VidTwoStages: 30 guided steps (CFG 3 / STG 1 / modality 3), then 3 with the distilled LoRA | quality |
 | `ltx25-dfr` | DFRPipeline: distilled flow with generated keyframe slots and the detailing IC-LoRA | Lightricks' production path |
+| `ltx25-hq` | TI2VidTwoStagesHQ: 15 res_2s steps x 2 evaluations, distilled LoRA in both stages | Lightricks' HQ preset |
+| `ltx25-keyframes` | KeyframeInterpolation: the dev flow with every still appended as a keyframe at its frame | a clip through given stills |
+| `ltx25-one-stage` | TI2VidOneStage: 30 guided steps at the output size, no upsampler | prototyping (upstream: educational) |
 
 Distilled versus dev is a quality-versus-time choice for the person asking,
 not something the server picks.
@@ -22,6 +25,8 @@ slimserve ltx25-distilled -y                        # fetch weights if needed, t
 slimserve ltx25-dev -p "A red fox trotting through a snowy pine forest at dawn" --output fox.mp4
 slimserve ltx25-dfr -p "..." --size 768x512 --seconds 5 --seed 7
 slimserve ltx25-distilled -p "the fox turns and runs" --image fox.png     # image-to-video
+slimserve ltx25-distilled -p "..." --image a.png --image b.png 48 0.8      # a second still pinned at frame 48
+slimserve ltx25-keyframes -p "..." --image a.png 0 --image b.png 96        # interpolate between stills
 slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
 slimserve ltx25-hq -p "..."                                               # Lightricks' HQ preset (res_2s)
 slimserve ltx25-dev -p "a cat watches rain" --enhance-prompt                # Gemma rewrites the prompt first
@@ -38,7 +43,8 @@ Serving API (a clip takes minutes, so it is job-shaped):
 ```
 POST   /v1/videos               {"prompt": "...", "size": "1536x1024", "seconds": 5, "seed": 42,
                                  "enhance_prompt": false,
-                                 "image": "<base64 or data: URL>", "image_strength": 1.0}
+                                 "image": "<base64 or data: URL>", "image_strength": 1.0,
+                                 "images": [{"image": "<base64>", "frame": 48, "strength": 1.0, "crf": 18}]}
 GET    /v1/videos/<id>          status (queued | in_progress | completed | failed), progress, timings
 GET    /v1/videos/<id>/content  the mp4
 DELETE /v1/videos/<id>
@@ -59,7 +65,8 @@ neither `seconds` nor `num_frames` gets its length from the model's duration
 head (Lightricks' auto-duration: the clip the prompt implies, 1-20 s, snapped
 to the 8k + 1 frame grid, capped at the profile's envelope for that size); the
 job reports the pick as `num_frames` and `predicted_seconds`. `negative_prompt`
-is accepted by `ltx25-dev` and `ltx25-hq` (the guided pipelines). `decoder` is `diffusion` (default, Lightricks'
+is accepted by the guided pipelines (`ltx25-dev`, `ltx25-hq`, `ltx25-keyframes`,
+`ltx25-one-stage`). `decoder` is `diffusion` (default, Lightricks'
 recommended decoder: sharper faces, textures and text) or `conv` (about 4x
 faster decode); the CLI flag is `--decoder`. Width and height are multiples of 64, frame
 counts are 8k + 1. Requests larger than the profile's validated clip
@@ -147,6 +154,20 @@ CLI: `--image PATH` and `--image-strength` (0-1, default 1.0). API: `image`
 is the encoded still (PNG, JPEG, ...) as base64, optionally a
 `data:image/png;base64,...` URL, with `image_strength`; undecodable payloads
 are a 400. The encode is timed as the `image` span (both stages summed).
+
+Stills at other frames (upstream's repeatable `--image PATH FRAME_IDX
+STRENGTH [CRF]`): `--image b.png 48 0.8` on the CLI, `images: [{"image":
+..., "frame": 48, "strength": 0.8, "crf": 18}]` in the API, any number, on
+every profile. A frame-0 still replaces latent frame 0 as above; a still at
+any other pixel frame is encoded as a one-frame latent and appended to the
+token sequence as a clean keyframe block whose RoPE position is that single
+pixel frame (`VideoConditionByKeyframeIndex`; `combined_image_conditionings`),
+so the clip passes through the image at that moment while the frames around
+it are generated. `crf` overrides the H.264 round trip for that still (0:
+none). In DFR the stills ride into every temporal-round window and epilogue
+window their (x2-per-round) frame falls in. `ltx25-keyframes` is the
+interpolation pipeline proper: every still, frame 0 included, is an appended
+keyframe, and the audio is refined in stage 2 rather than frozen.
 
 ### The fast tier
 
@@ -294,9 +315,12 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 
 ## Not implemented yet
 
-- Image conditioning beyond the first frame (keyframes at other frame
-  indices, video-to-video reference conditioning); the I2V first-frame path
-  is wired but its end-to-end output has not yet been compared against
-  upstream on this machine.
+Of upstream's pipelines and options (ledger section 30): ICLoraPipeline
+(video-to-video reference conditioning), A2VidPipelineTwoStage (audio-driven),
+RetakePipeline, DubItPipeline, T2AOneStagePipeline, HDRICLoraPipeline and the
+native `--hdr` EXR path, alpha_gen; generated keyframes on the distilled flow,
+user LoRAs, per-request guidance scales, and chunked long clips. The I2V
+first-frame path is wired but its end-to-end output has not been compared
+against upstream on this machine.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
   hardware and are separate profile records when they exist.

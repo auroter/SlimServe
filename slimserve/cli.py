@@ -82,7 +82,10 @@ def _parser() -> argparse.ArgumentParser:
         "--seconds", type=float, help="clip length (default: predicted from the prompt)"
     )
     video.add_argument("--seed", type=int, help="random seed (default 42)")
-    video.add_argument("--negative-prompt", help="dev and hq pipelines only")
+    video.add_argument(
+        "--negative-prompt",
+        help="guided pipelines only (dev, hq, keyframes, one_stage)",
+    )
     video.add_argument(
         "--enhance-prompt",
         action="store_true",
@@ -105,12 +108,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     video.add_argument(
         "--image",
-        help="image-to-video: a still that becomes the first frame",
+        nargs="+",
+        action="append",
+        metavar=("PATH", "FRAME STRENGTH CRF"),
+        help="a conditioning still (repeatable): PATH [FRAME [STRENGTH [CRF]]]. "
+        "Frame 0 (the default) is image-to-video; another frame pins that "
+        "moment as a keyframe; CRF overrides the H.264 round trip (0: none)",
     )
     video.add_argument(
         "--image-strength",
         type=float,
-        help="how strongly --image pins the first frame, 0-1 (default 1.0)",
+        help="strength of the first --image, 0-1 (default 1.0)",
     )
     video.add_argument(
         "--decoder",

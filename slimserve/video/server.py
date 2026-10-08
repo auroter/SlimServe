@@ -9,7 +9,9 @@ requests. The API is job-shaped because a clip takes minutes:
                                        "seconds": 5, "seed": 42,
                                        "enhance_prompt": false,
                                        "image": <base64 or data: URL>,
-                                       "image_strength": 1.0}
+                                       "image_strength": 1.0,
+                                       "images": [{"image": ..., "frame": 48,
+                                                   "strength": 1.0, "crf": 18}]}
     GET    /v1/videos/<id>            status, progress, timings
     GET    /v1/videos/<id>/content    the mp4 (H.264 + AAC)
     DELETE /v1/videos/<id>
@@ -22,7 +24,10 @@ has Gemma-4 E2B-it rewrite the request into the model's caption style first
 the job's `enhanced_prompt`. `image`
 (image-to-video) is an encoded still (PNG, JPEG, ...)
 as base64, optionally wrapped in a `data:image/...;base64,` URL; it becomes
-the clip's first frame, pinned at `image_strength` (0-1, default 1.0).
+the clip's first frame, pinned at `image_strength` (0-1, default 1.0). `images`
+is upstream's repeatable `--image PATH FRAME_IDX STRENGTH [CRF]`: stills at any
+pixel frame (frame 0 replaces the first latent frame, other frames ride along
+as keyframe tokens); the keyframe interpolation profile requires it.
 Requests outside the profile's validated envelope are refused: the envelope
 is what was measured to fit this machine's memory.
 """
@@ -45,6 +50,8 @@ from typing import Any
 
 MAX_QUEUED = 16
 KEEP_FINISHED = 32
+# pipelines on the dev transformer (CFG/STG guidance, a negative prompt)
+GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage")
 
 
 class BadRequest(ValueError):
@@ -77,6 +84,16 @@ class Job:
         }
         if isinstance(out.get("image"), (bytes, bytearray)):
             out["image"] = f"<{len(out['image'])} bytes>"
+        if out.get("images"):
+            out["images"] = [
+                {
+                    "image": f"<{len(s.image)} bytes>",
+                    "frame": s.frame,
+                    "strength": s.strength,
+                    **({"crf": s.crf} if s.crf is not None else {}),
+                }
+                for s in out["images"]
+            ]
         if self.completed_at:
             out["completed_at"] = int(self.completed_at)
             out["seconds_elapsed"] = round(
@@ -150,10 +167,10 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         )
     params["decoder"] = decoder
     if "negative_prompt" in body:
-        if cfg["pipeline"] not in ("dev", "hq"):
+        if cfg["pipeline"] not in GUIDED_PIPELINES:
             raise BadRequest(
-                "negative_prompt applies to the dev and hq pipelines only "
-                "(the distilled flows have no CFG)"
+                "negative_prompt applies to the guided pipelines only "
+                f"({', '.join(GUIDED_PIPELINES)}; the distilled flows have no CFG)"
             )
         params["negative_prompt"] = str(body["negative_prompt"])
     if "temporal_upscalings" in body:
@@ -183,17 +200,75 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
             params["enhance_prompt"] = True
     if body.get("image") is not None:
         params["image"] = decode_image_field(body["image"])
-        strength = body.get("image_strength", 1.0)
-        try:
-            strength = float(strength)
-        except (TypeError, ValueError) as exc:
-            raise BadRequest("image_strength must be a number in [0, 1]") from exc
-        if not 0.0 <= strength <= 1.0:
-            raise BadRequest("image_strength must be a number in [0, 1]")
-        params["image_strength"] = strength
+        params["image_strength"] = _strength(body.get("image_strength", 1.0))
     elif "image_strength" in body:
         raise BadRequest("image_strength needs an image")
+    if body.get("images") is not None:
+        params["images"] = [
+            still_field(item, frames, cfg["pipeline"]) for item in _list(body["images"])
+        ]
+    if cfg["pipeline"] == "keyframes":
+        if "image" in params:  # the shorthand is a frame-0 keyframe here
+            from slimserve.video.ltx25.sampling import Still
+
+            first = Still(params.pop("image"), 0, params.pop("image_strength"))
+            params["images"] = [first, *params.get("images", [])]
+        if not params.get("images"):
+            raise BadRequest(
+                "the keyframe interpolation pipeline needs `images` "
+                '([{"image": ..., "frame": N, "strength": 1.0}, ...])'
+            )
     return params
+
+
+def _list(value: Any) -> list:
+    if not isinstance(value, list) or not value:
+        raise BadRequest("images must be a non-empty list")
+    return value
+
+
+def _strength(value: Any) -> float:
+    try:
+        strength = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BadRequest("image strength must be a number in [0, 1]") from exc
+    if not 0.0 <= strength <= 1.0:
+        raise BadRequest("image strength must be a number in [0, 1]")
+    return strength
+
+
+def still_field(item: Any, frames: int | None, pipeline: str):
+    """One entry of `images`: {"image": <base64 or data: URL>, "frame": N,
+    "strength": 0-1, "crf": int} -> sampling.Still (upstream's --image PATH
+    FRAME_IDX STRENGTH [CRF]). Frames must be inside the clip when its length
+    is known; the engine checks again once the duration head has decided."""
+    from slimserve.video.ltx25.sampling import Still
+
+    if not isinstance(item, dict) or item.get("image") is None:
+        raise BadRequest('each images entry needs an "image"')
+    frame = item.get("frame", 0)
+    if not isinstance(frame, int) or isinstance(frame, bool) or frame < 0:
+        raise BadRequest("image frame must be a non-negative integer")
+    if frames is not None and frame >= frames:
+        raise BadRequest(f"image frame {frame} is outside the clip's {frames} frames")
+    crf = item.get("crf")
+    if crf is not None and (not isinstance(crf, int) or not 0 <= crf <= 51):
+        raise BadRequest("image crf must be an integer in [0, 51] (0: no round trip)")
+    return Still(
+        decode_image_field(item["image"]),
+        frame,
+        _strength(item.get("strength", 1.0)),
+        crf,
+    )
+
+
+def _first_still(params: dict[str, Any]):
+    """The still the prompt enhancer looks at: upstream passes images[0]."""
+    if params.get("image") is not None:
+        return params["image"]
+    if params.get("images"):
+        return params["images"][0].image
+    return None
 
 
 def fast_settings(cfg: dict[str, Any]):
@@ -270,17 +345,18 @@ class VideoService:
         pipeline = self.cfg["pipeline"]
         engine = LTX25Engine(
             root=self.cfg.get("root"),
-            variant="dev" if pipeline in ("dev", "hq") else "distilled",
+            variant="dev" if pipeline in GUIDED_PIPELINES else "distilled",
         )
         engine.load_text()
         engine.load_dit()
         engine.load_vae()
-        engine.load_upscaler()
+        if pipeline != "one_stage":
+            engine.load_upscaler()
         engine.load_audio()
         engine.load_duration()
         if self.cfg.get("decoder", "diffusion") == "diffusion":
             engine.load_diffvae()
-        if pipeline in ("dev", "hq"):
+        if pipeline in ("dev", "hq", "keyframes"):
             engine.load_distilled_lora()
         elif pipeline == "dfr":
             engine.load_detail_lora()
@@ -323,7 +399,7 @@ class VideoService:
             t0 = time.perf_counter()
             # loaded for the rewrite and dropped: the resident set stays the
             # measured one (a dev HD request sits near the active cap)
-            prompt = engine.enhance(prompt, p.get("image"))
+            prompt = engine.enhance(prompt, _first_still(p))
             engine.unload_enhancer()
             enhance_s = time.perf_counter() - t0
             job.params["enhanced_prompt"] = prompt

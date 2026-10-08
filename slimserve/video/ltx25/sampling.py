@@ -240,6 +240,80 @@ def with_latent(state: LatentState, latent: mx.array) -> LatentState:
     return replace(state, latent=latent)
 
 
+# ---- stills (upstream ImageConditioningInput) --------------------------------
+KEYFRAME_NOISE_SEED_OFFSET = 50000  # 40000 is the hq pipeline's res_2s stream
+
+
+@dataclass(frozen=True)
+class Still:
+    """One conditioning still, upstream's `--image PATH FRAME_IDX STRENGTH
+    [CRF]`: `image` is a path or encoded bytes, `frame` the target pixel frame,
+    `crf` None means the checkpoint's H.264 round trip (18), 0 none."""
+
+    image: Any
+    frame: int = 0
+    strength: float = 1.0
+    crf: int | None = None
+
+
+def rebase_stills(
+    conds: list[tuple[Any, int, float]],
+    scale: int,
+    start: int = 0,
+    end: int | None = None,
+    resume: int | None = None,
+) -> list[tuple[Any, int, float]]:
+    """Upstream dfr_helpers/ops.py rebase_image_conditionings: after r temporal
+    rounds a still's moment sits at frame * 2**r; with `end` only stills inside
+    [start, end] are kept, their frames made window-local; `resume` (the
+    epilogue's filter) additionally drops stills before the window's resume
+    pixel."""
+    out = []
+    for latent, frame, strength in conds:
+        scaled = frame * scale
+        if end is not None and not start <= scaled <= end:
+            continue
+        if resume is not None and scaled < resume:
+            continue
+        out.append((latent, scaled - start, strength))
+    return out
+
+
+def condition_stills(
+    state: LatentState,
+    conds: list[tuple[mx.array, int, float]],
+    fps: float,
+    sigma: float,
+    seed: int,
+    append_all: bool = False,
+) -> LatentState:
+    """Upstream combined_image_conditionings: each (latent (1, C, 1, h, w),
+    pixel frame, strength) at frame 0 replaces latent frame 0 (`VideoCondition
+    ByLatentIndex`); any other frame is appended as a clean single-frame
+    keyframe token block (`VideoConditionByKeyframeIndex`), in list order.
+    `append_all` is image_conditionings_by_adding_guiding_latent (the keyframe
+    interpolation pipeline): frame 0 is appended too. Apply before generated
+    slots and reference tokens."""
+    for i, (latent, frame, strength) in enumerate(conds):
+        if frame == 0 and not append_all:
+            state = condition_latent_frame(state, latent, strength)
+            continue
+        _, _, _, h, w = latent.shape
+        state = append_anchor_keyframes(
+            state,
+            latent,
+            [frame],
+            h,
+            w,
+            fps,
+            sigma,
+            seed + i,
+            strength=strength,
+            seed_offset=KEYFRAME_NOISE_SEED_OFFSET,
+        )
+    return state
+
+
 def condition_latent_frame(
     state: LatentState,
     latent: mx.array,
@@ -621,11 +695,14 @@ def append_anchor_keyframes(
     sigma: float,
     seed: int,
     strength: float = ANCHOR_KEYFRAME_STRENGTH,
+    seed_offset: int = ANCHOR_NOISE_SEED_OFFSET,
 ) -> LatentState:
     """Upstream VideoConditionByKeyframeIndex for each plane in `planes`
     ((B, C, K, H, W)): given keyframe content appended as single-frame tokens
     at pixel_frames (not marked as generated slots) with denoise mask
-    1 - strength; the noisy tokens start at lerp(clean, sigma * noise, mask)."""
+    1 - strength; the noisy tokens start at lerp(clean, sigma * noise, mask).
+    A frame-0 keyframe gets upstream's causal fix ([0, 1) -> the same single
+    pixel frame), so every index uses the (frame + 0.5) / fps midpoint."""
     b, n, c = state.latent.shape
     per = h * w
     y = mx.arange(h).astype(G) * 32 + 16.0
@@ -648,7 +725,7 @@ def append_anchor_keyframes(
     clean = mx.concatenate(
         [patchify(planes[:, :, k : k + 1]) for k in range(planes.shape[2])], axis=1
     ).astype(G)
-    mx.random.seed(seed + ANCHOR_NOISE_SEED_OFFSET)
+    mx.random.seed(seed + seed_offset)
     noise = mx.random.normal(clean.shape)
     mask = 1.0 - strength
     kf = state.keyframes_mask

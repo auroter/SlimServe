@@ -3994,6 +3994,128 @@
           ]
         }
       }
+    },
+    "ltx25-keyframes": {
+      "title": "LTX-2.5 keyframe interpolation (two-stage, guided) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Audio+video generation between given stills with Lightricks' KeyframeInterpolationPipeline: the dev flow (30 guided steps at half resolution, 2x latent upscale, 3 steps with the distilled LoRA) with every still appended as clean keyframe tokens at its pixel frame, so the clip passes through each image at its moment; the audio is re-noised and refined in stage 2. Requests name the stills with `images` ([{image, frame, strength}]); the CLI takes --image PATH FRAME [STRENGTH] repeatedly.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "keyframes",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "Every still is a VideoConditionByKeyframeIndex token block (upstream image_conditionings_by_adding_guiding_latent): frame 0 is appended too rather than replacing latent frame 0, as upstream's keyframe pipeline does. The stills are encoded at each stage's size. Guidance and the distilled LoRA as the dev profile; stage 2 refines the audio from sigma 0.909 instead of freezing it (keyframe_interpolation.py). Ledger section 31."
+          ]
+        }
+      }
+    },
+    "ltx25-one-stage": {
+      "title": "LTX-2.5 one-stage (guided, no upsampler) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Audio+video generation with Lightricks' TI2VidOneStagePipeline: 30 guided steps (CFG 3.0 / 7.0, STG 1.0 on block 28, modality 3.0, rescale 0.7) at the output size on the dev transformer, no latent upscale, audio from the same stage. Upstream keeps it for prototyping; the two-stage profiles are the production paths. Sizes snap to 32.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "one_stage",
+            "width": 768,
+            "height": 512,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 6144,
+            "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache and the server refuses clips above max_video_tokens (768x512x121: the token count of the dev profile's stage 1, whose four guided passes per step this pipeline runs at the output size). One generation at a time; up to 16 requests queue.",
+            "The schedule is upstream's scheduler.execute(steps) without a latent (the 4096-token shift at every size). Stills condition as in the distilled profile (frame 0 replaces latent frame 0, other frames are keyframe tokens). Ledger section 31."
+          ]
+        }
+      }
+    },
+    "ltx25-keyframes-fast": {
+      "title": "LTX-2.5 keyframe interpolation (two-stage, guided), fast tier, on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "The keyframe interpolation pipeline with the dev fast tier: 20 guided steps instead of 30, the first-block step cache at 0.10, conv decoder; the stills' keyframe tokens, all four guidance passes and the 3-step stage 2 are kept. Same engine as ltx25-keyframes. Measured in perf/ltx25_metal_campaign.md section 31.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "keyframes",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "conv",
+            "served_model_name": "LTX-2.5",
+            "fast": {
+              "steps": 20,
+              "step_cache": 0.1
+            }
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "What is on: `fast.steps` 20, `fast.step_cache` 0.10 (block 0 runs every step; a step whose block-0 residual moved less than 10% accumulated since the last computed step reuses that step's residual: 11 of 30 stage-1 steps at 1536x1024x121, never in stage 2), and `decoder: conv`. The tradeoff, measured: the generated transients come out softer with less denoising work (footsteps about 3 dB below the exact profile's, background and timing unchanged), as the picture's fine detail does; `fast.steps` is the dial back toward exact. Not in the profile: dropping the modality guidance pass (`fast.guidance.modality` 1.0, 3 passes per step, 22% off stage 1), which softens the footsteps a further 4 dB; the 2-step stage 2 (`fast.stage2_sigmas` [0.909375, 0.421875, 0.0]) reviewed slightly worse than the 3-step one and is an opt-in. Each stage-1 lever alone saved 22-27% of the exact 1513 s; stacked, 20 steps leave larger per-step moves so the cache skips 4 of 20 instead of 11 of 30.",
+            "negative_prompt and `images` as on ltx25-keyframes."
+          ]
+        }
+      }
+    },
+    "ltx25-one-stage-fast": {
+      "title": "LTX-2.5 one-stage (guided, no upsampler), fast tier, on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "The one-stage pipeline with the dev fast tier: 20 guided steps instead of 30, the first-block step cache at 0.10, conv decoder. Same engine as ltx25-one-stage. Measured in perf/ltx25_metal_campaign.md section 31.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "one_stage",
+            "width": 768,
+            "height": 512,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 6144,
+            "decoder": "conv",
+            "served_model_name": "LTX-2.5",
+            "fast": {
+              "steps": 20,
+              "step_cache": 0.1
+            }
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache and the server refuses clips above max_video_tokens (768x512x121: the token count of the dev profile's stage 1, whose four guided passes per step this pipeline runs at the output size). One generation at a time; up to 16 requests queue.",
+            "What is on: `fast.steps` 20, `fast.step_cache` 0.10 (block 0 runs every step; a step whose block-0 residual moved less than 10% accumulated since the last computed step reuses that step's residual: 11 of 30 stage-1 steps at 1536x1024x121, never in stage 2), and `decoder: conv`. The tradeoff, measured: the generated transients come out softer with less denoising work (footsteps about 3 dB below the exact profile's, background and timing unchanged), as the picture's fine detail does; `fast.steps` is the dial back toward exact. Not in the profile: dropping the modality guidance pass (`fast.guidance.modality` 1.0, 3 passes per step, 22% off stage 1), which softens the footsteps a further 4 dB; the 2-step stage 2 (`fast.stage2_sigmas` [0.909375, 0.421875, 0.0]) reviewed slightly worse than the 3-step one and is an opt-in. Each stage-1 lever alone saved 22-27% of the exact 1513 s; stacked, 20 steps leave larger per-step moves so the cache skips 4 of 20 instead of 11 of 30.",
+            "negative_prompt and stills as on ltx25-one-stage."
+          ]
+        }
+      }
     }
   }
 }

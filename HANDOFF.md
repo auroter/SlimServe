@@ -58,7 +58,11 @@ clip length), DFR temporal rounds and the second spatial epilogue, the HQ
 pipeline (res_2s, `ltx25-hq`, section 27), the prompt enhancer (Gemma-4
 E2B-it in MLX, `enhance_prompt` / `--enhance-prompt`, section 28, with the
 image-aware I2V variant through Gemma's vision tower, section 29). The
-component checklist is complete.
+component checklist is complete. 2026-10-08: the user's standard is 100% of
+upstream's capability, optimized the same way as the existing profiles;
+section 30 is the inventory and order, section 31 the first batch (stills at
+any frame on every profile, `ltx25-keyframes`, `ltx25-one-stage`, their
+fast tiers). Work the rest of section 30's list in its order.
 Not done: the opt-in tier, any hand-written Metal GEMM
 (measured headroom on M1-M4 is at most ~10% of a forward; see ledger section
 15), N7 (candidates: na3d / na3d_joint kernels, split-K dispatch, slab conv
@@ -90,7 +94,9 @@ DiT, same kernels:
 | `ltx25-dev` | TI2VidTwoStages | 30 steps x 4 guided passes (CFG 3.0, STG 1.0 on block 28, modality 3.0), half res | same | quality |
 | `ltx25-dfr` | DFRPipeline | distilled + 5 generated keyframe slots | upscale, spatial-detailing epilogue with the official IC-LoRA (strength 0.5), optional temporal rounds (+8 steps each) | production (Lightricks' label) |
 | `ltx25-hq` | TI2VidTwoStagesHQ | 15 res_2s steps x 3 guided passes, distilled LoRA 0.25 | 3 res_2s steps, LoRA 0.5, audio refined | Lightricks' HQ preset |
-| `ltx25-*-fast` | the same three | output-changing settings stacked on (section 24 of the ledger) | | iterate, judged by eye |
+| `ltx25-keyframes` | KeyframeInterpolation | dev stage 1 with every still appended as a keyframe token block | dev stage 2, audio refined | a clip through given stills |
+| `ltx25-one-stage` | TI2VidOneStage | 30 steps x 4 guided passes at the output size (snap 32) | none | prototyping |
+| `ltx25-*-fast` | distilled, dev, dfr, keyframes, one-stage | output-changing settings stacked on (section 24 of the ledger) | | iterate, judged by eye |
 
 Dev is the profile that adheres to the prompt (reviewed 2026-10-06: a lot
 better than distilled and DFR); never pick a mode on speed grounds. DFR must be supported. Default output
