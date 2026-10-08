@@ -140,6 +140,32 @@ def _parser() -> argparse.ArgumentParser:
         "sources, which carry none)",
     )
     video.add_argument(
+        "--input-colorspace",
+        choices=["srgb_gamma", "srgb", "acescg", "acescct"],
+        help="hdr-ic-lora: the source's encoding (srgb_gamma: display mp4; srgb: "
+        "linear mp4 or EXR; acescg / acescct: EXR folders)",
+    )
+    video.add_argument(
+        "--exr-colorspace",
+        choices=["srgb_linear", "acescg", "acescct"],
+        help="hdr-ic-lora: the EXR sidecar's colour space (default acescg)",
+    )
+    video.add_argument(
+        "--text-embeddings",
+        help="hdr-ic-lora: the adapter's scene embedding .safetensors",
+    )
+    video.add_argument(
+        "--high-quality",
+        action="store_true",
+        help="hdr-ic-lora: generate 2N - 1 frames",
+    )
+    video.add_argument(
+        "--no-keyframes", action="store_true", help="hdr-ic-lora: no DFR seam keyframes"
+    )
+    video.add_argument(
+        "--keyframe-strength", type=float, help="hdr-ic-lora: seam keyframe strength"
+    )
+    video.add_argument(
         "--chunked",
         action="store_true",
         help="long clips in overlapping temporal windows (97-frame windows, 25-frame "

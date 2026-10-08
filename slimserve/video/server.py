@@ -69,7 +69,7 @@ KEEP_FINISHED = 32
 # pipelines on the dev transformer (CFG/STG guidance, a negative prompt)
 GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage", "a2vid", "t2a", "alpha")
 # pipelines that edit a source clip: its size, length and rate are the output's
-SOURCE_PIPELINES = ("retake", "dubit")
+SOURCE_PIPELINES = ("retake", "dubit", "hdr_ic_lora")
 
 
 class BadRequest(ValueError):
@@ -133,6 +133,8 @@ class Job:
 def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     """Validate a request against the profile's envelope; returns engine parameters."""
     prompt = body.get("prompt")
+    if cfg["pipeline"] == "hdr_ic_lora":
+        return normalize_hdr_ic_lora_request(body, cfg)
     if not isinstance(prompt, str) or not prompt.strip():
         raise BadRequest("`prompt` is required")
     if cfg["pipeline"] in SOURCE_PIPELINES:
@@ -467,6 +469,102 @@ def normalize_source_request(
     if body.get("loras") is not None:
         params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
     hdr_field(body, params)
+    return params
+
+
+def normalize_hdr_ic_lora_request(
+    body: dict[str, Any], cfg: dict[str, Any]
+) -> dict[str, Any]:
+    """SDR to HDR: `video_path` (an mp4, or an EXR frame folder with `fps`),
+    `input_colorspace` (srgb_gamma default for display video; srgb; acescg /
+    acescct for EXR), `exr_colorspace` (the EXR sidecar's space, default
+    acescg), exactly one adapter in `loras` (the SDR-To-HDR IC-LoRA),
+    `text_embeddings` (its scene embedding file), `high_quality`,
+    `keyframes` (default true), `keyframe_strength`, `conditioning_strength`.
+    No prompt is used (the embeddings stand in for it)."""
+    from slimserve.video.ltx25 import hdr as hdr_mod
+    from slimserve.video.ltx25 import media
+
+    for key in ("size", "width", "height", "seconds", "num_frames", "image", "images"):
+        if key in body:
+            raise BadRequest(
+                f"{key} does not apply to the HDR IC-LoRA (the source sets it)"
+            )
+    if body.get("video_path") is not None:
+        path = Path(str(body["video_path"])).expanduser()
+        if not path.is_file() and not path.is_dir():
+            raise BadRequest(f"video_path {path} is not a file")
+        video_path = str(path)
+    elif body.get("video") is not None:
+        video_path = str(_store_video(body["video"]))
+    else:
+        raise BadRequest("the HDR IC-LoRA needs `video_path` (or `video` as base64)")
+    fps_hint = float(body["fps"]) if body.get("fps") is not None else None
+    try:
+        info = media.probe(video_path, fps_hint)
+    except (RuntimeError, ValueError) as exc:
+        raise BadRequest(f"cannot read the source: {exc}") from exc
+    if (info.frames - 1) % 8:
+        raise BadRequest(
+            f"the source has {info.frames} frames; it must be 8k + 1 "
+            f"(trim it to {(info.frames - 1) // 8 * 8 + 1})"
+        )
+    gen_w, gen_h = -(-info.width // 32) * 32, -(-info.height // 32) * 32
+    frames = 2 * info.frames - 1 if body.get("high_quality") else info.frames
+    tokens = ((frames - 1) // 8 + 1) * (gen_h // 32) * (gen_w // 32)
+    if 2 * tokens > cfg["max_video_tokens"]:  # the reference doubles the sequence
+        raise BadRequest(
+            f"{info.width}x{info.height}x{info.frames} is {tokens} latent tokens plus "
+            f"as many reference tokens; this profile is validated up to "
+            f"{cfg['max_video_tokens']}"
+        )
+    params: dict[str, Any] = {
+        "video_path": video_path,
+        "seed": int(body.get("seed", 42)),
+        "source": {
+            "width": info.width,
+            "height": info.height,
+            "num_frames": info.frames,
+            "fps": info.fps,
+        },
+    }
+    if fps_hint is not None:
+        params["fps"] = fps_hint
+    spaces = ("srgb_gamma", "srgb", "acescg", "acescct")
+    ics = str(body.get("input_colorspace", "srgb_gamma")).lower()
+    if ics not in spaces:
+        raise BadRequest(f"input_colorspace must be one of {', '.join(spaces)}")
+    params["input_colorspace"] = ics
+    ecs = str(body.get("exr_colorspace", "acescg")).lower()
+    if ecs not in hdr_mod.COLOR_SPACES:
+        raise BadRequest(
+            f"exr_colorspace must be one of {', '.join(hdr_mod.COLOR_SPACES)}"
+        )
+    params["exr_colorspace"] = ecs
+    loras = body.get("loras")
+    if not loras or not isinstance(loras, list) or len(loras) != 1:
+        raise BadRequest("the HDR IC-LoRA needs exactly one adapter in `loras`")
+    params["loras"] = [lora_field(loras[0])]
+    emb = body.get("text_embeddings")
+    if not isinstance(emb, str) or not Path(emb).expanduser().is_file():
+        raise BadRequest(
+            "`text_embeddings` must name the adapter's scene embedding .safetensors"
+        )
+    params["text_embeddings"] = str(Path(emb).expanduser())
+    for key in ("high_quality", "keyframes"):
+        if key in body:
+            if not isinstance(body[key], bool):
+                raise BadRequest(f"{key} must be true or false")
+            params[key] = body[key]
+    for key in ("keyframe_strength", "conditioning_strength"):
+        if key in body:
+            params[key] = _strength(body[key], key)
+    decoder = str(body.get("decoder", cfg.get("decoder", "diffusion")))
+    if decoder not in ("diffusion", "conv"):
+        raise BadRequest(
+            "decoder must be 'diffusion' (default, sharper) or 'conv' (faster)"
+        )
+    params["decoder"] = decoder
     return params
 
 
@@ -1040,13 +1138,14 @@ class VideoService:
             root=self.cfg.get("root"),
             variant="dev" if pipeline in GUIDED_PIPELINES else "distilled",
         )
-        engine.load_text()
+        if pipeline != "hdr_ic_lora":  # no prompt: the scene embeddings stand in
+            engine.load_text()
         engine.load_dit()
         engine.load_vae()
         if pipeline not in ("one_stage", "t2a", "alpha", *SOURCE_PIPELINES):
             engine.load_upscaler()
-        if pipeline != "alpha":
-            engine.load_audio(encoder=pipeline in (*SOURCE_PIPELINES, "a2vid"))
+        if pipeline not in ("alpha", "hdr_ic_lora"):
+            engine.load_audio(encoder=pipeline in ("retake", "dubit", "a2vid"))
         engine.load_duration()
         if self.cfg.get("decoder", "diffusion") == "diffusion" and pipeline != "t2a":
             engine.load_diffvae()
@@ -1086,7 +1185,7 @@ class VideoService:
 
     def _generate(self, engine, job: Job) -> None:
         p = dict(job.params)
-        prompt = p.pop("prompt")
+        prompt = p.pop("prompt", None)
         enhance_s = None
         if p.pop("enhance_prompt", False):
             job.progress = {"stage": "enhance"}
@@ -1109,13 +1208,18 @@ class VideoService:
         # the IC-LoRA pipelines manage their adapters per stage themselves
         loras = (
             None
-            if self.cfg["pipeline"] in ("ic_lora", "dubit", "alpha")
+            if self.cfg["pipeline"] in ("ic_lora", "dubit", "alpha", "hdr_ic_lora")
             else p.pop("loras", None)
         )
         if p.get("chunk") is not None:
             p["decoder"] = decoder  # chunked clips decode per window inside
         with engine.user_loras(loras):
-            result = getattr(engine, self.cfg["pipeline"])(prompt, on_step=on_step, **p)
+            if prompt is None:  # the HDR IC-LoRA takes no prompt
+                result = getattr(engine, self.cfg["pipeline"])(on_step=on_step, **p)
+            else:
+                result = getattr(engine, self.cfg["pipeline"])(
+                    prompt, on_step=on_step, **p
+                )
         if result.predicted_seconds is not None:  # auto duration: report the pick
             job.params["num_frames"] = result.num_frames
             job.params["predicted_seconds"] = round(result.predicted_seconds, 2)

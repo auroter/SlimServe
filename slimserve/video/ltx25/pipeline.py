@@ -111,6 +111,9 @@ class Result:
     # the request's HDR colour space: render decodes in fp32 and writes the EXR
     # folder and the HLG master instead of an H.264 mp4
     hdr: str | None = None
+    # HDR IC-LoRA: crop the decoded frames back to (height, width) and keep
+    # every `stride`th frame (the high-quality 2N - 1 generation)
+    crop: tuple[int, int, int] | None = None
 
 
 class Denoiser:
@@ -141,28 +144,36 @@ class Denoiser:
     ):
         b = vx.shape[0]
         t = mx.full((b,), sigma, dtype=G)
+        no_audio = audio is None  # a video-only forward (the HDR IC-LoRA)
         vt = None if video.uniform else (video.denoise_mask * sigma).squeeze(-1)
-        at = None if audio.uniform else (audio.denoise_mask * sigma).squeeze(-1)
+        at = (
+            None
+            if no_audio or audio.uniform
+            else (audio.denoise_mask * sigma).squeeze(-1)
+        )
         v, a = self.dit(
             vx,
-            ax,
+            None if no_audio else ax,
             t,
             self.video_text,
-            self.audio_text,
+            None if no_audio else self.audio_text,
             video.positions,
-            audio.positions,
+            None if no_audio else audio.positions,
             video_keyframes_mask=video.keyframes_mask,
             video_timesteps=vt,
             audio_timesteps=at,
             video_sigma=mx.zeros((b,), dtype=G) if video.frozen else None,
-            audio_sigma=mx.zeros((b,), dtype=G) if audio.frozen else None,
+            audio_sigma=None
+            if no_audio or not audio.frozen
+            else mx.zeros((b,), dtype=G),
             video_attention_mask=video.attention_mask,
-            audio_attention_mask=audio.attention_mask,
+            audio_attention_mask=None if no_audio else audio.attention_mask,
             video_tiles=self.video_tiles,
             step_cache=step_cache,
         )
-        return x0_from_velocity(vx, v, t if vt is None else vt), x0_from_velocity(
-            ax, a, t if at is None else at
+        return (
+            x0_from_velocity(vx, v, t if vt is None else vt),
+            None if a is None else x0_from_velocity(ax, a, t if at is None else at),
         )
 
 
@@ -3516,6 +3527,213 @@ class LTX25Engine:
             predicted_seconds=predicted,
         )
 
+    # ---- SDR to HDR (HDRICLoraPipeline) ------------------------------------------
+    HDR_TILED_ENCODE_AREA = 512 * 768  # upstream TILED_VAE_ENCODE_PIXEL_THRESHOLD
+    HDR_INPUT_COLORSPACES = ("srgb_gamma", "srgb", "acescg", "acescct")
+
+    def hdr_ic_lora(
+        self,
+        video_path: str,
+        loras: list[tuple[str, float]],
+        text_embeddings: str,
+        input_colorspace: str = "srgb_gamma",
+        exr_colorspace: str = "acescg",
+        fps: float | None = None,
+        seed: int = 42,
+        high_quality: bool = False,
+        keyframes: bool = True,
+        keyframe_strength: float = 0.95,
+        conditioning_strength: float = 1.0,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+        fast: Fast | None = None,
+    ) -> Result:
+        """Lightricks' HDRICLoraPipeline: an SDR clip (an mp4, `input_colorspace`
+        srgb_gamma for display video or srgb for linear; or an EXR frame
+        folder in srgb / acescg / acescct, with `fps`) becomes HDR in one
+        video-only distilled stage under the SDR-To-HDR IC-LoRA (`loras`, one
+        file) with the clip's ACEScct codes appended as reference tokens; the
+        text context is the adapter's scene embedding file (`text_embeddings`,
+        its `video_context`; no prompt). By default every DFR seam of the clip
+        (the 24 / 32-frame segments of `dfr_canvas`, inside the clip) gets a
+        generated HDR slot and a 1-frame SDR guide at `keyframe_strength`,
+        and the decode anchors on the slots. `high_quality` doubles every
+        frame (2N - 1) and keeps every other output frame. The frame is
+        reflect-padded up to multiples of 32 and cropped back; the clip's
+        length must be 8k + 1 and the conditioning fps is 30 above 30. Ships
+        as upstream's HDR outputs in `exr_colorspace`, without audio."""
+        from slimserve.video.ltx25 import hdr as hdr_mod
+        from slimserve.video.ltx25 import image as image_mod
+        from slimserve.video.ltx25 import media
+        from slimserve.video.ltx25.lora import Lora
+        from slimserve.video.ltx25.vae import Tiling
+
+        if self.variant != "distilled":
+            raise ValueError("the HDR IC-LoRA runs on the distilled transformer")
+        if len(loras) != 1:
+            raise ValueError(
+                "hdr_ic_lora takes exactly one adapter (the SDR-To-HDR IC-LoRA)"
+            )
+        if input_colorspace not in self.HDR_INPUT_COLORSPACES:
+            raise ValueError(
+                f"input_colorspace must be one of {self.HDR_INPUT_COLORSPACES}"
+            )
+        if exr_colorspace not in hdr_mod.COLOR_SPACES:
+            raise ValueError(f"exr_colorspace must be one of {hdr_mod.COLOR_SPACES}")
+        fast = fast or Fast()
+        key = str(Path(loras[0][0]).expanduser().resolve())
+        lora = self.user_lora_cache.get(key)
+        if lora is None:
+            lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+        tm = Timings()
+        with tm.span("text"):
+            video_text = self._load_video_context(text_embeddings)
+        with tm.span("load"):
+            dit = self.load_dit()
+            vae = self.load_vae()
+        is_exr = hdr_mod.is_exr_dir(video_path)
+        if is_exr and input_colorspace == "srgb_gamma":
+            raise ValueError(
+                "an EXR folder is linear: input_colorspace srgb, acescg or acescct"
+            )
+        if not is_exr and input_colorspace in ("acescg", "acescct"):
+            raise ValueError("acescg / acescct inputs are EXR frame folders")
+        info = media.probe(video_path, fps)
+        if (info.frames - 1) % 8:
+            raise ValueError(
+                f"the source has {info.frames} frames; it must be 8k + 1 "
+                f"(trim it to {(info.frames - 1) // 8 * 8 + 1})"
+            )
+        num_frames, src_fps = info.frames, info.fps
+        gen_w, gen_h = -(-info.width // 32) * 32, -(-info.height // 32) * 32
+        if gen_w < 32 or gen_h < 32:
+            raise ValueError("the source is too small")
+        gen_frames = 2 * num_frames - 1 if high_quality else num_frames
+        cond_fps = 30.0 if src_fps > 30.0 else src_fps
+        generated_kf: list[int] = []
+        guides_kf: list[int] = []
+        if keyframes and num_frames >= 2:
+            _, _, seams = sampling.dfr_canvas(num_frames)
+            seams = [p for p in seams if p < num_frames]
+            if high_quality:
+                seams = [2 * p for p in seams]
+            generated_kf, guides_kf = list(seams), list(seams)
+        with tm.span("encode_video"):
+            frames = media.read_frames(video_path, info, 0.0, num_frames / src_fps)[
+                :num_frames
+            ]
+            if is_exr:
+                px = np.stack(
+                    [image_mod.resize_and_reflect_pad(f, gen_h, gen_w) for f in frames]
+                )
+                codes = hdr_mod.to_working_space(px, input_colorspace)
+            else:  # upstream load_video_as_hdr_conditioning: codes first, then resize
+                codes = hdr_mod.srgb_video_to_working_space(
+                    frames.astype(np.float32) / 255.0, input_colorspace == "srgb_gamma"
+                )
+                codes = np.stack(
+                    [image_mod.resize_and_reflect_pad(c, gen_h, gen_w) for c in codes]
+                )
+            if high_quality:
+                codes = np.repeat(codes, 2, axis=0)[:gen_frames]
+            pixels = mx.array((codes * 2.0 - 1.0).transpose(3, 0, 1, 2))[None]
+            if gen_h * gen_w > self.HDR_TILED_ENCODE_AREA:
+                spatial, temporal = self.SOURCE_ENCODE_TILING
+                source = vae.encode_tiled(
+                    pixels, Tiling(spatial=spatial, temporal=temporal)
+                )
+            else:
+                source = vae.encode(pixels)
+            mx.eval(source)
+            guides = []
+            for g in guides_kf:
+                plane = vae.encode(pixels[:, :, g : g + 1])
+                mx.eval(plane)
+                guides.append((plane, g))
+            del pixels
+        _, _, f, h, w = source.shape
+        stepper = self._stepper(tm, on_step)
+        sigmas = fast.sigmas1(sampling.DISTILLED_SIGMAS)
+        with tm.span("stage1"):
+            video = sampling.noised_state(
+                (1, f * h * w, 128),
+                sampling.video_positions(f, h, w, cond_fps),
+                seed,
+                sigma=sigmas[0],
+                initial=sampling.patchify(source),
+                tokens_per_frame=h * w,
+                bf16_noise=self.bf16_noise,
+            )
+            video = sampling.append_reference(
+                video,
+                sampling.patchify(source),
+                sampling.video_positions(f, h, w, cond_fps),
+                1,
+                conditioning_strength,
+            )
+            for i, (plane, g) in enumerate(guides):
+                video = sampling.append_anchor_keyframes(
+                    video,
+                    plane,
+                    [g],
+                    h,
+                    w,
+                    cond_fps,
+                    sigmas[0],
+                    seed + i,
+                    strength=keyframe_strength,
+                    seed_offset=sampling.KEYFRAME_NOISE_SEED_OFFSET,
+                )
+            slots = None
+            if generated_kf:
+                video, slots = sampling.append_slots(
+                    video, generated_kf, h, w, cond_fps, None, sigmas[0], seed
+                )
+            mx.eval(video.latent, video.clean, video.positions)
+            lora.attach(dit, loras[0][1])
+            try:
+                v = sampling.euler_loop_video(
+                    Denoiser(dit, video_text, None),
+                    video,
+                    sigmas,
+                    on_step=stepper("stage1"),
+                    step_cache=fast.cache(),
+                )
+            finally:
+                lora.detach(dit)
+        latent = sampling.unpatchify(v[:, : f * h * w], (f, h, w))
+        keyframe_planes = self._decode_keyframes(
+            v, slots, generated_kf, h, w, gen_frames, True
+        )
+        mx.eval(latent)
+        return Result(
+            latent,
+            None,
+            num_frames,
+            info.height,
+            info.width,
+            src_fps,
+            tm,
+            keyframes=keyframe_planes,
+            hdr=exr_colorspace,
+            crop=(info.height, info.width, 2 if high_quality else 1),
+        )
+
+    @staticmethod
+    def _load_video_context(path: str) -> mx.array:
+        """Upstream _load_video_context: `video_context` (or the trainer's
+        `video_prompt_embeds`) from a .safetensors (the adapter's scene
+        embedding file), fp32."""
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"text embeddings not found: {p}")
+        tensors = mx.load(str(p))
+        for name in ("video_context", "video_prompt_embeds"):
+            if name in tensors:
+                ctx = tensors[name].astype(G)
+                return ctx if ctx.ndim == 3 else ctx[None]
+        raise KeyError(f"video_context not found in {p} (keys: {sorted(tensors)})")
+
     # ---- hq (res_2s) --------------------------------------------------------
     def hq(
         self,
@@ -3794,6 +4012,9 @@ class LTX25Engine:
             else:
                 waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
         with tm.span("mux"):
+            if result.crop is not None:
+                ch, cw, stride = result.crop
+                frames = frames[::stride, :ch, :cw]
             frames = frames[: result.num_frames]
             if hdr is not None:
                 hdr_mod.write_hdr_outputs(

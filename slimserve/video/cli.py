@@ -25,7 +25,10 @@ def run(plan: Plan, args: Any) -> int:
             f"{plan.profile_id} generates video; use --prompt for one clip or serve it"
         )
         return 2
-    if args.prompt:
+    one_clip = args.prompt or (
+        cfg["pipeline"] == "hdr_ic_lora" and getattr(args, "video_path", None)
+    )
+    if one_clip:
         return _one_clip(cfg, args)
     from slimserve.video import server
 
@@ -140,7 +143,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     from slimserve.video import server
     from slimserve.video.ltx25.pipeline import LTX25Engine
 
-    body = {"prompt": args.prompt}
+    body = {"prompt": args.prompt} if cfg["pipeline"] != "hdr_ic_lora" else {}
     if getattr(args, "frame_rate", None) is not None:
         body["fps"] = args.frame_rate
     for key in (
@@ -165,6 +168,10 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         "chunk_carry_frames",
         "chunk_blend_frames",
         "hdr",
+        "input_colorspace",
+        "exr_colorspace",
+        "text_embeddings",
+        "keyframe_strength",
     ):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
@@ -177,6 +184,10 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     ):
         if getattr(args, key, False):
             body[key] = True
+    if getattr(args, "high_quality", False):
+        body["high_quality"] = True
+    if getattr(args, "no_keyframes", False):
+        body["keyframes"] = False
     if getattr(args, "num_generated_keyframes", None):
         body["generated_keyframes"] = args.num_generated_keyframes
     if getattr(args, "video_conditioning", None):
@@ -216,7 +227,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         variant="dev" if cfg["pipeline"] in server.GUIDED_PIPELINES else "distilled",
     )
     source = params.pop("source", None)
-    prompt = params.pop("prompt")
+    prompt = params.pop("prompt", None)
     extra = ""
     if params.pop("enhance_prompt", False):
         t0 = time.perf_counter()
@@ -237,16 +248,16 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         params["fast"] = fast
     loras = (
         None
-        if cfg["pipeline"] in ("ic_lora", "dubit", "alpha")
+        if cfg["pipeline"] in ("ic_lora", "dubit", "alpha", "hdr_ic_lora")
         else params.pop("loras", None)
     )
     with engine.user_loras(loras):
-        result = getattr(engine, cfg["pipeline"])(
-            prompt,
-            keep_text=False,
-            on_step=lambda stage, i, s: term.note(f"{stage} step {i + 1}"),
-            **params,
-        )
+        call = getattr(engine, cfg["pipeline"])
+        note = lambda stage, i, s: term.note(f"{stage} step {i + 1}")  # noqa: E731
+        if prompt is None:  # the HDR IC-LoRA takes no prompt
+            result = call(on_step=note, **params)
+        else:
+            result = call(prompt, keep_text=False, on_step=note, **params)
     out = engine.render(
         result, out, seed=params["seed"], decoder=decoder, hdr=params.get("hdr")
     )

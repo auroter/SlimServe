@@ -115,3 +115,86 @@ def test_hdr_requests(tmp_path):
     )
     assert params["source"] == {"width": 96, "height": 64, "num_frames": 9, "fps": 24.0}
     assert params["fps"] == 24.0 and params["hdr"] == "acescg"
+
+
+def test_hdr_ic_lora_requests(tmp_path):
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg not on PATH")
+    clip = tmp_path / "c.mp4"
+    src = "testsrc=size=100x60:rate=24:duration=0.7"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            src,
+            "-frames:v",
+            "17",
+        ]
+        + ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)],
+        check=True,
+    )
+    lora = tmp_path / "hdr.safetensors"
+    lora.write_bytes(b"x")
+    emb = tmp_path / "scene.safetensors"
+    emb.write_bytes(b"x")
+    cfg = {
+        "pipeline": "hdr_ic_lora",
+        "width": 1536,
+        "height": 1024,
+        "num_frames": 121,
+        "fps": 24.0,
+        "max_video_tokens": 24576,
+    }
+    params = server.normalize_request(
+        {
+            "video_path": str(clip),
+            "loras": [{"path": str(lora)}],
+            "text_embeddings": str(emb),
+            "high_quality": True,
+        },
+        cfg,
+    )
+    assert "prompt" not in params and params["input_colorspace"] == "srgb_gamma"
+    assert params["exr_colorspace"] == "acescg" and params["high_quality"] is True
+    assert params["source"] == {
+        "width": 100,
+        "height": 60,
+        "num_frames": 17,
+        "fps": 24.0,
+    }
+    with pytest.raises(server.BadRequest, match="exactly one adapter"):
+        server.normalize_request(
+            {"video_path": str(clip), "text_embeddings": str(emb)}, cfg
+        )
+    with pytest.raises(server.BadRequest, match="text_embeddings"):
+        server.normalize_request(
+            {"video_path": str(clip), "loras": [{"path": str(lora)}]}, cfg
+        )
+    with pytest.raises(server.BadRequest, match="input_colorspace"):
+        server.normalize_request(
+            {
+                "video_path": str(clip),
+                "loras": [{"path": str(lora)}],
+                "text_embeddings": str(emb),
+                "input_colorspace": "rec2020",
+            },
+            cfg,
+        )
+    with pytest.raises(server.BadRequest, match="reference tokens"):
+        server.normalize_request(
+            {
+                "video_path": str(clip),
+                "loras": [{"path": str(lora)}],
+                "text_embeddings": str(emb),
+            },
+            {**cfg, "max_video_tokens": 10},
+        )

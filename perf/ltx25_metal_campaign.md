@@ -1816,3 +1816,29 @@ The kept frames come back through the SDR model's VAE at 15% rel-L2 in
 linear (the log space amplifies code error at highlights: a 2.0 input
 reaches 29 at a pixel) - the SDR-To-HDR IC-LoRA pipeline (next) is what
 makes HDR content.
+
+## 41. The HDR IC-LoRA pipeline (2026-10-08)
+
+`ltx25-hdr-ic-lora` = HDRICLoraPipeline (`pipeline.hdr_ic_lora`): no text
+encoder (the adapter's scene embedding file's `video_context` is the
+context, `_load_video_context`), the source (an mp4 through the sRGB EOTF
+into ACEScct codes before the resize, or an EXR folder resized linear then
+compressed; reflect-padded up to multiples of 32, `align_resolution`'s
+REFLECT_PAD rounding, cropped back after the decode) encoded (tiled above
+512x768 as upstream's threshold) and appended as reference tokens at
+downscale 1, the initial latent the encoded source fully noised (noise
+scale 1.0 as upstream), every DFR seam inside the clip (`dfr_canvas`,
+doubled in high quality) a generated slot plus a 1-frame SDR guide at 0.95
+(`keyframes` false: plain), high quality 2N - 1 frames then every other,
+conditioning fps 30 above 30, the 8 distilled sigmas, plain Euler, the
+video half only (`Denoiser` with no audio), the keyframe-aware decode in
+fp32, `Result.crop` for the pad-back and the stride, HDR outputs in
+`exr_colorspace`. Upstream runs it FP8-cast; ours the fp16 policy.
+Mechanics smoke (`n12/hdr_iclora.*`: the detailing adapter and a
+text-encoder embedding standing in for the gated SDR-To-HDR pair): the
+33-frame fox clip, 76.8 s (stage 61.5 s: 8 steps at 1,920 + 1,920 + the
+seam slot and guide tokens), 33 EXR frames (ACEScg) and the HLG master.
+The real conversion waits for the adapter.
+
+That closes section 30's pipeline list: every upstream pipeline is ported.
+Still open there: chunked long clips on IC-LoRA and Dub-It.
