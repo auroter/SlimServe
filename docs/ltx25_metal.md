@@ -19,6 +19,7 @@ H.264 + AAC mp4. One profile per upstream pipeline:
 | `ltx25-dubit` | DubItPipeline: re-voice a clip under the Dub-It IC-LoRA, the clip's video and audio as reference tokens | dubbing |
 | `ltx25-t2a` | T2AOneStagePipeline: audio only, the dev transformer's audio half, a WAV | text-to-audio |
 | `ltx25-alpha` | AlphaGenPipeline: a video-only stage under the Alpha-Gen IC-LoRA, the clip to matte as reference | alpha mattes |
+| `ltx25-hdr-ic-lora` | HDRICLoraPipeline: SDR video to HDR under the SDR-To-HDR IC-LoRA, EXR + HLG out | SDR to HDR |
 
 Distilled versus dev is a quality-versus-time choice for the person asking,
 not something the server picks.
@@ -39,6 +40,7 @@ slimserve ltx25-a2vid -p "..." --audio-path speech.m4a --size 768x512          #
 slimserve ltx25-dubit -p "..." --reference-video talk.mp4 --lora dubit.safetensors   # dubbing
 slimserve ltx25-t2a -p "rain on a tin roof" --seconds 5 --output rain.wav   # text-to-audio
 slimserve ltx25-alpha -p "..." --video-conditioning clip.mp4 --lora alpha-gen.safetensors   # alpha matte
+slimserve ltx25-hdr-ic-lora --video-path clip.mp4 --lora sdr-to-hdr.safetensors --text-embeddings scene-emb.safetensors   # SDR to HDR
 slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
 slimserve ltx25-hq -p "..."                                               # Lightricks' HQ preset (res_2s)
 slimserve ltx25-dev -p "a cat watches rain" --enhance-prompt                # Gemma rewrites the prompt first
@@ -175,6 +177,18 @@ parameters, diffuse white mapped to signal 0.75 with highlights rolled
 toward 1). The colour math matches upstream to float precision and the HLG
 10-bit planes bit for bit. Real HDR output needs the SDR-To-HDR IC-LoRA;
 the plain model reproduces SDR content in the log space.
+
+`ltx25-hdr-ic-lora` (upstream's HDRICLoraPipeline) takes no prompt:
+`video_path` (an mp4, `input_colorspace` srgb_gamma for display video or
+srgb for linear; or an EXR folder in srgb / acescg / acescct with `fps`),
+the SDR-To-HDR adapter in `loras` and its scene embedding file in
+`text_embeddings` (both in Lightricks/LTX-2.5-22b-IC-LoRA-SDR-To-HDR,
+gated), `exr_colorspace` (default acescg), `high_quality`, `keyframes`
+(default true: a generated slot and a 1-frame SDR guide at
+`keyframe_strength` 0.95 on every DFR seam), `conditioning_strength`. One
+video-only distilled stage with the clip's ACEScct codes as reference
+tokens; the frame is reflect-padded to multiples of 32 and cropped back;
+the outputs are the HDR ones above.
 
 `ltx25-dfr` takes two more options (upstream's `--temporal-upscalings` and
 `--spatial-upscalings`; CLI flags of the same names): `temporal_upscalings`
@@ -453,10 +467,9 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 
 ## Not implemented yet
 
-Of upstream's pipelines and options (ledger section 30): HDRICLoraPipeline
-(SDR video to HDR with the SDR-To-HDR IC-LoRA; the native `--hdr` path is
-in); chunked long clips on the IC-LoRA and Dub-It pipelines (distilled, dev
-and a2vid have them). The I2V
+Of upstream's pipelines and options (ledger section 30): chunked long clips
+on the IC-LoRA and Dub-It pipelines (distilled, dev and a2vid have them).
+The I2V
 first-frame path is wired but its end-to-end output has not been compared
 against upstream on this machine.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
