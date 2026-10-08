@@ -1412,3 +1412,50 @@ geometry, the patch grid against transformers' values, patch order, the
 placeholder expansion, the 2-D RoPE split and the uint8 resize arithmetic.
 The enhancer's resident set grows by the tower: 4.9 GiB while loaded (fp32
 tower 0.7 GiB), still per request.
+
+## 30. The remaining capability surface (2026-10-08)
+
+The user's standard is 100% of upstream's capability, and "supporting means
+supporting and optimizing": every pipeline below gets parity against
+Lightricks' source, then the fast tier (fp16 operands, fused glue, step cache,
+tiled attention, conv/diffusion decoder) applied and measured. Inventory from
+`ltx_pipelines/utils/args.py` and the twelve runnable pipelines, against what
+`server.py` / `cli.py` accept today (prompt, size, seconds/num_frames, fps,
+seed, negative_prompt, decoder, temporal/spatial_upscalings, enhance_prompt,
+one first-frame image + strength).
+
+**Request options missing on the existing profiles**
+- `--image PATH FRAME_IDX STRENGTH [CRF]`, repeatable: several stills at any
+  pixel-frame index (`combined_image_conditionings`: frame 0 replaces latent
+  frame 0, any other index appends clean keyframe tokens,
+  `VideoConditionByKeyframeIndex`); per-image CRF (0 = no round trip).
+- `--num-generated-keyframes` / `--decode-with-keyframes` on distilled (and
+  a2vid): DFR-style generated slots on the plain distilled flow.
+- `--lora PATH [STRENGTH]`, repeatable: user LoRAs on the transformer.
+- guidance knobs per request (dev/hq/one-stage/keyframes/a2vid/retake): CFG,
+  STG scale and blocks, rescale, modality (a2v / v2a) scale, skip_step, for
+  video and audio; `--num-inference-steps`; hq's two distilled-LoRA strengths.
+- `--chunked` / `--chunk-pixel-frames` / `--chunk-carry-frames` /
+  `--chunk-blend-frames`: long clips in overlapping temporal windows
+  (distilled, dev, ic_lora, a2vid, dubit; `chunks/`).
+- `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}`: EXR stills / frame folders in, EXR +
+  BT.2020/HLG out (`ltx_core/hdr.py`, `color/`, `media_io`).
+- `--text-embeddings` (hdr_ic_lora only: precomputed video_context).
+
+**Pipelines not ported** (HQ = `pipeline.hq` is done, section 27)
+| upstream | input -> output | shape |
+| --- | --- | --- |
+| TI2VidOneStagePipeline | text/stills -> video, one guided stage, no upsampler | dev stage 1 at full size |
+| KeyframeInterpolationPipeline | stills at frame indices -> video between them | dev flow; every still appended as keyframe tokens (`image_conditionings_by_adding_guiding_latent`); audio re-noised in stage 2 (not frozen) |
+| ICLoraPipeline | reference video (+stills) -> video, IC-LoRA (depth/pose/canny...) | distilled flow; reference tokens appended (`VideoConditionByReferenceLatent`), `--tile`, `--skip-stage-2`, `--stage-2-ic-lora`, `--conditioning-attention-mask`, chunked |
+| A2VidPipelineTwoStage | audio file (+stills) -> video synced to it | dev flow; audio VAE **encoder**; `AudioConditionByLatentIndex`; `--audio-start-time`, `--audio-max-duration`; generated keyframes; chunked |
+| RetakePipeline | video + [start, end) s -> that region regenerated | one stage; video + audio VAE encoders; `TemporalRegionMask`; audio kept |
+| HDRICLoraPipeline | SDR video -> HDR (ACEScct; HLG master + EXR) | one stage, HDR IC-LoRA, seam keyframes, `--high-quality` |
+| DubItPipeline | video + reference audio -> dubbed video | reference video + `AudioConditionByReferenceLatent`; chunked |
+| T2AOneStagePipeline | text -> audio only | audio-only guided stage |
+| alpha_gen | video -> alpha matte | one stage |
+
+Order: multiple stills + keyframe interpolation + one-stage (same mechanism)
+-> guidance knobs + user LoRAs -> retake -> IC-LoRA -> A2Vid -> DubIt -> T2A
+-> generated keyframes on distilled -> chunked long clips -> HDR / HDR IC-LoRA
+-> alpha. Each lands with its own ledger section.
