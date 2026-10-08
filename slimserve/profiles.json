@@ -4368,6 +4368,33 @@
           ]
         }
       }
+    },
+    "ltx25-t2a": {
+      "title": "LTX-2.5 text-to-audio (one stage) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Audio only with Lightricks' T2AOneStagePipeline: 30 guided steps (CFG 7.0, STG 1.0 on block 28, rescale 0.7) of the dev transformer's audio half, no video modality, the length from `seconds` or the duration head; a 48 kHz stereo WAV through the audio VAE, vocoder and bandwidth extension. Requests take prompt, seconds / num_frames, seed, negative_prompt, steps and guidance.audio; the CLI the same flags (--output gets a .wav).",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "t2a",
+            "width": 0,
+            "height": 0,
+            "num_frames": 481,
+            "fps": 24.0,
+            "max_video_tokens": 0,
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "The transformer runs with video=None as upstream: each block's video half, both cross-attentions and the video output are skipped; the audio half (self-attention, text cross-attention, feed-forward) and the audio guider's passes run as one batch. Up to 481 frames of audio (20 s at 24 fps, the duration head's maximum); resident set the text encoder, the transformer and the audio decoder. Ledger section 36.",
+            "negative_prompt, steps and guidance.audio as on the guided profiles; the modality (v2a) term is neutral since there is no video."
+          ]
+        }
+      }
     }
   }
 }

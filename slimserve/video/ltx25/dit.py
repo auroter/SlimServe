@@ -445,6 +445,7 @@ class LTX25DiT:
         # update or feed-forward for it, while the other modality still reads
         # it through the cross-attention.
         run_v, run_a = s["run_video"], s["run_audio"]
+        has_v = s["has_video"]
 
         def skip(kind: str, like_ndim: int) -> mx.array | None:
             m = stg.get((kind, i)) if stg else None
@@ -512,7 +513,7 @@ class LTX25DiT:
             w[p + ".scale_shift_table_a2v_ca_audio"],
         )
         cvm, cam = s["av_video_mod"], s["av_audio_mod"]
-        vn, an = self._norm(v), self._norm(a)
+        vn, an = (None if v is None else self._norm(v)), self._norm(a)
         v_new = v
         if run_v:
             vq = _modulate(vn, cvm.get(0, cvt[0]), cvm.get(1, cvt[1]))
@@ -528,7 +529,7 @@ class LTX25DiT:
             sk = skip("a2v", 3)
             v_new = v + (y if sk is None else y * sk)
 
-        if run_a:
+        if run_a and has_v:
             aq = _modulate(an, cam.get(2, cat[2]), cam.get(3, cat[3]))
             vkv = _modulate(vn, cvm.get(2, cvt[2]), cvm.get(3, cvt[3]))
             y = self._attn(
@@ -555,12 +556,12 @@ class LTX25DiT:
     # ---- model ------------------------------------------------------------
     def __call__(
         self,
-        video_latent: mx.array,
+        video_latent: mx.array | None,
         audio_latent: mx.array,
         timestep: mx.array,
         video_text: mx.array | None,
         audio_text: mx.array | None,
-        video_positions: mx.array,
+        video_positions: mx.array | None,
         audio_positions: mx.array,
         video_keyframes_mask: mx.array | None = None,
         video_timesteps: mx.array | None = None,
@@ -596,6 +597,8 @@ class LTX25DiT:
         """
         if not (run_video or run_audio):
             raise ValueError("at least one modality must run")
+        if video_latent is None and (share_from is not None or video_tiles is not None):
+            raise ValueError("an audio-only forward takes no STG fork or video tiles")
         inputs = dict(
             video_latent=video_latent,
             audio_latent=audio_latent,
@@ -623,7 +626,7 @@ class LTX25DiT:
             share_from = None
         if share_from is not None:
             fork_block, src, dst = share_from
-            b = video_latent.shape[0]
+            b = audio_latent.shape[0]
             keep = [r for r in range(b) if r != dst]
             v, a, state, _, _ = self._prepare(**_select_rows(inputs, keep, b))
             src_pos = keep.index(src)
@@ -639,7 +642,7 @@ class LTX25DiT:
         v_in = v
         v, a = self._block(0, v, a, state)
         v1 = a1 = None
-        if step_cache is not None and not run_video:
+        if step_cache is not None and (not run_video or v is None):
             step_cache = None  # the cache keys on the video residual
         if step_cache is not None:
             v1, a1 = expand(v), expand(a)
@@ -668,7 +671,7 @@ class LTX25DiT:
         w = self.w
         return (
             self._out(v, video_emb, w["scale_shift_table"], "proj_out")
-            if run_video
+            if run_video and v is not None
             else None,
             self._out(a, audio_emb, w["audio_scale_shift_table"], "audio_proj_out")
             if run_audio
@@ -703,11 +706,15 @@ class LTX25DiT:
         vd, ad = cfg.video_dim, cfg.audio_dim
         timestep = timestep.astype(G)
 
-        v = self.lin("patchify_proj", video_latent.astype(F)).astype(G)
-        if video_keyframes_mask is not None:
-            v = v + (video_keyframes_mask > 0).astype(G) * w[
-                "keyframes_abs_pos_embedding"
-            ].astype(G)
+        no_video = video_latent is None  # an audio-only forward (T2A)
+        if no_video:
+            v = None
+        else:
+            v = self.lin("patchify_proj", video_latent.astype(F)).astype(G)
+            if video_keyframes_mask is not None:
+                v = v + (video_keyframes_mask > 0).astype(G) * w[
+                    "keyframes_abs_pos_embedding"
+                ].astype(G)
         a = self.lin("audio_patchify_proj", audio_latent.astype(F)).astype(G)
 
         ts = cfg.timestep_scale
@@ -763,11 +770,13 @@ class LTX25DiT:
             "v2a_gate_mod": v2a_gate_mod,
             "video_text": None if video_text is None else video_text.astype(G),
             "audio_text": None if audio_text is None else audio_text.astype(G),
-            "video_rope": rope(video_positions, vd, heads, cfg.max_pos),
+            "video_rope": None
+            if no_video
+            else rope(video_positions, vd, heads, cfg.max_pos),
             "audio_rope": rope(audio_positions, ad, cfg.audio_heads, cfg.audio_max_pos),
-            "video_cross_rope": rope(
-                video_positions[:, :, 0:1], cross_inner, heads, cross_max
-            ),
+            "video_cross_rope": None
+            if no_video
+            else rope(video_positions[:, :, 0:1], cross_inner, heads, cross_max),
             "audio_cross_rope": rope(
                 audio_positions[:, :, 0:1], cross_inner, heads, cross_max
             ),
@@ -777,8 +786,9 @@ class LTX25DiT:
             "stg": stg,
             "text_rows": text_rows,
             "video_tiles": video_tiles,
-            "run_video": run_video,
+            "run_video": run_video and not no_video,
             "run_audio": run_audio,
+            "has_video": not no_video,
             # one batch row standing for each distinct text row, for the prompt AdaLN
             "text_reps": None
             if text_rows is None
@@ -790,9 +800,8 @@ class LTX25DiT:
             ),
         }
         mx.eval(
-            state["video_rope"],
+            *(() if no_video else (state["video_rope"], state["video_cross_rope"])),
             state["audio_rope"],
-            state["video_cross_rope"],
             state["audio_cross_rope"],
         )
         return v, a, state, video_emb, audio_emb

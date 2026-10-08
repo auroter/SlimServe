@@ -67,7 +67,7 @@ from typing import Any
 MAX_QUEUED = 16
 KEEP_FINISHED = 32
 # pipelines on the dev transformer (CFG/STG guidance, a negative prompt)
-GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage", "a2vid")
+GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage", "a2vid", "t2a")
 # pipelines that edit a source clip: its size, length and rate are the output's
 SOURCE_PIPELINES = ("retake", "dubit")
 
@@ -137,6 +137,8 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         raise BadRequest("`prompt` is required")
     if cfg["pipeline"] in SOURCE_PIPELINES:
         return normalize_source_request(body, cfg, prompt)
+    if cfg["pipeline"] == "t2a":
+        return normalize_t2a_request(body, cfg, prompt)
     width, height = cfg["width"], cfg["height"]
     if size := body.get("size"):
         try:
@@ -286,6 +288,58 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
                 "the keyframe interpolation pipeline needs `images` "
                 '([{"image": ..., "frame": N, "strength": 1.0}, ...])'
             )
+    return params
+
+
+def normalize_t2a_request(
+    body: dict[str, Any], cfg: dict[str, Any], prompt: str
+) -> dict[str, Any]:
+    """Text to audio: `seconds` / `num_frames` (at `fps`; the duration head
+    decides otherwise), `seed`, `negative_prompt`, `steps`, `guidance.audio`;
+    no size, stills or decoder. The job's content is a WAV."""
+    for key in ("size", "width", "height", "image", "images", "decoder"):
+        if key in body:
+            raise BadRequest(f"{key} does not apply to the t2a pipeline (audio only)")
+    fps = float(body.get("fps", cfg["fps"]))
+    if not 1.0 <= fps <= 60.0:
+        raise BadRequest("fps must be between 1 and 60")
+    if "num_frames" in body:
+        frames = int(body["num_frames"])
+    elif "seconds" in body:
+        frames = int(round(float(body["seconds"]) * fps / 8)) * 8 + 1
+    else:
+        frames = None
+    max_frames = cfg["num_frames"]
+    if frames is not None and (frames < 9 or (frames - 1) % 8 or frames > max_frames):
+        raise BadRequest(f"num_frames must be 8k + 1 up to {max_frames}")
+    params: dict[str, Any] = {
+        "prompt": prompt,
+        "num_frames": frames,
+        "fps": fps,
+        "seed": int(body.get("seed", 42)),
+    }
+    if frames is None:
+        params["max_num_frames"] = max_frames
+    if "negative_prompt" in body:
+        params["negative_prompt"] = str(body["negative_prompt"])
+    if "steps" in body:
+        steps = body["steps"]
+        if (
+            not isinstance(steps, int)
+            or isinstance(steps, bool)
+            or not 1 <= steps <= 200
+        ):
+            raise BadRequest("steps must be an integer in [1, 200]")
+        params["steps"] = steps
+    if "guidance" in body:
+        fields = guidance_fields(body["guidance"], cfg["pipeline"])
+        if "video_guidance" in fields:
+            raise BadRequest("t2a has no video modality: give guidance.audio only")
+        params.update(fields)
+    if body.get("enhance_prompt") is True:
+        params["enhance_prompt"] = True
+    if body.get("loras") is not None:
+        params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
     return params
 
 
@@ -829,11 +883,11 @@ class VideoService:
         engine.load_text()
         engine.load_dit()
         engine.load_vae()
-        if pipeline not in ("one_stage", *SOURCE_PIPELINES):
+        if pipeline not in ("one_stage", "t2a", *SOURCE_PIPELINES):
             engine.load_upscaler()
         engine.load_audio(encoder=pipeline in (*SOURCE_PIPELINES, "a2vid"))
         engine.load_duration()
-        if self.cfg.get("decoder", "diffusion") == "diffusion":
+        if self.cfg.get("decoder", "diffusion") == "diffusion" and pipeline != "t2a":
             engine.load_diffvae()
         if pipeline in ("dev", "hq", "keyframes", "a2vid"):
             engine.load_distilled_lora()
@@ -897,7 +951,8 @@ class VideoService:
             job.params["num_frames"] = result.num_frames
             job.params["predicted_seconds"] = round(result.predicted_seconds, 2)
         job.progress = {"stage": "decode"}
-        path = self.output_dir / f"{job.id}.mp4"
+        suffix = ".wav" if getattr(result, "video_latent", 0) is None else ".mp4"
+        path = self.output_dir / f"{job.id}{suffix}"
         engine.render(result, path, seed=p["seed"], decoder=decoder)
         job.path = path
         tm = result.timings
@@ -1029,7 +1084,8 @@ def make_handler(service: VideoService):
                         return self._error(409, f"video is {job.status}")
                     data = job.path.read_bytes()
                     self.send_response(200)
-                    self.send_header("Content-Type", "video/mp4")
+                    kind = "audio/wav" if job.path.suffix == ".wav" else "video/mp4"
+                    self.send_header("Content-Type", kind)
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
                     self.wfile.write(data)

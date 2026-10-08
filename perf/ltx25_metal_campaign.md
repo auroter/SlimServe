@@ -1698,3 +1698,19 @@ conv 471 s, + tiles **363 s** (stage 239 s; exact 745 s, 2.05x).
 Request parsing for both in `test_video_retake.py`; the keyframe
 interpolation, one-stage, retake, IC-LoRA, A2Vid and Dub-It profiles all
 have fast tiers now (the dev or distilled block they stack on).
+
+## 36. Text to audio (2026-10-08)
+
+`ltx25-t2a` = T2AOneStagePipeline (`pipeline.t2a`): the dev transformer with
+`video=None` (`LTX25DiT` now takes no video: the block's video half, both
+cross-attentions and the video output are skipped, the audio half runs;
+`GuidedDenoiser` batches the audio guider's passes alone;
+`sampling.euler_loop_audio`), the 4096-anchor schedule, the length from
+`seconds` or the duration head on the audio connector's tokens; the job
+ships a WAV (upstream encode_audio: PCM 16-bit at the vocoder's rate).
+
+Parity (`n8_dit_parity.py t2a-ref / t2a-ours`, upstream LTXModel on the CPU
+with video None, 18 audio tokens): rel-L2 **1.6e-3**, the plain forward's
+fp16 error. Smoke (`n12/t2a.wav`): "gentle rain on a tin roof with distant
+thunder", 3 s: 21.7 s (stage 1 8.0 s for 30 steps x 3 passes on 73 tokens),
+a 3.01 s 48 kHz stereo WAV, broadband (centroid 6 kHz).

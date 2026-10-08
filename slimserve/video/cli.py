@@ -180,7 +180,8 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
     except ValueError as error:
         term.fail(str(error))
         return 2
-    out = Path(args.output or f"{cfg['pipeline']}-{params['seed']}.mp4").expanduser()
+    ext = ".wav" if cfg["pipeline"] == "t2a" else ".mp4"
+    out = Path(args.output or f"{cfg['pipeline']}-{params['seed']}{ext}").expanduser()
     started = time.perf_counter()
     engine = LTX25Engine(
         root=cfg["root"],
@@ -195,7 +196,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         extra = f"enhance {time.perf_counter() - t0:.1f}s, "
         term.note(f"enhanced prompt: {prompt}")
         engine.unload_enhancer()
-    decoder = params.pop("decoder")
+    decoder = params.pop("decoder", None)
     if source:
         term.note(
             f"source {source['width']}x{source['height']}x{source['num_frames']} "
@@ -214,7 +215,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
             on_step=lambda stage, i, s: term.note(f"{stage} step {i + 1}"),
             **params,
         )
-    engine.render(result, out, seed=params["seed"], decoder=decoder)
+    out = engine.render(result, out, seed=params["seed"], decoder=decoder)
     spans = ", ".join(f"{k} {v:.1f}s" for k, v in result.timings.spans.items())
     auto = (
         f"  (duration head: {result.predicted_seconds:.1f} s)"

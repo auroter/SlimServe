@@ -17,6 +17,7 @@ H.264 + AAC mp4. One profile per upstream pipeline:
 | `ltx25-ic-lora` | ICLoraPipeline: a reference video drives the clip through an IC-LoRA adapter (colorize, deblur, restore, relight, matte, ...) | video-to-video |
 | `ltx25-a2vid` | A2VidPipelineTwoStage: the dev flow driven by an audio file, which rides frozen and ships | audio-to-video |
 | `ltx25-dubit` | DubItPipeline: re-voice a clip under the Dub-It IC-LoRA, the clip's video and audio as reference tokens | dubbing |
+| `ltx25-t2a` | T2AOneStagePipeline: audio only, the dev transformer's audio half, a WAV | text-to-audio |
 
 Distilled versus dev is a quality-versus-time choice for the person asking,
 not something the server picks.
@@ -35,6 +36,7 @@ slimserve ltx25-retake -p "..." --video-path clip.mp4 --start-time 2 --end-time 
 slimserve ltx25-ic-lora -p "..." --video-conditioning gray.mp4 --lora colorization.safetensors   # video-to-video
 slimserve ltx25-a2vid -p "..." --audio-path speech.m4a --size 768x512          # audio-to-video (length from the audio)
 slimserve ltx25-dubit -p "..." --reference-video talk.mp4 --lora dubit.safetensors   # dubbing
+slimserve ltx25-t2a -p "rain on a tin roof" --seconds 5 --output rain.wav   # text-to-audio
 slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
 slimserve ltx25-hq -p "..."                                               # Lightricks' HQ preset (res_2s)
 slimserve ltx25-dev -p "a cat watches rain" --enhance-prompt                # Gemma rewrites the prompt first
@@ -117,6 +119,13 @@ appended as reference tokens; its audio is encoded and appended after the
 target audio as frozen reference tokens at negative times (stage 1), and
 stage 2 freezes the stage-1 audio and appends it as its own reference. The
 stage-1 audio ships.
+
+`ltx25-t2a` (upstream's T2AOneStagePipeline) takes `seconds` / `num_frames`
+at `fps` (the duration head decides otherwise), `seed`, `negative_prompt`,
+`steps` and `guidance.audio`; no size, stills or decoder. The transformer
+runs with no video modality (each block's audio half only, as upstream's
+`video=None`), the audio guider as the guided profiles, and the job's
+content is a 48 kHz stereo WAV (`audio/wav`).
 
 `ltx25-dfr` takes two more options (upstream's `--temporal-upscalings` and
 `--spatial-upscalings`; CLI flags of the same names): `temporal_upscalings`
@@ -393,9 +402,9 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 
 ## Not implemented yet
 
-Of upstream's pipelines and options (ledger section 30): T2AOneStagePipeline, HDRICLoraPipeline and the
-native `--hdr` EXR path, alpha_gen; generated keyframes on the distilled flow
-and chunked long clips. The I2V
+Of upstream's pipelines and options (ledger section 30): HDRICLoraPipeline
+and the native `--hdr` EXR path, alpha_gen; generated keyframes on the
+distilled flow and chunked long clips. The I2V
 first-frame path is wired but its end-to-end output has not been compared
 against upstream on this machine.
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on

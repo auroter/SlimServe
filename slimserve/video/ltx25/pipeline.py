@@ -82,7 +82,7 @@ class Timings:
 
 @dataclass
 class Result:
-    video_latent: mx.array  # (1, 128, F, H, W), normalized
+    video_latent: mx.array | None  # (1, 128, F, H, W), normalized; None: audio only
     audio_tokens: mx.array  # (1, T, 128)
     num_frames: int
     height: int
@@ -214,7 +214,7 @@ class GuidedDenoiser:
 
     def _forward(
         self,
-        video: LatentState,
+        video: LatentState | None,
         audio: LatentState,
         vx,
         ax,
@@ -236,27 +236,32 @@ class GuidedDenoiser:
             )
         rep = lambda x: None if x is None else mx.repeat(x, n, axis=0)  # noqa: E731
         t = mx.full((n,), sigma, dtype=G)
-        vt = None if video.uniform else rep((video.denoise_mask * sigma).squeeze(-1))
+        no_video = video is None  # T2A: an audio-only forward
+        vt = (
+            None
+            if no_video or video.uniform
+            else rep((video.denoise_mask * sigma).squeeze(-1))
+        )
         at = None if audio.uniform else rep((audio.denoise_mask * sigma).squeeze(-1))
         v, a = self.dit(
-            rep(vx),
+            None if no_video else rep(vx),
             rep(ax),
             t,
-            vtext,
+            None if no_video else vtext,
             atext,
-            rep(video.positions),
+            None if no_video else rep(video.positions),
             rep(audio.positions),
-            video_keyframes_mask=rep(video.keyframes_mask),
+            video_keyframes_mask=None if no_video else rep(video.keyframes_mask),
             video_timesteps=vt,
             audio_timesteps=at,
-            video_attention_mask=video.attention_mask,
+            video_attention_mask=None if no_video else video.attention_mask,
             audio_attention_mask=audio.attention_mask,
             stg={k: m[rows] for k, m in self.stg.items()},
             text_rows=trows,
-            share_from=self.share if n == self.passes else None,
-            video_tiles=self.video_tiles,
+            share_from=self.share if n == self.passes and not no_video else None,
+            video_tiles=None if no_video else self.video_tiles,
             step_cache=step_cache if n == self.passes else None,
-            run_video=run_video,
+            run_video=run_video and not no_video,
             run_audio=run_audio,
         )
         return (
@@ -281,6 +286,8 @@ class GuidedDenoiser:
         # upstream _guided_denoise: a modality whose guider skips this step
         # keeps its last x0 (both skipped: no forward at all)
         run_v, run_a = not self.video_g.skips(step), not self.audio_g.skips(step)
+        if video is None:
+            run_v = False
         if not (run_v or run_a):
             if self.last is None:
                 raise ValueError("skip_step cannot skip the first step")
@@ -325,7 +332,7 @@ class GuidedDenoiser:
 
         prev = self.last or (None, None)
         self.last = (
-            guided(v0, self.video_g, prev[0]),
+            None if video is None else guided(v0, self.video_g, prev[0]),
             guided(a0, self.audio_g, prev[1]),
         )
         return self.last
@@ -2611,6 +2618,85 @@ class LTX25Engine:
             tm,
         )
 
+    # ---- text to audio ----------------------------------------------------------
+    def t2a(
+        self,
+        prompt: str,
+        num_frames: int | None = None,
+        fps: float = 24.0,
+        seed: int = 42,
+        negative_prompt: str | None = None,
+        steps: int = 30,
+        audio_guidance: sampling.Guidance = DEFAULT_AUDIO_GUIDANCE,
+        batched: bool = True,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+        fast: Fast | None = None,
+        max_num_frames: int | None = None,
+    ) -> Result:
+        """Lightricks' T2AOneStagePipeline: audio only, one guided stage on the
+        dev transformer with no video modality (the blocks run their audio
+        half: self-attention, text cross-attention, feed-forward); the audio
+        length is `num_frames` / `fps` (the duration head's pick from the
+        audio connector's tokens when not given); the audio guider as the
+        guided profiles (CFG 7, STG on block 28, no modality term). Ships a
+        WAV."""
+        if self.variant != "dev":
+            raise ValueError("the T2A pipeline needs LTX25Engine(variant='dev')")
+        fast = fast or Fast()
+        if fast.steps:
+            steps = fast.steps
+        if fast.guidance:
+            audio_guidance = replace(audio_guidance, **fast.guidance)
+        audio_guidance = replace(audio_guidance, modality=1.0)  # no video to isolate
+        tm = Timings()
+        with tm.span("text"):
+            text = self.load_text()
+            cond = text.encode(prompt)[:2]
+            neg = text.encode(
+                sampling.DEFAULT_NEGATIVE_PROMPT
+                if negative_prompt is None
+                else negative_prompt
+            )[:2]
+            mx.eval(cond, neg)
+            predicted = None
+            if num_frames is None:
+                num_frames, predicted = self.load_duration().num_frames(
+                    None, cond[1], fps
+                )
+                if max_num_frames is not None:
+                    num_frames = min(num_frames, max_num_frames)
+            if not keep_text:
+                self.unload_text()
+        with tm.span("load"):
+            dit = self.load_dit()
+        audio_t = sampling.audio_token_count(num_frames, fps)
+        stepper = self._stepper(tm, on_step)
+        with tm.span("stage1"):
+            audio = sampling.noised_state(
+                (1, audio_t, 128),
+                sampling.audio_positions(audio_t),
+                seed + 1,
+                bf16_noise=self.bf16_noise,
+            )
+            # the video guider is absent upstream: neutral here so no video
+            # pass is planned
+            guided = GuidedDenoiser(
+                dit,
+                cond,
+                neg,
+                sampling.Guidance(cfg=1.0, stg=0.0, modality=1.0, rescale=0.0),
+                audio_guidance,
+                batched,
+            )
+            a = sampling.euler_loop_audio(
+                guided,
+                audio,
+                sampling.ltx2_schedule(steps, 4096),
+                on_step=stepper("stage1"),
+            )
+        return Result(None, a, num_frames, 0, 0, fps, tm, predicted_seconds=predicted)
+
     # ---- hq (res_2s) --------------------------------------------------------
     def hq(
         self,
@@ -2775,6 +2861,15 @@ class LTX25Engine:
 
         decoder = decoder or self.decoder
         tm = result.timings
+        if result.video_latent is None:  # T2A: a WAV (upstream encode_audio)
+            with tm.span("audio_decode"):
+                waveform, sample_rate = self.load_audio().decode(result.audio_tokens)
+            with tm.span("mux"):
+                path = Path(path)
+                if path.suffix.lower() != ".wav":
+                    path = path.with_suffix(".wav")
+                mux.write_wav(str(path), waveform, sample_rate)
+            return path
         with tm.span("vae_decode"):
             from slimserve.video.ltx25 import vae as vae_mod
 

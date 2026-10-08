@@ -24,6 +24,7 @@ VIDEO_IDS = (
     "ltx25-ic-lora",
     "ltx25-a2vid",
     "ltx25-dubit",
+    "ltx25-t2a",
 )
 FAST_IDS = (
     "ltx25-distilled-fast",

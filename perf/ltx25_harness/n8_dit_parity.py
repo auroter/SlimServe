@@ -413,9 +413,69 @@ def skip_ours(out, ref_path, operand="fp16"):
     np.savez(out, video=np.array(v), audio=np.array(a))
 
 
+def t2a_ref(out):
+    """The audio-only forward (video=None): upstream LTXModel vs ours."""
+    import torch
+
+    sys.path[:0] = [f"{UP}/ltx-core/src"]
+    from ltx_core.model.transformer.modality import Modality
+
+    _, _, _, atext = inputs()
+    _, astate = _upstream_states()
+    sigma = torch.tensor([SIGMA])
+    audio = Modality(
+        latent=astate.latent,
+        sigma=sigma,
+        timesteps=astate.denoise_mask * SIGMA,
+        positions=astate.positions,
+        context=torch.from_numpy(atext),
+        context_mask=None,
+        attention_mask=None,
+        keyframes_mask=None,
+    )
+    model = _upstream_model()
+    with torch.inference_mode():
+        _, ax = model(None, audio, None)
+    np.savez(out, audio=ax.float().numpy(), audio_tokens=astate.latent.numpy())
+    print("saved", ax.shape)
+
+
+def t2a_ours(out, ref_path, operand="fp16"):
+    import mlx.core as mx
+
+    from slimserve.video.ltx25 import checkpoints, sampling
+    from slimserve.video.ltx25 import dit as dit_mod
+    from slimserve.video.ltx25.dit import DiTConfig, LTX25DiT
+
+    if operand == "fp32":
+        dit_mod.F = mx.float32
+        checkpoints.cast_operands.__defaults__ = (
+            mx.float32,
+        ) + checkpoints.cast_operands.__defaults__[1:]
+    r = np.load(ref_path)
+    _, _, _, atext = inputs()
+    at = mx.array(r["audio_tokens"])
+    weights, _, tcfg = checkpoints.load_dit("dev")
+    model = LTX25DiT(weights, DiTConfig.from_checkpoint(tcfg))
+    v, a = model(
+        None,
+        at,
+        mx.array([SIGMA]),
+        None,
+        mx.array(atext),
+        None,
+        sampling.audio_positions(at.shape[1]),
+    )
+    assert v is None
+    mx.eval(a)
+    np.savez(out, audio=np.array(a), video=np.zeros(1))
+
+
 def cmp(a, b):
     ra, rb = np.load(a), np.load(b)
     for key in ("video", "audio"):
+        if key not in ra or key not in rb:
+            continue
         x, y = ra[key].astype(np.float64), rb[key].astype(np.float64)
         rel = np.linalg.norm(x - y) / np.linalg.norm(x)
         cos = float((x * y).sum() / (np.linalg.norm(x) * np.linalg.norm(y)))
@@ -430,6 +490,8 @@ if __name__ == "__main__":
         "ours": ours,
         "skip-ref": skip_ref,
         "skip-ours": skip_ours,
+        "t2a-ref": t2a_ref,
+        "t2a-ours": t2a_ours,
         "cmp": cmp,
         "guided-ref": guided_ref,
         "guided-ours": guided_ours,
