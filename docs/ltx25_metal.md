@@ -13,6 +13,8 @@ H.264 + AAC mp4. One profile per upstream pipeline:
 | `ltx25-hq` | TI2VidTwoStagesHQ: 15 res_2s steps x 2 evaluations, distilled LoRA in both stages | Lightricks' HQ preset |
 | `ltx25-keyframes` | KeyframeInterpolation: the dev flow with every still appended as a keyframe at its frame | a clip through given stills |
 | `ltx25-one-stage` | TI2VidOneStage: 30 guided steps at the output size, no upsampler | prototyping (upstream: educational) |
+| `ltx25-retake` | RetakePipeline: regenerate [start, end) seconds of a source clip, the rest kept | editing an existing clip |
+| `ltx25-ic-lora` | ICLoraPipeline: a reference video drives the clip through an IC-LoRA adapter (colorize, deblur, restore, relight, matte, ...) | video-to-video |
 
 Distilled versus dev is a quality-versus-time choice for the person asking,
 not something the server picks.
@@ -27,6 +29,8 @@ slimserve ltx25-dfr -p "..." --size 768x512 --seconds 5 --seed 7
 slimserve ltx25-distilled -p "the fox turns and runs" --image fox.png     # image-to-video
 slimserve ltx25-distilled -p "..." --image a.png --image b.png 48 0.8      # a second still pinned at frame 48
 slimserve ltx25-keyframes -p "..." --image a.png 0 --image b.png 96        # interpolate between stills
+slimserve ltx25-retake -p "..." --video-path clip.mp4 --start-time 2 --end-time 3.5   # regenerate a region
+slimserve ltx25-ic-lora -p "..." --video-conditioning gray.mp4 --lora colorization.safetensors   # video-to-video
 slimserve ltx25-distilled-fast -p "..."                                   # the fast tier (see below)
 slimserve ltx25-hq -p "..."                                               # Lightricks' HQ preset (res_2s)
 slimserve ltx25-dev -p "a cat watches rain" --enhance-prompt                # Gemma rewrites the prompt first
@@ -50,6 +54,45 @@ GET    /v1/videos/<id>/content  the mp4
 DELETE /v1/videos/<id>
 GET    /health, /v1/models
 ```
+
+`ltx25-retake` takes a source clip instead of a size and length:
+`video_path` (a file on the server) or `video` (base64 mp4), `start_time` and
+`end_time` in seconds, optional `regenerate_video` / `regenerate_audio`
+(default true; false freezes that modality). The clip must have 8k + 1
+frames and sides that are multiples of 32 and fit the token envelope; its
+size, frame count and rate are the output's. The clip is decoded with ffmpeg
+exactly as upstream's PyAV path does, video-VAE-encoded with upstream's
+default tiling (frames 80/24, 768/64 px), the audio through the audio VAE
+encoder (torchaudio's sinc resample to 16 kHz, Slaney log-mel), and only
+the tokens whose time span overlaps the region are regenerated (upstream's
+TemporalRegionMask), on the distilled transformer with its 8 sigmas and
+plain Euler, as upstream's CLI runs it. A source without an audio track
+gets audio generated over the whole clip.
+
+`ltx25-ic-lora` (upstream's ICLoraPipeline, its CLI recipe) takes
+`video_conditioning` (`[{"path", "strength"}]`, reference clips on the
+server; CLI `--video-conditioning PATH [STRENGTH]`, repeatable) and the
+IC-LoRA adapter through `loras` / `--lora` (Lightricks publishes thirteen
+for 2.5, all gated behind their own terms: Colorization, Deblur, Restore,
+Day-To-Night, Clean-Plate, Alpha-Gen, SDR-To-HDR, Refine-Details,
+Decompression, Layout-To-Render, Water-Simulation, Ingredients,
+Pixel-Spatial-Upscaler). Stage 1 (half resolution, the 8 distilled sigmas,
+plain Euler) runs under the adapter with each reference encoded at the
+stage's size (over the adapter's `reference_downscale_factor`, frame 0 then
+every `reference_temporal_scale_factor`th frame) and appended as clean
+reference tokens whose positions are scaled onto the target grid; stage 2
+is the bare 3-sigma refinement (`stage_2_ic_lora` keeps the adapter and
+references, `skip_stage_2` ships the half-size stage 1). `attention_strength`
+(0-1) and `attention_mask` (a grayscale mask video; CLI
+`--conditioning-attention-mask MASK STRENGTH`) scale how strongly reference
+and target tokens attend to each other (upstream's log-space attention
+bias; it materializes an (N + M)^2 fp16 mask, 1.8 GB at the 1536x1024x121
+envelope). `tile` / `--tile` (`tile_height`, `tile_width`, default 1024x1536,
+half overlap) runs each transformer call over pinned equal windows blended
+with trapezoids (upstream FixedSizeSpatialTiling); a tiled full-resolution
+stage needs `stage_2_ic_lora`. Stills condition as elsewhere. A tiled stage
+encodes its references with our default source tiling, not upstream's
+machine-dependent decode tiling (the one documented deviation).
 
 `ltx25-dfr` takes two more options (upstream's `--temporal-upscalings` and
 `--spatial-upscalings`; CLI flags of the same names): `temporal_upscalings`
@@ -320,14 +363,14 @@ Development rule (HANDOFF.md): one model-loading process at a time, through
 | `image.py` | image-to-video still: decode, CRF-18 round trip, upstream resize/crop/normalize |
 | `duration.py` | the duration head (auto clip length from the prompt) |
 | `enhancer.py`, `prompts/` | the prompt enhancer: Gemma-4 E2B-it language model and vision tower, greedy decoding, upstream's system prompts |
-| `audio.py`, `mux.py` | audio VAE + vocoder + bandwidth extension; ffmpeg mux |
+| `audio.py`, `mux.py` | audio VAE (encoder and decoder) + vocoder + bandwidth extension; ffmpeg mux |
+| `media.py` | source clips for the editing pipelines: ffmpeg probe / frame / audio decode as PyAV does, torchaudio's sinc resampler |
 | `../server.py`, `../cli.py` | the job queue and HTTP API; `slimserve` integration |
 
 ## Not implemented yet
 
-Of upstream's pipelines and options (ledger section 30): ICLoraPipeline
-(video-to-video reference conditioning), A2VidPipelineTwoStage (audio-driven),
-RetakePipeline, DubItPipeline, T2AOneStagePipeline, HDRICLoraPipeline and the
+Of upstream's pipelines and options (ledger section 30): A2VidPipelineTwoStage
+(audio-driven), DubItPipeline, T2AOneStagePipeline, HDRICLoraPipeline and the
 native `--hdr` EXR path, alpha_gen; generated keyframes on the distilled flow
 and chunked long clips. The I2V
 first-frame path is wired but its end-to-end output has not been compared

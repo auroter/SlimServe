@@ -240,6 +240,57 @@ def with_latent(state: LatentState, latent: mx.array) -> LatentState:
     return replace(state, latent=latent)
 
 
+def video_time_bounds(f: int, fps: float) -> tuple[np.ndarray, np.ndarray]:
+    """[start, end) seconds of each latent frame (causal first frame), the
+    temporal row of upstream get_pixel_coords(causal_fix=True) / fps."""
+    idx = np.arange(f, dtype=np.float64)
+    starts = np.maximum(idx * 8 + 1 - 8, 0.0) / fps
+    ends = np.maximum((idx + 1) * 8 + 1 - 8, 0.0) / fps
+    return starts, ends
+
+
+def audio_time_bounds(tokens: int) -> tuple[np.ndarray, np.ndarray]:
+    """[start, end) seconds of each audio latent (upstream AudioPatchifier
+    _compute_audio_timings, causal)."""
+    idx = np.arange(tokens, dtype=np.float64)
+    starts = np.maximum(idx * 4 + 1 - 4, 0.0) * 160 / 16000
+    ends = np.maximum((idx + 1) * 4 + 1 - 4, 0.0) * 160 / 16000
+    return starts, ends
+
+
+def region_mask(
+    state: LatentState,
+    start_time: float,
+    end_time: float,
+    fps: float,
+    tokens_per_frame: int | None,
+) -> LatentState:
+    """Upstream TemporalRegionMask: denoise mask 1 for the tokens whose time
+    span overlaps [start_time, end_time) (end > start_time and start <
+    end_time), 0 elsewhere, over the whole state (it is the only conditioning
+    of the retake); `tokens_per_frame` None means an audio state. The noisy
+    latent is re-blended as the noiser does (lerp(clean, noised, mask)) so the
+    kept region is the source."""
+    n = state.latent.shape[1]
+    if tokens_per_frame is None:
+        starts, ends = audio_time_bounds(n)
+    else:
+        f = n // tokens_per_frame
+        starts, ends = video_time_bounds(f, fps)
+        starts, ends = (
+            np.repeat(starts, tokens_per_frame),
+            np.repeat(ends, tokens_per_frame),
+        )
+    inside = (ends > start_time) & (starts < end_time)
+    mask = mx.array(inside.astype(np.float32)).reshape(1, n, 1)
+    mask = mx.broadcast_to(mask, (state.latent.shape[0], n, 1))
+    return replace(
+        state,
+        denoise_mask=mask,
+        latent=state.clean * (1.0 - mask) + state.latent * mask,
+    )
+
+
 # ---- stills (upstream ImageConditioningInput) --------------------------------
 KEYFRAME_NOISE_SEED_OFFSET = 50000  # 40000 is the hq pipeline's res_2s stream
 
@@ -535,14 +586,36 @@ def append_reference(
     positions: mx.array,
     downscale: int,
     strength: float = 1.0,
+    temporal_scale: int = 1,
+    fps: float | None = None,
+    attention: float | np.ndarray | None = None,
+    num_noisy: int | None = None,
 ) -> LatentState:
-    """Append clean IC-LoRA reference tokens (denoise mask 1 - strength); their
-    spatial positions are scaled to the target's pixel grid."""
+    """Upstream VideoConditionByReferenceLatent: append clean IC-LoRA reference
+    tokens (denoise mask 1 - strength) with their spatial positions scaled to
+    the target's pixel grid (`downscale`) and, for a reference at 1 / S of
+    the target's frame rate (`temporal_scale` S), their times spread by S and
+    shifted so the last reference patch ends with the target's last
+    (t - (S - 1) / fps, clamped at 0). `attention` (upstream
+    ConditioningItemAttentionStrengthWrapper) is a scalar in [0, 1] or a
+    per-token weight (count,) controlling how strongly these tokens and the
+    target's `num_noisy` tokens attend to each other: the state's attention
+    mask becomes the log-space bias of upstream build_attention_mask."""
     b, n, _ = state.latent.shape
     count = tokens.shape[1]
     tokens = tokens.astype(G)
     pos = positions * mx.array([1.0, float(downscale), float(downscale)])
+    if temporal_scale != 1:
+        if fps is None:
+            raise ValueError("temporal_scale needs the target fps")
+        t = pos[..., 0:1] * float(temporal_scale) - (temporal_scale - 1) / fps
+        pos = mx.concatenate([mx.maximum(t, 0.0), pos[..., 1:]], axis=-1)
     kf = state.keyframes_mask
+    mask = state.attention_mask
+    if attention is not None or mask is not None:
+        mask = attention_bias(
+            mask, n, count, num_noisy if num_noisy is not None else n, attention
+        )
     return replace(
         state,
         latent=mx.concatenate([state.latent, tokens], axis=1),
@@ -557,7 +630,63 @@ def append_reference(
         keyframes_mask=None
         if kf is None
         else mx.concatenate([kf, mx.zeros((b, count, 1), dtype=G)], axis=1),
+        attention_mask=mask,
     )
+
+
+def attention_bias(
+    existing: mx.array | None,
+    n_existing: int,
+    m_new: int,
+    n_noisy: int,
+    cross: float | np.ndarray | None,
+) -> mx.array:
+    """Upstream mask_utils.build_attention_mask followed by the transformer's
+    _prepare_self_attention_mask: the (1, N + M, N + M) self-attention bias
+    for a conditioning block of M tokens appended to N. Blocks: existing x
+    existing kept (or full attention), new x new 1, noisy x new and new x
+    noisy the per-token weight `cross` (None: 1), other prior conditioning
+    tokens x new 0. Weights w become log(w) (w <= 0: -inf), fp16."""
+    total = n_existing + m_new
+    weights = np.ones((total, total), dtype=np.float32)
+    if existing is not None:
+        weights[:n_existing, :n_existing] = np.exp(
+            np.array(existing[0], dtype=np.float32)
+        )
+    c = (
+        np.ones(m_new, dtype=np.float32)
+        if cross is None
+        else np.broadcast_to(np.asarray(cross, dtype=np.float32), (m_new,))
+    )
+    weights[:, n_existing:] = 0.0
+    weights[n_existing:, :] = 0.0
+    weights[n_existing:, n_existing:] = 1.0
+    weights[:n_noisy, n_existing:] = c[None, :]
+    weights[n_existing:, :n_noisy] = c[:, None]
+    with np.errstate(divide="ignore"):
+        bias = np.where(weights > 0, np.log(np.maximum(weights, 1e-30)), -np.inf)
+    return mx.array(bias.astype(np.float16))[None]
+
+
+def mask_video_to_tokens(mask: np.ndarray, f: int, h: int, w: int) -> np.ndarray:
+    """Upstream downsample_mask_video_to_latent: a pixel mask (F, H, W) in
+    [0, 1] -> per-token weights (f h w) for an (f, h, w) latent: area
+    downsampling to (h, w) per frame, the first frame kept, the rest averaged
+    over each latent frame's (F - 1) / (f - 1) pixel frames."""
+    F = mask.shape[0]
+    sh, sw = mask.shape[1] // h, mask.shape[2] // w
+    if mask.shape[1] != sh * h or mask.shape[2] != sw * w:
+        raise ValueError("the mask video's size must be a multiple of the latent grid")
+    spatial = mask.reshape(F, h, sh, w, sw).mean(axis=(2, 4))
+    if F > 1 and f > 1:
+        if (F - 1) % (f - 1):
+            raise ValueError(f"mask frames {F} do not fit {f} latent frames")
+        t = (F - 1) // (f - 1)
+        rest = spatial[1:].reshape(f - 1, t, h, w).mean(axis=1)
+        out = np.concatenate([spatial[:1], rest], axis=0)
+    else:
+        out = spatial[:1]
+    return out.reshape(-1).astype(np.float32)
 
 
 def slots_to_latent(
@@ -818,6 +947,45 @@ class SpatialTile:
     w0: int
     w1: int
     weights: np.ndarray  # (h1 - h0, w1 - w0) trapezoid blend
+
+
+def split_by_size_pinned(
+    dim: int, size: int, min_overlap: int
+) -> list[tuple[int, int, int, int]]:
+    """ltx_core.tiling.split_by_size_pinned: equal `size` tiles with the first
+    and last origins pinned to the extent, the count grown until the realized
+    overlap reaches `min_overlap` (capped so three tiles never share a cell),
+    interior origins spread evenly (remainder to the leading gaps)."""
+    if dim <= size:
+        return [(0, dim, 0, 0)]
+    limit = max(2, 1 + (dim - size) // ((size + 1) // 2))
+    count = 2
+    while count < limit and (count * size - dim) / (count - 1) < min_overlap:
+        count += 1
+    base, remainder = divmod(dim - size, count - 1)
+    origins = [0]
+    for index in range(count - 1):
+        origins.append(origins[-1] + base + (1 if index < remainder else 0))
+    out = []
+    for index, start in enumerate(origins):
+        left = 0 if index == 0 else origins[index - 1] + size - start
+        right = 0 if index == count - 1 else start + size - origins[index + 1]
+        out.append((start, start + size, left, right))
+    return out
+
+
+def spatial_tiles_by_size(
+    h: int, w: int, tile_h: int, tile_w: int, overlap_h: int, overlap_w: int
+) -> list[SpatialTile]:
+    """Upstream FixedSizeSpatialTiling (the IC-LoRA --tile stages): pinned
+    equal-size tiles per axis with trapezoid blends, in latent cells."""
+    tiles = []
+    for h0, h1, hl, hr in split_by_size_pinned(h, tile_h, overlap_h):
+        mh = trapezoid_mask(h1 - h0, hl, hr)
+        for w0, w1, wl, wr in split_by_size_pinned(w, tile_w, overlap_w):
+            mw = trapezoid_mask(w1 - w0, wl, wr)
+            tiles.append(SpatialTile(h0, h1, w0, w1, mh[:, None] * mw[None, :]))
+    return tiles
 
 
 def spatial_tiles(h: int, w: int, num_tiles: int, overlap: int) -> list[SpatialTile]:

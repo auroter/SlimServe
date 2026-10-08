@@ -60,9 +60,12 @@ E2B-it in MLX, `enhance_prompt` / `--enhance-prompt`, section 28, with the
 image-aware I2V variant through Gemma's vision tower, section 29). The
 component checklist is complete. 2026-10-08: the user's standard is 100% of
 upstream's capability, optimized the same way as the existing profiles;
-section 30 is the inventory and order, section 31 the first batch (stills at
-any frame on every profile, `ltx25-keyframes`, `ltx25-one-stage`, their
-fast tiers). Work the rest of section 30's list in its order.
+section 30 is the inventory and order; sections 31-34 landed stills at any
+frame on every profile, `ltx25-keyframes`, `ltx25-one-stage`, per-request
+guidance / skip_step / user LoRAs, `ltx25-retake` (with the source media
+path and both VAE encoders parity-gated) and `ltx25-ic-lora` (every control
+IC-LoRA is a gated repo the account must accept before an end-to-end check),
+each with a fast tier. Work the rest of section 30's list in its order.
 Not done: the opt-in tier, any hand-written Metal GEMM
 (measured headroom on M1-M4 is at most ~10% of a forward; see ledger section
 15), N7 (candidates: na3d / na3d_joint kernels, split-K dispatch, slab conv
@@ -96,6 +99,8 @@ DiT, same kernels:
 | `ltx25-hq` | TI2VidTwoStagesHQ | 15 res_2s steps x 3 guided passes, distilled LoRA 0.25 | 3 res_2s steps, LoRA 0.5, audio refined | Lightricks' HQ preset |
 | `ltx25-keyframes` | KeyframeInterpolation | dev stage 1 with every still appended as a keyframe token block | dev stage 2, audio refined | a clip through given stills |
 | `ltx25-one-stage` | TI2VidOneStage | 30 steps x 4 guided passes at the output size (snap 32) | none | prototyping |
+| `ltx25-retake` | RetakePipeline | 8 distilled sigmas, plain Euler, at the source size; region mask on the tokens' time spans | none | edit a region of a clip |
+| `ltx25-ic-lora` | ICLoraPipeline | distilled sigmas under the IC-LoRA with reference tokens, half res | bare 3 sigmas (adapter optional) | video-to-video |
 | `ltx25-*-fast` | distilled, dev, dfr, keyframes, one-stage | output-changing settings stacked on (section 24 of the ledger) | | iterate, judged by eye |
 
 Dev is the profile that adheres to the prompt (reviewed 2026-10-06: a lot

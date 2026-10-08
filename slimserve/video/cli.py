@@ -135,9 +135,36 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         "decoder",
         "temporal_upscalings",
         "spatial_upscalings",
+        "video_path",
+        "start_time",
+        "end_time",
+        "tile_height",
+        "tile_width",
     ):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
+    for key in ("skip_stage_2", "stage_2_ic_lora", "tile"):
+        if getattr(args, key, False):
+            body[key] = True
+    if getattr(args, "video_conditioning", None):
+        body["video_conditioning"] = []
+        for group in args.video_conditioning:
+            if not 1 <= len(group) <= 2:
+                term.fail("--video-conditioning takes PATH [STRENGTH]")
+                return 2
+            body["video_conditioning"].append(
+                {
+                    "path": str(Path(group[0]).expanduser()),
+                    "strength": float(group[1]) if len(group) > 1 else 1.0,
+                }
+            )
+    if getattr(args, "conditioning_attention_mask", None):
+        group = args.conditioning_attention_mask
+        if len(group) != 2:
+            term.fail("--conditioning-attention-mask takes MASK_PATH STRENGTH")
+            return 2
+        body["attention_mask"] = str(Path(group[0]).expanduser())
+        body["attention_strength"] = float(group[1])
     if getattr(args, "enhance_prompt", False):
         body["enhance_prompt"] = True
     try:
@@ -154,6 +181,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         root=cfg["root"],
         variant="dev" if cfg["pipeline"] in server.GUIDED_PIPELINES else "distilled",
     )
+    source = params.pop("source", None)
     prompt = params.pop("prompt")
     extra = ""
     if params.pop("enhance_prompt", False):
@@ -163,10 +191,16 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         term.note(f"enhanced prompt: {prompt}")
         engine.unload_enhancer()
     decoder = params.pop("decoder")
+    if source:
+        term.note(
+            f"source {source['width']}x{source['height']}x{source['num_frames']} "
+            f"at {source['fps']:g} fps"
+        )
     fast = server.fast_settings(cfg)
     if fast is not None:
         params["fast"] = fast
-    with engine.user_loras(params.pop("loras", None)):
+    loras = None if cfg["pipeline"] == "ic_lora" else params.pop("loras", None)
+    with engine.user_loras(loras):
         result = getattr(engine, cfg["pipeline"])(
             prompt,
             keep_text=False,
@@ -181,7 +215,7 @@ def _one_clip(cfg: dict[str, Any], args: Any) -> int:
         else ""
     )
     term.ok(
-        f"{out}  {params['width']}x{params['height']}x{result.num_frames}{auto}  "
+        f"{out}  {result.width}x{result.height}x{result.num_frames}{auto}  "
         f"{time.perf_counter() - started:.1f}s  ({extra}{spans})"
     )
     return 0

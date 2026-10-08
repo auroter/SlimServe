@@ -20,6 +20,9 @@ requests. The API is job-shaped because a clip takes minutes:
                                        "image_strength": 1.0,
                                        "images": [{"image": ..., "frame": 48,
                                                    "strength": 1.0, "crf": 18}]}
+    POST   /v1/videos  (retake)       {"prompt": ..., "video_path": "/clips/a.mp4"
+                                       or "video": <base64 mp4>, "start_time": 1.0,
+                                       "end_time": 2.5, "regenerate_audio": true}
     GET    /v1/videos/<id>            status, progress, timings
     GET    /v1/videos/<id>/content    the mp4 (H.264 + AAC)
     DELETE /v1/videos/<id>
@@ -65,6 +68,8 @@ MAX_QUEUED = 16
 KEEP_FINISHED = 32
 # pipelines on the dev transformer (CFG/STG guidance, a negative prompt)
 GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage")
+# pipelines that edit a source clip: its size, length and rate are the output's
+SOURCE_PIPELINES = ("retake",)
 
 
 class BadRequest(ValueError):
@@ -100,8 +105,9 @@ class Job:
         for key in ("video_guidance", "audio_guidance"):
             if key in out:
                 out[key] = asdict(out[key])
-        if out.get("loras"):
-            out["loras"] = [{"path": p, "strength": s} for p, s in out["loras"]]
+        for key in ("loras", "video_conditioning"):
+            if out.get(key):
+                out[key] = [{"path": p, "strength": s} for p, s in out[key]]
         if out.get("images"):
             out["images"] = [
                 {
@@ -129,6 +135,8 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise BadRequest("`prompt` is required")
+    if cfg["pipeline"] in SOURCE_PIPELINES:
+        return normalize_source_request(body, cfg, prompt)
     width, height = cfg["width"], cfg["height"]
     if size := body.get("size"):
         try:
@@ -253,6 +261,13 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         )
     if body.get("loras") is not None:
         params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
+    if cfg["pipeline"] == "ic_lora":
+        params.update(ic_lora_fields(body, params))
+    elif any(key in body for key in IC_LORA_KEYS):
+        raise BadRequest(
+            f"{', '.join(k for k in IC_LORA_KEYS if k in body)}: IC-LoRA options "
+            "apply to the ic_lora pipeline only"
+        )
     if cfg["pipeline"] == "keyframes":
         if "image" in params:  # the shorthand is a frame-0 keyframe here
             from slimserve.video.ltx25.sampling import Still
@@ -265,6 +280,138 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
                 '([{"image": ..., "frame": N, "strength": 1.0}, ...])'
             )
     return params
+
+
+def normalize_source_request(
+    body: dict[str, Any], cfg: dict[str, Any], prompt: str
+) -> dict[str, Any]:
+    """A retake request: `video_path` (a file on the server) or `video`
+    (base64 mp4, written next to the outputs), `start_time` / `end_time` in
+    seconds, `regenerate_video` / `regenerate_audio` (default true). The
+    source's size, frame count and rate are the output's; it must fit the
+    profile's token envelope. No size / seconds / fps / images here."""
+    for key in (
+        "size",
+        "width",
+        "height",
+        "seconds",
+        "num_frames",
+        "fps",
+        "image",
+        "images",
+    ):
+        if key in body:
+            raise BadRequest(
+                f"{key} does not apply to the retake pipeline (the source clip sets it)"
+            )
+    if body.get("video_path") is not None:
+        path = Path(str(body["video_path"])).expanduser()
+        if not path.is_file():
+            raise BadRequest(f"video_path {path} is not a file")
+        video_path = str(path)
+    elif body.get("video") is not None:
+        video_path = str(_store_video(body["video"]))
+    else:
+        raise BadRequest(
+            "the retake pipeline needs `video_path` (a file on the server) "
+            "or `video` (base64)"
+        )
+    from slimserve.video.ltx25 import media
+
+    try:
+        info = media.probe(video_path)
+    except (RuntimeError, ValueError) as exc:
+        raise BadRequest(f"cannot read the source clip: {exc}") from exc
+    if (info.frames - 1) % 8:
+        raise BadRequest(
+            f"the source has {info.frames} frames; retake needs 8k + 1 "
+            f"(trim it to {(info.frames - 1) // 8 * 8 + 1})"
+        )
+    if info.width % 32 or info.height % 32:
+        raise BadRequest(
+            f"the source is {info.width}x{info.height}; sides must be multiples of 32"
+        )
+    tokens = ((info.frames - 1) // 8 + 1) * (info.height // 32) * (info.width // 32)
+    if tokens > cfg["max_video_tokens"] or (info.height // 32) * (info.width // 32) > (
+        cfg["height"] // 32
+    ) * (cfg["width"] // 32):
+        raise BadRequest(
+            f"{info.width}x{info.height}x{info.frames} is {tokens} latent tokens; "
+            f"this profile is validated up to {cfg['max_video_tokens']} "
+            f"({cfg['width']}x{cfg['height']}x{cfg['num_frames']})"
+        )
+    try:
+        start, end = float(body["start_time"]), float(body["end_time"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BadRequest("start_time and end_time (seconds) are required") from exc
+    duration = info.frames / info.fps
+    if not 0.0 <= start < end or start >= duration:
+        raise BadRequest(
+            "the region must satisfy 0 <= start_time < end_time inside the "
+            f"clip's {duration:.3f} s"
+        )
+    params: dict[str, Any] = {
+        "prompt": prompt,
+        "video_path": video_path,
+        "start_time": start,
+        "end_time": end,
+        "seed": int(body.get("seed", 42)),
+        "source": {
+            "width": info.width,
+            "height": info.height,
+            "num_frames": info.frames,
+            "fps": info.fps,
+        },
+    }
+    for key in ("regenerate_video", "regenerate_audio"):
+        if key in body:
+            if not isinstance(body[key], bool):
+                raise BadRequest(f"{key} must be true or false")
+            params[key] = body[key]
+    decoder = str(body.get("decoder", cfg.get("decoder", "diffusion")))
+    if decoder not in ("diffusion", "conv"):
+        raise BadRequest(
+            "decoder must be 'diffusion' (default, sharper) or 'conv' (faster)"
+        )
+    params["decoder"] = decoder
+    if "enhance_prompt" in body:
+        if not isinstance(body["enhance_prompt"], bool):
+            raise BadRequest("enhance_prompt must be true or false")
+        if body["enhance_prompt"]:
+            params["enhance_prompt"] = True
+    if body.get("loras") is not None:
+        params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
+    return params
+
+
+def _store_video(value: Any) -> Path:
+    """`video`: base64 mp4 (optionally a data: URL) -> a file under the output
+    directory (the engine reads clips from disk)."""
+    data = _b64(value)
+    target = output_dir() / f"source_{uuid.uuid4().hex[:16]}.mp4"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    return target
+
+
+def _b64(value: Any) -> bytes:
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.startswith("data:"):
+            header, sep, text = text.partition(",")
+            if not sep or ";base64" not in header:
+                raise BadRequest("video data: URL must be base64 encoded")
+        try:
+            data = base64.b64decode(text, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise BadRequest("video must be base64 (optionally a data: URL)") from exc
+    else:
+        raise BadRequest("video must be a base64 string")
+    if not data:
+        raise BadRequest("video is empty")
+    return data
 
 
 def _list(value: Any, name: str = "images") -> list:
@@ -343,6 +490,72 @@ def guidance_fields(value: Any, pipeline: str) -> dict[str, Any]:
                 if key != "rescale" and clean[key] < 0.0:
                     raise BadRequest(f"{key} must be non-negative")
         out[f"{modality}_guidance"] = dc_replace(defaults[modality], **clean)
+    return out
+
+
+IC_LORA_KEYS = (
+    "video_conditioning",
+    "attention_strength",
+    "attention_mask",
+    "skip_stage_2",
+    "stage_2_ic_lora",
+    "tile",
+    "tile_height",
+    "tile_width",
+)
+
+
+def ic_lora_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    """The IC-LoRA request: `video_conditioning` ([{"path", "strength"}],
+    reference clips on the server; required), `loras` (the IC-LoRA adapters;
+    required), `attention_strength` (0-1), `attention_mask` (a grayscale mask
+    video on the server), `skip_stage_2`, `stage_2_ic_lora`, `tile`,
+    `tile_height` / `tile_width` (multiples of 32)."""
+    out: dict[str, Any] = {}
+    refs = body.get("video_conditioning")
+    if not refs:
+        raise BadRequest(
+            "the ic_lora pipeline needs `video_conditioning` "
+            '([{"path": ..., "strength": 1.0}])'
+        )
+    out["video_conditioning"] = []
+    for item in _list(refs, "video_conditioning"):
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise BadRequest('each video_conditioning entry needs a "path"')
+        path = Path(item["path"]).expanduser()
+        if not path.is_file():
+            raise BadRequest(f"video_conditioning: {path} is not a file")
+        out["video_conditioning"].append(
+            (str(path), _strength(item.get("strength", 1.0), "reference strength"))
+        )
+    if not params.get("loras"):
+        raise BadRequest("the ic_lora pipeline needs `loras` (the IC-LoRA adapter)")
+    if "attention_strength" in body:
+        out["attention_strength"] = _strength(
+            body["attention_strength"], "attention_strength"
+        )
+    if body.get("attention_mask") is not None:
+        mask = Path(str(body["attention_mask"])).expanduser()
+        if not mask.is_file():
+            raise BadRequest(f"attention_mask: {mask} is not a file")
+        out["attention_mask"] = str(mask)
+    for key in ("skip_stage_2", "stage_2_ic_lora", "tile"):
+        if key in body:
+            if not isinstance(body[key], bool):
+                raise BadRequest(f"{key} must be true or false")
+            if body[key]:
+                out[key] = True
+    for key in ("tile_height", "tile_width"):
+        if key in body:
+            value = body[key]
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 64
+                or value % 32
+            ):
+                raise BadRequest(f"{key} must be a multiple of 32, at least 64")
+            out[key] = value
     return out
 
 
@@ -471,9 +684,9 @@ class VideoService:
         engine.load_text()
         engine.load_dit()
         engine.load_vae()
-        if pipeline != "one_stage":
+        if pipeline not in ("one_stage", *SOURCE_PIPELINES):
             engine.load_upscaler()
-        engine.load_audio()
+        engine.load_audio(encoder=pipeline in SOURCE_PIPELINES)
         engine.load_duration()
         if self.cfg.get("decoder", "diffusion") == "diffusion":
             engine.load_diffvae()
@@ -529,6 +742,7 @@ class VideoService:
             job.progress = {"stage": stage, "step": index + 1}
 
         decoder = p.pop("decoder", None)
+        p.pop("source", None)  # reported, not an engine argument
         fast = fast_settings(self.cfg)
         if fast is not None:
             p["fast"] = fast

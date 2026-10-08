@@ -4116,6 +4116,131 @@
           ]
         }
       }
+    },
+    "ltx25-retake": {
+      "title": "LTX-2.5 retake (regenerate a time region of a clip) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Video editing with Lightricks' RetakePipeline: a source clip is encoded to video and audio latents and only the tokens inside [start_time, end_time) are regenerated from the prompt on the distilled transformer (8 Euler steps, no guidance, no upsampler); the rest of the clip, picture and sound, stays the source. The output keeps the source's size, frame count and rate. Requests give `video_path` (or `video` as base64), `start_time`, `end_time`; the CLI --video-path --start-time --end-time.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-distilled",
+          "engine": {
+            "pipeline": "retake",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "The source must have 8k + 1 frames and sides that are multiples of 32 (upstream's CLI refuses otherwise); frames are decoded through ffmpeg exactly as PyAV does (bit-identical), the audio stream likewise (ffmpeg keeps the AAC priming frame's skip, upstream's PyAV path starts 1024 samples late on such files). The clip is encoded with upstream's TileSizeConfig.default() tiling (frames 80/24, 768/64 px; the tiled encode matches upstream to 4e-6, and differs from an untiled one by 18%), the audio through the VAE encoder (torchaudio's sinc resample to 16 kHz, Slaney log-mel; encoder 1e-6). The region mask is upstream's TemporalRegionMask on the tokens' time spans; a source without audio gets its audio generated over the whole clip. Ledger section 33.",
+            "Precision as ltx25-distilled: fp32 residual stream, fp16 GEMM and attention operands."
+          ]
+        }
+      }
+    },
+    "ltx25-retake-fast": {
+      "title": "LTX-2.5 retake, fast tier, on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "The retake pipeline with the fast tier: the first-block step cache at 0.10 and the conv decoder on the one 8-step stage. Same engine as ltx25-retake. Measured in perf/ltx25_metal_campaign.md section 33.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-distilled",
+          "engine": {
+            "pipeline": "retake",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "conv",
+            "served_model_name": "LTX-2.5",
+            "fast": {
+              "step_cache": 0.1
+            }
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "What is on: `fast.step_cache` 0.10 (a step whose block-0 residual moved less than 10% accumulated since the last computed step reuses that step's residual) and `decoder: conv`. The source handling is ltx25-retake's."
+          ]
+        }
+      }
+    },
+    "ltx25-ic-lora": {
+      "title": "LTX-2.5 IC-LoRA (video-to-video) on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "Video-to-video with Lightricks' ICLoraPipeline: a reference video (the control signal: a clip to colorize, deblur, restore, relight, matte, ...) is encoded and appended as reference tokens while an IC-LoRA adapter (Lightricks publishes Colorization, Deblur, Restore, Day-To-Night, Clean-Plate, Alpha-Gen, SDR-To-HDR, Refine-Details, Decompression, Layout-To-Render, Water-Simulation, Ingredients, Pixel-Spatial-Upscaler for 2.5; pass one with --lora) runs on the distilled transformer: stage 1 at half resolution under the adapter with the references, 2x latent upscale, a 3-step bare stage 2 (optionally with the adapter and references, optionally skipped). Requests give `video_conditioning` and `loras`; the CLI --video-conditioning PATH [STRENGTH] --lora PATH [STRENGTH].",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-distilled",
+          "engine": {
+            "pipeline": "ic_lora",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "The adapter's metadata sets the reference geometry (reference_downscale_factor: the reference encoded at 1 / N of the stage size, its positions scaled back; reference_temporal_scale_factor: frame 0 then every Nth frame, times spread by N and shifted so the last patches align). References are decoded by frame index through ffmpeg exactly as PyAV does, resized to fill and center-cropped, encoded untiled (upstream's default recipe); `attention_strength` / `attention_mask` (a grayscale mask video) become upstream's log-space attention bias between the reference and target tokens; `tile` runs the transformer over pinned equal windows (FixedSizeSpatialTiling, default 1024x1536, half overlap) blended with trapezoids. Plain Euler on the distilled sigmas, as upstream's stage default. Ledger section 34.",
+            "Precision as ltx25-distilled: fp32 residual stream, fp16 GEMM and attention operands."
+          ]
+        }
+      }
+    },
+    "ltx25-ic-lora-fast": {
+      "title": "LTX-2.5 IC-LoRA (video-to-video), fast tier, on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "The IC-LoRA pipeline with the distilled fast tier: the 2-step stage 2 and the conv decoder. Same engine as ltx25-ic-lora. Measured in perf/ltx25_metal_campaign.md section 34.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-distilled",
+          "engine": {
+            "pipeline": "ic_lora",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "conv",
+            "served_model_name": "LTX-2.5",
+            "fast": {
+              "stage2_sigmas": [
+                0.909375,
+                0.421875,
+                0.0
+              ]
+            }
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "The fast tier is judged by eye and by PSNR against the exact profile at 1536x1024x121, never by parity. What is on: `decoder: conv` (97 -> 34 s at HD, softer fine texture than the diffusion decoder) and `fast.stage2_sigmas` with two refinement steps instead of three. Rejected for this profile: the first-block step cache (never fires on the 8+3 ancestral schedules: the block-0 residual moves 22-70% per step) and tiled stage-2 attention (a visible seam through faces at the frame centre).",
+            "References, adapters and options as on ltx25-ic-lora."
+          ]
+        }
+      }
     }
   }
 }

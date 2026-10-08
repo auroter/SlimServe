@@ -1566,3 +1566,100 @@ distilled adapter> 0.25`: 71 s, stage 1 34 s (10 of 20 steps audio-only), a
 clean frame. Tests: `test_video_guidance.py` (the modulo rule, the x0 reuse
 and run flags on a fake DiT, request parsing and defaults, the adapter
 loader and attach/detach, CLI groups).
+
+## 33. Retake (2026-10-08)
+
+`ltx25-retake` = RetakePipeline (`pipeline.retake`), on the distilled
+transformer as upstream's CLI (`video_editing_arg_parser(distilled=True)`):
+the source clip's video and audio latents with only the tokens whose time
+span overlaps [start_time, end_time) regenerated (`sampling.region_mask`,
+upstream TemporalRegionMask over the causal pixel / audio time bounds),
+the 8 distilled sigmas, plain Euler (the stage's default loop; only
+distilled.py passes the ancestral one), no guidance; the dev variant of the
+engine runs the guided 40-step form the class also offers. A source
+without audio gets its audio generated over the whole clip;
+`regenerate_video` / `regenerate_audio` false freeze that modality.
+
+**Source media** (`media.py`): ffmpeg in place of PyAV. Frames: `-sws_flags
+bilinear -pix_fmt rgb24` reproduces `frame.to_rgb().to_ndarray()`
+bit-identically (33 frames, 0 pixels differ). Audio: `-f f32le` at the
+stream's rate and layout; on AAC sources PyAV hands upstream the priming
+frame (packet pts -1024 with skip-samples side data) as a frame at -21 ms
+and upstream trims by that time, so its stream starts 1024 samples into the
+true timeline and ends 1024 short; ffmpeg applies the skip and gives the
+66,000 samples of a 1.375 s clip from t = 0 (ffprobe's decoded frames start
+at pts 0). Kept ours, which is the aligned one; the parity harness aligns
+for the shift. Resampling: torchaudio's `resample` ported (Hann sinc,
+lowpass width 6, rolloff 0.99, one phase per output sample; `media.
+resample_sinc`), the log-mel front end now f_max = sr / 2 (= the config's
+8000).
+
+**Tiled encode** (`VideoVAE.encode_tiled`) rewritten to upstream's current
+`tiled_encode`: latent-grid splits per axis (`split_by_size` with tile =
+max(2, overlap + 1, size // factor); the temporal axis causal: later tiles
+start one latent frame earlier with a one-longer left ramp), pixel windows
+[8 b, 1 + 8 (e - 1)) x [32 b, 32 e), trapezoid blends on the latent grid
+(temporal from 0), no denominator when they partition unity. Retake uses
+upstream's `TileSizeConfig.default()` (frames 80/24, 768/64 px).
+
+**Parity** (`n12_encoders_parity.py`, upstream on the CPU, fp32, a 33-frame
+768x512 clip with AAC audio, tiles 24/16 frames and 256/64 px so the clip is
+3 x 2 x 3 tiles): frames bit-identical; tiled encode rel-L2 **4.1e-6** (the
+untiled one 5.0e-6; upstream's tiled differs from its untiled by 18%, so
+the geometry matters); audio: waveform aligned 1.8e-2 (two AAC decoders;
+3.3e-3 at 16 kHz), log-mel on the same 16 kHz input 4.3e-7, the VAE encoder
+on the same mel **1.3e-6**, tokens end to end 2.5e-3 (the decoder
+difference).
+
+**Smoke** (`n12/retake.mp4`, 768x512x33, region 0.5-1.0 s): 48.8 s; frames
+whose latent span overlaps the region (9-24) move to 21-24 dB from the
+source, the rest stays at 29-30 dB (the VAE round trip); the audio decodes
+through the vocoder, so it is not sample-comparable even where kept.
+
+**1536x1024x121** (`n9_repeat/clip.mp4`, region 2.0-3.5 s): exact
+**744.9 s** (encode 91, the 8 full-resolution steps 544.5 = 68 s each at
+24,576 tokens, decode 97); `ltx25-retake-fast` (step cache 0.10, conv
+decoder) **471.1 s** (stage 345, decode 34). Per-step cost is the stage-2
+forward's: upstream's recipe denoises the whole clip at full resolution.
+
+## 34. IC-LoRA (2026-10-08)
+
+`ltx25-ic-lora` = ICLoraPipeline's CLI recipe (`pipeline.ic_lora`): stage 1
+at half resolution under the adapters with the references, 2x upscale, a
+bare 3-sigma stage 2 (`stage_2_ic_lora`, `skip_stage_2`), plain Euler on
+the distilled sigmas (upstream's stage default; chunked long clips are
+section 30's later item). Pieces, each against upstream's printed values
+(`tests/slimserve/test_video_iclora.py`):
+- `append_reference` grew upstream's `temporal_scale_factor` (times spread
+  by S and shifted back by (S - 1) / fps, clamped at 0) and the attention
+  strength: `sampling.attention_bias` is `build_attention_mask` (existing
+  block kept, new x new 1, noisy x new and new x noisy the per-token weight,
+  prior conditioning x new 0) followed by the transformer's log-space bias
+  (-inf at 0), fp16, consumed by our SDPA as an additive mask; the DFR
+  epilogue's `TiledDenoiser` now slices it per tile.
+- `mask_video_to_tokens` = `downsample_mask_video_to_latent` (area over the
+  latent cells, frame 0 kept, the rest averaged per latent frame; 2e-6).
+- `split_by_size_pinned` / `spatial_tiles_by_size` = FixedSizeSpatialTiling
+  (pinned equal windows, the count grown to the overlap target, remainder to
+  the leading gaps; six cases identical), run through `TiledDenoiser` with
+  the reference tokens' extents scaled by the downscale.
+- the reference: frames by index (ffmpeg as PyAV, bit-identical), resized to
+  fill and center-cropped to the stage size over the downscale, frame 0 then
+  every Sth frame, encoded untiled as the default recipe does; the adapters'
+  metadata (`reference_downscale_factor`, `reference_temporal_scale_factor`)
+  read by `Lora`, conflicts refused as upstream.
+- the mask video decoded at the stage-1 size, grey, [0, 1]
+  (`_load_mask_video`).
+
+Smoke (`n12/iclora.*`): 768x512x33 with the Pixel-Spatial-Upscaler adapter
+at 0.5 as the IC-LoRA and the fox clip as the reference: 39.9 s (reference
+0.5, stage 1 15.1, stage 2 10.8), a coherent clip of the same scene. That
+adapter is a refinement adapter (trained at sigma 0.909 on latent
+references, as DFR uses it), not a control adapter, so the result does not
+follow the reference (12.7 dB), and it was not expected to. Every control
+IC-LoRA Lightricks publishes for 2.5 (Colorization, Deblur, Restore,
+Day-To-Night, Clean-Plate, Alpha-Gen, SDR-To-HDR, ...) is a gated
+repository the account has not been granted (403 on Colorization, 0.9
+GB); an end-to-end "follows the reference" check waits for one of them to
+be accepted. The mechanism itself (`append_reference` + an IC-LoRA) is what
+DFR stage 2 runs, parity-checked in sections 21 and 26.

@@ -263,14 +263,6 @@ def _trapezoid(
     return mx.clip(mask, 0.0, 1.0)
 
 
-def _rect(length: int, left: int, right: int) -> mx.array:
-    m = np.ones(length, dtype=np.float32)
-    m[:left] = 0
-    if right:
-        m[-right:] = 0
-    return mx.array(m)
-
-
 def _split(length: int, size: int, overlap: int) -> list[tuple[int, int, int, int]]:
     """[(start, end, left_ramp, right_ramp)] with symmetric overlaps."""
     if length <= size:
@@ -671,53 +663,56 @@ class VideoVAE:
         return self.normalize(x.transpose(0, 4, 1, 2, 3))
 
     def encode_tiled(self, pixels: mx.array, tiling: Tiling) -> mx.array:
-        """Tiled encode with rectangular masks (upstream prepare_tiles_for_encoding)."""
+        """Upstream VideoEncoder.tiled_encode with a TileSizeConfig (the
+        retake / IC-LoRA source encode: TileSizeConfig.default() is frames
+        80/24, height and width 768/64): the latent grid is split per axis
+        (`to_splitters`: tile = max(2, overlap + 1, size // factor), the
+        temporal axis causal: every tile after the first starts one latent
+        frame earlier with its left ramp one longer), each tile's pixels are
+        encoded on their own (frames [8 b, 1 + 8 (e - 1)), pixels [32 b,
+        32 e)) and blended on the latent grid with per-axis trapezoid masks
+        (the temporal one starting from 0); the masks partition unity, so no
+        denominator unless they do not (then the summed weights)."""
         b, _, f, h, w = pixels.shape
         if (f - 1) % 8:
             pixels = pixels[:, :, : f - (f - 1) % 8]
             f = pixels.shape[2]
-        t_axis = [(slice(0, None), slice(0, None), None)]
-        if tiling.temporal:
-            size, ov = tiling.temporal[0], max(tiling.temporal[1], 16)
-            ivs, t_axis = _split(f, size, ov), []
-            for i, (s, e, lr, _) in enumerate(ivs):
-                if len(ivs) > 1 and i < len(ivs) - 1:
-                    e += 1
-                lo, hi = s // SCALE_T, (e - 1) // SCALE_T + 1
-                t_axis.append(
-                    (
-                        slice(s, e),
-                        slice(lo, hi),
-                        _rect(hi - lo, 0 if lr == 0 else 1 + (lr - 1) // SCALE_T, 0),
-                    )
-                )
-        s_axes = []
-        for n in (h, w):
-            if tiling.spatial:
-                size, ov = tiling.spatial[0], max(tiling.spatial[1], 64)
-                s_axes.append(
-                    [
-                        (
-                            slice(s, e),
-                            slice(s // SCALE_S, e // SCALE_S),
-                            _rect(
-                                (e - s) // SCALE_S,
-                                max(0, lr // SCALE_S - 1),
-                                1 if rr else 0,
-                            ),
-                        )
-                        for s, e, lr, rr in _split(n, size, ov)
-                    ]
-                )
-            else:
-                s_axes.append([(slice(0, None), slice(0, None), None)])
-        buf = mx.zeros((b, 128, (f - 1) // 8 + 1, h // SCALE_S, w // SCALE_S))
-        wts = mx.zeros_like(buf)
-        for t, y, x in itertools.product(t_axis, *s_axes):
-            lat = self.encode(pixels[:, :, t[0], y[0], x[0]])
-            mask = _axis_mask(t[2], 2) * _axis_mask(y[2], 3) * _axis_mask(x[2], 4)
-            at = (slice(None), slice(None), t[1], y[1], x[1])
-            buf[at] = buf[at] + lat * mask
-            wts[at] = wts[at] + mask
+        lf, lh, lw = (f - 1) // SCALE_T + 1, h // SCALE_S, w // SCALE_S
+
+        def axis(cfg, factor, length, temporal):
+            if cfg is None:
+                return [(0, length, 0, 0)]
+            size, overlap = cfg[0] // factor, cfg[1] // factor
+            size = max(2, overlap + 1, size)
+            ivs = _split(length, size, overlap)
+            if temporal and len(ivs) > 1:
+                ivs = [ivs[0]] + [(s - 1, e, lr + 1, rr) for s, e, lr, rr in ivs[1:]]
+            return ivs
+
+        t_ivs = axis(tiling.temporal, SCALE_T, lf, True)
+        h_ivs = axis(tiling.spatial, SCALE_S, lh, False)
+        w_ivs = axis(tiling.spatial, SCALE_S, lw, False)
+        buf = mx.zeros((b, 128, lf, lh, lw))
+        wts = mx.zeros((lf, lh, lw))
+        for (ts, te, tl, tr), (hs, he, hl, hr), (ws, we, wl, wr) in itertools.product(
+            t_ivs, h_ivs, w_ivs
+        ):
+            tile = pixels[
+                :,
+                :,
+                ts * SCALE_T : 1 + (te - 1) * SCALE_T,
+                hs * SCALE_S : he * SCALE_S,
+                ws * SCALE_S : we * SCALE_S,
+            ]
+            lat = self.encode(tile)
+            mt = _trapezoid(te - ts, tl, tr, True)
+            mh = _trapezoid(he - hs, hl, hr, False)
+            mw = _trapezoid(we - ws, wl, wr, False)
+            mask = mt[:, None, None] * mh[None, :, None] * mw[None, None, :]
+            at = (slice(None), slice(None), slice(ts, te), slice(hs, he), slice(ws, we))
+            buf[at] = buf[at] + lat * mask[None, None]
+            wts[ts:te, hs:he, ws:we] = wts[ts:te, hs:he, ws:we] + mask
             mx.eval(buf, wts)
-        return buf / mx.maximum(wts, 1e-8)
+        if bool(mx.all(mx.abs(wts - 1.0) <= 1e-5).item()):
+            return buf
+        return buf / mx.maximum(wts, 1e-8)[None, None]

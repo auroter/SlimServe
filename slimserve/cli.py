@@ -120,6 +120,43 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         help="strength of the first --image, 0-1 (default 1.0)",
     )
+    video.add_argument("--video-path", help="retake: the source clip (mp4/mov)")
+    video.add_argument(
+        "--start-time", type=float, help="retake: start of the region to regenerate (s)"
+    )
+    video.add_argument(
+        "--end-time", type=float, help="retake: end of the region to regenerate (s)"
+    )
+    video.add_argument(
+        "--video-conditioning",
+        nargs="+",
+        action="append",
+        metavar=("PATH", "STRENGTH"),
+        help="ic_lora: a reference video (the control signal) and its strength "
+        "(default 1.0), repeatable",
+    )
+    video.add_argument(
+        "--conditioning-attention-mask",
+        nargs=2,
+        metavar=("MASK_PATH", "STRENGTH"),
+        help="ic_lora: a grayscale mask video scaling the reference attention per "
+        "region, times STRENGTH",
+    )
+    video.add_argument(
+        "--skip-stage-2", action="store_true", help="ic_lora: ship stage 1 (half size)"
+    )
+    video.add_argument(
+        "--stage-2-ic-lora",
+        action="store_true",
+        help="ic_lora: keep the adapter and the references in stage 2",
+    )
+    video.add_argument(
+        "--tile",
+        action="store_true",
+        help="ic_lora: run each transformer call over pinned spatial windows",
+    )
+    video.add_argument("--tile-height", type=int, help="ic_lora --tile: window height")
+    video.add_argument("--tile-width", type=int, help="ic_lora --tile: window width")
     video.add_argument(
         "--lora",
         nargs="+",

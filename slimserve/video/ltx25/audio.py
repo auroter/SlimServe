@@ -174,9 +174,9 @@ def encode_mel(w: dict[str, mx.array], mel: mx.array) -> mx.array:
     x = v.conv(p + ".conv_out", _silu(_pixel_norm(v.mid(p, x))))
     b, t = x.shape[0], x.shape[1]
     x = x[..., :LATENT_CHANNELS].transpose(0, 1, 3, 2).reshape(b, t, -1)
-    x = (x - w["audio_vae.per_channel_statistics.mean-of-means"]) / (
-        w["audio_vae.per_channel_statistics.std-of-means"] + 1e-8
-    )
+    x = (x - w["audio_vae.per_channel_statistics.mean-of-means"]) / w[
+        "audio_vae.per_channel_statistics.std-of-means"
+    ]
     return unpatchify(x)
 
 
@@ -428,22 +428,18 @@ def _slaney_filterbank(
 
 
 def waveform_to_mel(waveform: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
-    """16 kHz waveform (C, T) -> log-mel (1, C, T', 64) as the VAE encoder expects
-    (Slaney mel, centered reflect-padded STFT, magnitude). Resampling to 16 kHz
-    is the caller's job (ffmpeg). Ported from the runner; not parity-gated yet."""
+    """16 kHz waveform (C, T) -> log-mel (1, C, T', 64) as the VAE encoder expects:
+    upstream AudioProcessor.waveform_to_mel, a torchaudio MelSpectrogram with
+    f_min 0, f_max sr / 2, Slaney scale and norm, power 1, Hann window, centered
+    reflect padding, then log(clamp(mel, 1e-5)). Resampling to 16 kHz is the
+    caller's job (`media.resample_sinc`)."""
     pre = cfg["audio_vae"]["preprocessing"]
     sr, n_fft, hop = (
         pre["audio"]["sampling_rate"],
         pre["stft"]["filter_length"],
         pre["stft"]["hop_length"],
     )
-    fb = _slaney_filterbank(
-        sr,
-        n_fft,
-        pre["mel"]["n_mel_channels"],
-        pre["mel"]["mel_fmin"],
-        pre["mel"]["mel_fmax"],
-    )
+    fb = _slaney_filterbank(sr, n_fft, pre["mel"]["n_mel_channels"], 0.0, sr / 2.0)
     window = np.hanning(n_fft + 1)[:-1].astype(np.float32)
     out = []
     for ch in np.asarray(waveform, dtype=np.float32):
@@ -494,11 +490,16 @@ class AudioDecoder:
         mx.eval(wav)
         return np.array(wav[0]), self.sample_rate
 
-    def encode(self, waveform_16k: np.ndarray) -> mx.array:
-        """16 kHz stereo (2, T) -> normalized tokens (1, T_latent, 128)."""
+    def encode(self, waveform: np.ndarray, sample_rate: int = 16000) -> mx.array:
+        """(channels, T) float waveform at `sample_rate` -> normalized tokens
+        (1, T_latent, 128): upstream encode_audio (resample to 16 kHz, log-mel,
+        the encoder's posterior mean, per-channel normalization)."""
         if not self.with_encoder:
             raise RuntimeError("AudioDecoder(encoder=True) is required to encode")
         self.load()
-        return patchify(
-            encode_mel(self.w, mx.array(waveform_to_mel(waveform_16k, self.cfg)))
+        from slimserve.video.ltx25 import media
+
+        wav = media.resample_sinc(
+            np.asarray(waveform, dtype=np.float32), sample_rate, 16000
         )
+        return patchify(encode_mel(self.w, mx.array(waveform_to_mel(wav, self.cfg))))

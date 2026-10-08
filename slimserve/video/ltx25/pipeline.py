@@ -383,12 +383,16 @@ class TiledDenoiser:
                 return None if z is None else mx.take(z, idx, axis=1)
 
             pos = take(video.positions) - mx.array([0.0, t.h0 * 32.0, t.w0 * 32.0])
+            mask = video.attention_mask
+            if mask is not None:
+                mask = mx.take(mx.take(mask, idx, axis=1), idx, axis=2)
             sub = sampling.LatentState(
                 latent=take(video.latent),
                 clean=take(video.clean),
                 denoise_mask=take(video.denoise_mask),
                 positions=pos,
                 keyframes_mask=take(video.keyframes_mask),
+                attention_mask=mask,
                 frozen=video.frozen,
             )
             v0, a0 = self.inner(sub, audio, take(vx), ax, sigma)
@@ -548,13 +552,95 @@ class LTX25Engine:
             self.upscaler.load()
         return self.upscaler
 
-    def load_audio(self):
-        if self.audio is None:
+    def load_audio(self, encoder: bool = False):
+        """The audio VAE decoder + vocoder; `encoder` adds the VAE encoder (the
+        editing pipelines' source audio) to the resident set."""
+        if self.audio is None or (encoder and not self.audio.with_encoder):
             from slimserve.video.ltx25.audio import AudioDecoder
 
-            self.audio = AudioDecoder(self.root)
+            self.audio = AudioDecoder(self.root, encoder=encoder)
             self.audio.load()
         return self.audio
+
+    # ---- source clips (retake, IC-LoRA, A2Vid, DubIt) ----------------------------
+    SOURCE_ENCODE_TILING = ((768, 64), (80, 24))  # upstream TileSizeConfig.default()
+
+    def _source_video_latent(
+        self,
+        path: str,
+        info,
+        height: int,
+        width: int,
+        tm: Timings,
+        start_time: float = 0.0,
+        num_frames: int | None = None,
+        fps: float | None = None,
+    ) -> mx.array:
+        """Upstream video_latent_from_file: the frames in [start_time, start_time
+        + num_frames / fps) decoded (`media.read_frames`), resized to fill and
+        center-cropped to height x width and mapped to [-1, 1] as the stills
+        are, tiled-encoded (frames 80/24, 768/64 px), the latent length
+        conformed to the clip's (trimmed, or zero-padded at the end)."""
+        from slimserve.video.ltx25 import image as image_mod
+        from slimserve.video.ltx25 import media
+        from slimserve.video.ltx25.vae import Tiling
+
+        fps = fps or info.fps
+        num_frames = num_frames or info.frames
+        with tm.span("encode_video"):
+            frames = media.read_frames(path, info, start_time, num_frames / fps)
+            if frames.shape[0] == 0:
+                raise ValueError(f"{path}: no frames from {start_time:.3f} s")
+            pixels = np.stack(
+                [
+                    image_mod.resize_and_center_crop(
+                        f.astype(np.float32), height, width
+                    )
+                    for f in frames
+                ]
+            )
+            pixels = mx.array((pixels / 127.5 - 1.0).transpose(3, 0, 1, 2))[None]
+            spatial, temporal = self.SOURCE_ENCODE_TILING
+            latent = self.load_vae().encode_tiled(
+                pixels, Tiling(spatial=spatial, temporal=temporal)
+            )
+            want = (num_frames - 1) // 8 + 1
+            latent = latent[:, :, :want]
+            if latent.shape[2] < want:
+                pad = mx.zeros((1, 128, want - latent.shape[2], *latent.shape[3:]))
+                latent = mx.concatenate([latent, pad], axis=2)
+            mx.eval(latent)
+            del pixels, frames
+        return latent
+
+    def _source_audio_tokens(
+        self,
+        path: str,
+        info,
+        num_frames: int,
+        fps: float,
+        tm: Timings,
+        start_time: float = 0.0,
+    ) -> mx.array | None:
+        """Upstream audio_latent_from_file: the stream's samples in the window,
+        resampled to 16 kHz, log-mel, the VAE encoder, conformed to the clip's
+        token count; None without an audio stream."""
+        from slimserve.video.ltx25 import media
+
+        audio = media.read_audio(path, info, start_time, num_frames / fps)
+        if audio is None:
+            return None
+        with tm.span("encode_audio"):
+            wav, rate = audio
+            tokens = self.load_audio(encoder=True).encode(wav, rate)
+            want = sampling.audio_token_count(num_frames, fps)
+            tokens = tokens[:, :want]
+            if tokens.shape[1] < want:
+                tokens = mx.concatenate(
+                    [tokens, mx.zeros((1, want - tokens.shape[1], 128))], axis=1
+                )
+            mx.eval(tokens)
+        return tokens
 
     def load_duration(self):
         if self.duration is None:
@@ -1779,6 +1865,501 @@ class LTX25Engine:
         return Result(
             sampling.unpatchify(v[:, : f * h * w], (f, h, w)),
             a,
+            num_frames,
+            height,
+            width,
+            fps,
+            tm,
+            predicted_seconds=predicted,
+        )
+
+    # ---- retake -----------------------------------------------------------------
+    def retake(
+        self,
+        prompt: str,
+        video_path: str,
+        start_time: float,
+        end_time: float,
+        seed: int = 42,
+        negative_prompt: str | None = None,
+        steps: int = 40,
+        video_guidance: sampling.Guidance = DEFAULT_VIDEO_GUIDANCE,
+        audio_guidance: sampling.Guidance = DEFAULT_AUDIO_GUIDANCE,
+        regenerate_video: bool = True,
+        regenerate_audio: bool = True,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+        fast: Fast | None = None,
+        batched: bool = True,
+    ) -> Result:
+        """Lightricks' RetakePipeline: the source clip (its own size, frame
+        count and rate; 8k + 1 frames, sides multiples of 32) is encoded to
+        video and audio latents, and only the tokens whose time span overlaps
+        [start_time, end_time) are regenerated from the prompt
+        (TemporalRegionMask), the rest stays the source. On the distilled
+        transformer (upstream's CLI): the 8 distilled sigmas, plain Euler, no
+        guidance; on the dev transformer: `steps` guided steps with the
+        negative prompt. A source without audio gets its audio generated over
+        the whole clip; `regenerate_video` / `regenerate_audio` False keeps
+        that modality frozen. `fast` applies its step cache and sigma override."""
+        from slimserve.video.ltx25 import media
+
+        if start_time >= end_time:
+            raise ValueError("start_time must be less than end_time")
+        fast = fast or Fast()
+        if fast.steps:
+            steps = fast.steps
+        if fast.guidance:
+            video_guidance = replace(video_guidance, **fast.guidance)
+            audio_guidance = replace(audio_guidance, **fast.guidance)
+        info = media.probe(video_path)
+        if (info.frames - 1) % 8:
+            snapped = (info.frames - 1) // 8 * 8 + 1
+            raise ValueError(
+                f"the source has {info.frames} frames; retake needs 8k + 1 "
+                f"(trim it to {snapped})"
+            )
+        if info.width % 32 or info.height % 32:
+            raise ValueError(
+                f"the source is {info.width}x{info.height}; sides must be "
+                "multiples of 32"
+            )
+        guided = self.variant == "dev"
+        tm = Timings()
+        with tm.span("text"):
+            text = self.load_text()
+            cond = text.encode(prompt)[:2]
+            neg = None
+            if guided:
+                neg = text.encode(
+                    sampling.DEFAULT_NEGATIVE_PROMPT
+                    if negative_prompt is None
+                    else negative_prompt
+                )[:2]
+                mx.eval(cond, neg)
+            else:
+                mx.eval(cond)
+            if not keep_text:
+                self.unload_text()
+        with tm.span("load"):
+            dit = self.load_dit()
+            self.load_vae()
+        num_frames, fps = info.frames, info.fps
+        f, h, w = sampling.video_latent_shape(num_frames, info.height, info.width)
+        source = self._source_video_latent(
+            video_path, info, info.height, info.width, tm
+        )
+        audio_src = self._source_audio_tokens(video_path, info, num_frames, fps, tm)
+        audio_t = sampling.audio_token_count(num_frames, fps)
+        stepper = self._stepper(tm, on_step)
+
+        with tm.span("stage1"):
+            video = sampling.noised_state(
+                (1, f * h * w, 128),
+                sampling.video_positions(f, h, w, fps),
+                seed,
+                initial=sampling.patchify(source),
+                tokens_per_frame=h * w,
+                bf16_noise=self.bf16_noise,
+            )
+            if regenerate_video:
+                video = sampling.region_mask(video, start_time, end_time, fps, h * w)
+            else:
+                video = replace(
+                    video,
+                    latent=video.clean,
+                    denoise_mask=mx.zeros_like(video.denoise_mask),
+                    frozen=True,
+                )
+            audio = sampling.noised_state(
+                (1, audio_t, 128),
+                sampling.audio_positions(audio_t),
+                seed + 1,
+                initial=audio_src,
+                bf16_noise=self.bf16_noise,
+            )
+            if audio_src is None:
+                pass  # no audio track: generated from scratch over the clip
+            elif regenerate_audio:
+                audio = sampling.region_mask(audio, start_time, end_time, fps, None)
+            else:
+                audio = replace(
+                    audio,
+                    latent=audio.clean,
+                    denoise_mask=mx.zeros_like(audio.denoise_mask),
+                    frozen=True,
+                )
+            mx.eval(video.latent, video.denoise_mask, audio.latent, audio.denoise_mask)
+            if guided:
+                denoise = GuidedDenoiser(
+                    dit, cond, neg, video_guidance, audio_guidance, batched
+                )
+                sigmas = sampling.ltx2_schedule(steps, 4096)
+            else:
+                denoise = Denoiser(
+                    dit, *cond, video_tiles=fast.tiles(f, h, w, video.latent.shape[1])
+                )
+                sigmas = fast.sigmas1(sampling.DISTILLED_SIGMAS)
+            # upstream's stage runs its default loop here: plain Euler
+            v, a = sampling.euler_loop(
+                denoise,
+                video,
+                audio,
+                sigmas,
+                on_step=stepper("stage1"),
+                step_cache=fast.cache(),
+            )
+        return Result(
+            sampling.unpatchify(v, (f, h, w)),
+            a,
+            num_frames,
+            info.height,
+            info.width,
+            fps,
+            tm,
+        )
+
+    # ---- IC-LoRA (video-to-video) ---------------------------------------------
+    IC_LORA_TILE = (1024, 1536)  # upstream LTX_2_PARAMS stage 2 (height, width)
+
+    def _reference_tokens(
+        self,
+        path: str,
+        info,
+        height: int,
+        width: int,
+        num_frames: int,
+        downscale: int,
+        temporal_scale: int,
+        tm: Timings,
+    ) -> tuple[mx.array, tuple[int, int, int]]:
+        """Upstream append_ic_lora_reference_video_conditionings: the first
+        num_frames frames of the reference (by index), resized to fill and
+        center-cropped to the stage's size over `downscale`, frame 0 then every
+        `temporal_scale`th frame kept, encoded untiled. Returns the patchified
+        tokens and the latent (f, h, w)."""
+        from slimserve.video.ltx25 import image as image_mod
+        from slimserve.video.ltx25 import media
+
+        if height % downscale or width % downscale:
+            raise ValueError(
+                f"{width}x{height} must be divisible by the adapter's "
+                f"reference_downscale_factor {downscale}"
+            )
+        rh, rw = height // downscale, width // downscale
+        with tm.span("reference"):
+            frames = media.read_frames(path, info, 0.0, num_frames / info.fps)[
+                :num_frames
+            ]
+            if frames.shape[0] == 0:
+                raise ValueError(f"{path}: no frames")
+            if temporal_scale > 1:
+                frames = frames[[0, *range(1, frames.shape[0], temporal_scale)]]
+            pixels = np.stack(
+                [
+                    image_mod.resize_and_center_crop(fr.astype(np.float32), rh, rw)
+                    for fr in frames
+                ]
+            )
+            pixels = mx.array((pixels / 127.5 - 1.0).transpose(3, 0, 1, 2))[None]
+            latent = self.load_vae().encode(pixels)
+            mx.eval(latent)
+            del pixels, frames
+        _, _, f, h, w = latent.shape
+        return sampling.patchify(latent), (f, h, w)
+
+    def ic_lora(
+        self,
+        prompt: str,
+        video_conditioning: list[tuple[str, float]],
+        loras: list[tuple[str, float]],
+        height: int = 1024,
+        width: int = 1536,
+        num_frames: int | None = 121,
+        fps: float = 24.0,
+        seed: int = 42,
+        images: list[sampling.Still] | None = None,
+        image: str | bytes | None = None,
+        image_strength: float = 1.0,
+        attention_strength: float = 1.0,
+        attention_mask: str | None = None,
+        skip_stage_2: bool = False,
+        stage_2_ic_lora: bool = False,
+        tile: bool = False,
+        tile_height: int | None = None,
+        tile_width: int | None = None,
+        keep_text: bool = True,
+        on_step: Callable[[str, int, float], None] | None = None,
+        fast: Fast | None = None,
+        max_num_frames: int | None = None,
+    ) -> Result:
+        """Lightricks' ICLoraPipeline, the CLI's two-stage recipe: stage 1 at
+        half resolution on the distilled transformer under the IC-LoRA
+        adapters (`loras`: path, strength; their metadata sets the reference
+        downscale and temporal factors), the 8 distilled sigmas, plain Euler,
+        with each reference video (`video_conditioning`: path, strength)
+        encoded at the stage's size and appended as clean reference tokens
+        (VideoConditionByReferenceLatent); then the 2x latent upscale and a
+        3-sigma stage 2 on the bare checkpoint (`stage_2_ic_lora` keeps the
+        adapters and references there too; `skip_stage_2` ships stage 1 at
+        half size). `attention_strength` (0-1) and `attention_mask` (a
+        grayscale mask video, per region) scale how strongly the reference
+        tokens and the target attend to each other. `tile` runs each
+        transformer call over pinned `tile_height` x `tile_width` windows
+        (default 1024x1536, half overlap) blended with trapezoids; a tiled
+        full-resolution stage needs `stage_2_ic_lora`. Stills condition as
+        on `distilled`."""
+        from slimserve.video.ltx25 import media
+        from slimserve.video.ltx25.lora import Lora
+
+        if self.variant != "distilled":
+            raise ValueError("the IC-LoRA pipeline runs on the distilled transformer")
+        if not video_conditioning:
+            raise ValueError("ic_lora needs at least one reference video")
+        if not loras:
+            raise ValueError(
+                "ic_lora needs the IC-LoRA adapter (--lora PATH [STRENGTH])"
+            )
+        if not 0.0 <= attention_strength <= 1.0:
+            raise ValueError("attention_strength must be in [0, 1]")
+        fast = fast or Fast()
+        adapters = []
+        downscale, temporal_scale = 1, 1
+        for path, strength in loras:
+            key = str(Path(path).expanduser().resolve())
+            lora = self.user_lora_cache.get(key)
+            if lora is None:
+                lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+            for name, have, got in (
+                ("reference_downscale_factor", downscale, lora.reference_downscale),
+                (
+                    "reference_temporal_scale_factor",
+                    temporal_scale,
+                    lora.reference_temporal_scale,
+                ),
+            ):
+                if got != 1 and have not in (1, got):
+                    raise ValueError(f"conflicting {name} values in the adapters")
+            downscale = max(downscale, lora.reference_downscale)
+            temporal_scale = max(temporal_scale, lora.reference_temporal_scale)
+            adapters.append((lora, strength))
+        if tile:
+            th = tile_height or self.IC_LORA_TILE[0]
+            tw = tile_width or self.IC_LORA_TILE[1]
+            if th < 64 or tw < 64 or th % 32 or tw % 32:
+                raise ValueError("tile sizes must be multiples of 32, at least 64")
+            tiled_stage_2 = not skip_stage_2 and (height > th or width > tw)
+            if tiled_stage_2 and not stage_2_ic_lora:
+                raise ValueError(
+                    "a tiled full-resolution stage needs the IC-LoRA on it "
+                    "(stage_2_ic_lora)"
+                )
+        elif tile_height is not None or tile_width is not None:
+            raise ValueError("tile_height / tile_width need tile")
+        tm = Timings()
+        with tm.span("text"):
+            video_text, audio_text = self.load_text().encode(prompt)[:2]
+            mx.eval(video_text, audio_text)
+            if not keep_text:
+                self.unload_text()
+        num_frames, predicted = self.resolve_frames(
+            num_frames, video_text, audio_text, fps, max_num_frames
+        )
+        with tm.span("load"):
+            dit = self.load_dit()
+            vae = self.load_vae()
+            upscaler = None if skip_stage_2 else self.load_upscaler()
+        height, width = sampling.snap_dimensions(
+            height, width, two_stage=not skip_stage_2
+        )
+        infos = {path: media.probe(path) for path, _ in video_conditioning}
+        mask_video = None
+        if attention_mask is not None:
+            # upstream _load_mask_video: decoded at the stage-1 size, grey, [0, 1]
+            minfo = media.probe(attention_mask)
+            frames = media.read_frames(attention_mask, minfo)[:num_frames]
+            from slimserve.video.ltx25 import image as image_mod
+
+            mask_video = np.stack(
+                [
+                    image_mod.resize_and_center_crop(
+                        fr.astype(np.float32), height // 2, width // 2
+                    ).mean(axis=-1)
+                    / 255.0
+                    for fr in frames
+                ]
+            ).clip(0.0, 1.0)
+        f, h1, w1 = sampling.video_latent_shape(num_frames, height // 2, width // 2)
+        audio_t = sampling.audio_token_count(num_frames, fps)
+        apos = sampling.audio_positions(audio_t)
+        stepper = self._stepper(tm, on_step)
+        stills = self._prepare_images(image, image_strength, images, num_frames)
+
+        def conditioned(video, h, w, sigma, stage_seed, with_reference):
+            """The stage's conditioned state and, for the tiled stages, every
+            token's cell extent on the target grid (generated and keyframe
+            tokens: their cell; reference tokens: their cell times the
+            downscale, as the DFR epilogue's extents)."""
+            n_noisy = f * h * w
+            yy, xx = np.divmod(np.arange(n_noisy) % (h * w), w)
+            extents = [np.stack([yy, yy + 1, xx, xx + 1], axis=1).astype(np.float32)]
+            video = self._condition(
+                video, self._image_latents(stills, h, w, tm), fps, sigma, stage_seed
+            )
+            for _ in range((video.latent.shape[1] - n_noisy) // (h * w)):
+                extents.append(extents[0][: h * w])
+            if with_reference:
+                for path, strength in video_conditioning:
+                    tokens, (rf, rh, rw) = self._reference_tokens(
+                        path,
+                        infos[path],
+                        h * 32,
+                        w * 32,
+                        num_frames,
+                        downscale,
+                        temporal_scale,
+                        tm,
+                    )
+                    weights = None
+                    if mask_video is not None:
+                        weights = sampling.mask_video_to_tokens(mask_video, rf, rh, rw)
+                        weights = weights * attention_strength
+                    elif attention_strength < 1.0:
+                        weights = attention_strength
+                    video = sampling.append_reference(
+                        video,
+                        tokens,
+                        sampling.video_positions(rf, rh, rw, fps),
+                        downscale,
+                        strength,
+                        temporal_scale,
+                        fps,
+                        weights,
+                        n_noisy,
+                    )
+                    ry, rx = np.divmod(np.arange(rf * rh * rw) % (rh * rw), rw)
+                    extents.append(
+                        np.stack(
+                            [
+                                ry * downscale,
+                                (ry + 1) * downscale,
+                                rx * downscale,
+                                (rx + 1) * downscale,
+                            ],
+                            axis=1,
+                        ).astype(np.float32)
+                    )
+            mx.eval(video.latent, video.clean, video.positions)
+            return video, np.concatenate(extents)
+
+        def tiles_for(h, w):
+            if not tile:
+                return None
+            th_c, tw_c = th // 32, tw // 32
+            return sampling.spatial_tiles_by_size(
+                h, w, th_c, tw_c, int(th * 0.5) // 32, int(tw * 0.5) // 32
+            )
+
+        def run(stage, video, extents, audio, sigmas, h, w, lora_on, stage_tiles):
+            den = Denoiser(
+                dit,
+                video_text,
+                audio_text,
+                video_tiles=None
+                if stage_tiles
+                else fast.tiles(f, h, w, video.latent.shape[1]),
+            )
+            if stage_tiles is not None:
+                den = TiledDenoiser(den, f, h, w, extents, stage_tiles)
+            for lora, strength in adapters if lora_on else ():
+                lora.attach(dit, strength)
+            try:
+                return sampling.euler_loop(
+                    den,
+                    video,
+                    audio,
+                    sigmas,
+                    on_step=stepper(stage),
+                    step_cache=fast.cache() if stage_tiles is None else None,
+                )
+            finally:
+                for lora, _ in adapters if lora_on else ():
+                    lora.detach(dit)
+
+        with tm.span("stage1"):
+            video = sampling.noised_state(
+                (1, f * h1 * w1, 128),
+                sampling.video_positions(f, h1, w1, fps),
+                seed,
+                tokens_per_frame=h1 * w1,
+                bf16_noise=self.bf16_noise,
+            )
+            video, extents = conditioned(video, h1, w1, 1.0, seed, True)
+            audio = sampling.noised_state(
+                (1, audio_t, 128), apos, seed + 1, bf16_noise=self.bf16_noise
+            )
+            v1, a1 = run(
+                "stage1",
+                video,
+                extents,
+                audio,
+                fast.sigmas1(sampling.DISTILLED_SIGMAS),
+                h1,
+                w1,
+                True,
+                tiles_for(h1, w1),
+            )
+        if skip_stage_2:
+            return Result(
+                sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1)),
+                a1,
+                num_frames,
+                height // 2,
+                width // 2,
+                fps,
+                tm,
+                predicted_seconds=predicted,
+            )
+        with tm.span("upscale"):
+            half = sampling.unpatchify(v1[:, : f * h1 * w1], (f, h1, w1))
+            up = vae.normalize(upscaler(vae.denormalize(half)))
+            mx.eval(up)
+        h2, w2 = h1 * 2, w1 * 2
+        with tm.span("stage2"):
+            sigmas2 = fast.sigmas2(sampling.STAGE_2_DISTILLED_SIGMAS)
+            s0 = sigmas2[0]
+            video = sampling.noised_state(
+                (1, f * h2 * w2, 128),
+                sampling.video_positions(f, h2, w2, fps),
+                seed + 2,
+                sigma=s0,
+                initial=sampling.patchify(up),
+                tokens_per_frame=h2 * w2,
+                bf16_noise=self.bf16_noise,
+            )
+            video, extents = conditioned(video, h2, w2, s0, seed + 2, stage_2_ic_lora)
+            audio = sampling.noised_state(
+                (1, audio_t, 128),
+                apos,
+                seed + 2,
+                sigma=s0,
+                initial=a1,
+                bf16_noise=self.bf16_noise,
+            )
+            v2, a2 = run(
+                "stage2",
+                video,
+                extents,
+                audio,
+                sigmas2,
+                h2,
+                w2,
+                stage_2_ic_lora,
+                tiles_for(h2, w2),
+            )
+        return Result(
+            sampling.unpatchify(v2[:, : f * h2 * w2], (f, h2, w2)),
+            a2,
             num_frames,
             height,
             width,

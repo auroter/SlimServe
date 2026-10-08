@@ -29,6 +29,7 @@ class Lora:
         self.path = checkpoints.path_of(component, root)
         self.pairs: dict[str, tuple[mx.array, mx.array]] = {}
         self.reference_downscale = 1
+        self.reference_temporal_scale = 1
 
     @classmethod
     def from_path(cls, path: str | Path) -> Lora:
@@ -39,6 +40,7 @@ class Lora:
             raise FileNotFoundError(f"LoRA file not found: {self.path}")
         self.pairs = {}
         self.reference_downscale = 1
+        self.reference_temporal_scale = 1
         return self
 
     def load(self) -> Lora:
@@ -47,6 +49,9 @@ class Lora:
         header = checkpoints.read_header(self.path)
         self.reference_downscale = int(
             header.metadata.get("reference_downscale_factor", 1)
+        )
+        self.reference_temporal_scale = int(
+            header.metadata.get("reference_temporal_scale_factor", 1)
         )
         raw = checkpoints.cast_operands(checkpoints.load_raw(self.path))
         for key in [k for k in raw if k.endswith(".lora_A.weight")]:
