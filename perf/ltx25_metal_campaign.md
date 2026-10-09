@@ -1898,3 +1898,54 @@ std 0.052). The fast tier's saving sits in stage 2 (its step cache; stage 1
 is the same 8 distilled steps). End-to-end quality of the chunked editing
 flows waits, like the unchunked ones (sections 35, 37), on the gated
 Lightricks adapters.
+
+## 43. The gated adapters: Alpha-Gen, Colorization, SDR-To-HDR end to end (2026-10-08)
+
+The user accepted the three Lightricks terms pages, and the four files
+sit in `~/models/ltx-2.5/official/loras/` (alpha-gen-0.9 1.25 GB,
+sdr-to-hdr-1.0 1.25 GB + scene-emb 12 MB, colorization-0.9 864 MB). The
+sources in the scratch folder are a snowy forest with no subject, so the
+test clip is our own: `n12/fox65.mp4`, `ltx25-distilled` 768x512x65 with
+audio (58.8 s), a red fox standing in a clearing, and `fox65_gray.mp4`
+(`hue=s=0`, crf 12) for the colorizer. Everything below is
+`perf/ltx25_harness/gpu_run.py`-serialized, seed 7, with the frames at 0 /
+32 / 64 tiled for review (`n12/*_tile.png`, `hdr_fox_preview.png`).
+
+**Alpha-Gen** (`ltx25-alpha`, `n12/alpha_fox.*`): a clean white fox
+silhouette on black, every frame, tail and ears included; 405.9 s (stage
+383.0 s: 30 steps x 1 pass over 6,144 target + 6,144 reference tokens on
+the dev transformer at full resolution — this pipeline has no half-res
+stage). The fast tier is new, `ltx25-alpha-fast` (`fast.step_cache` 0.10
++ the conv decoder, the only two levers the one-stage reference loop
+takes): **191.2 s** (2.12x), the matte's foreground IoU vs the exact one
+0.991, mean abs 3.3e-4. On the way: a reference shorter than the clip is
+a cap, not an error (upstream `frame_cap`); `_reference_tokens` trims it
+to the grid.
+
+**Colorization through `ltx25-ic-lora`** (`n12/color_ltx25-ic-lora*.*`):
+the grayscale fox back in colour — orange fox, green pines, blue-white
+snow, golden light — 78.2 s exact, **61.9 s** fast. Against the colour
+original: chroma correlation 0.74 / 0.76 (the grey input −0.06), chroma
+MAE 0.024 / 0.023 (grey 0.036); luma MAE 0.056 (the regeneration shifts
+exposure, so PSNR is the wrong yardstick for this adapter).
+
+**SDR-To-HDR** (`ltx25-hdr-ic-lora`, `n12/hdr_fox*`): 65 ACEScg EXR frames
+and the HLG master (HEVC yuv420p10le, arib-std-b67 / bt2020, 65 frames);
+scene-linear values up to 2.93 with 23% of the pixels above 1.0 (the lit
+snow), luma correlation with the SDR source 0.99 per frame; 160.8 s
+(stage 127.5 s: 8 distilled steps over 6,144 + 6,144 + the seam slot and
+guide). The fast tier is new, `ltx25-hdr-ic-lora-fast` (step cache 0.10 +
+conv decoder, which drops the keyframe-aware decode): **123.4 s** (1.30x),
+rel-L2 against the exact EXRs 0.071 (the decoder swap is most of it;
+highlight fraction 0.237 vs 0.217).
+
+**Dub-It** stays a mechanics check (section 36): upstream wants "the
+Dub-It IC-LoRA", and Lightricks' LTX-2.5 listing on the Hub (18 repos)
+has no such adapter — Colorization, Deblur, Restore, Day-To-Night,
+Clean-Plate, Alpha-Gen, SDR-To-HDR, Refine-Details, Decompression,
+Layout-To-Render, Water-Simulation, Ingredients, Pixel-Spatial-Upscaler
+and the two plain LoRAs are what exists.
+
+Fast-tier coverage is now every profile but `ltx25-t2a`, whose 21.7 s is
+13 s of text encoding and model load around an 8 s audio stage; a step
+cache there would save a second or two and is not worth a record.

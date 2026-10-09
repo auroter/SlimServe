@@ -2351,10 +2351,9 @@ class LTX25Engine:
             if frames.shape[0] == 0:
                 raise ValueError(f"{path}: no frames from frame {start_frame}")
             if frames.shape[0] < num_frames:
-                raise ValueError(
-                    f"{path}: reference frames [{start_frame}, "
-                    f"{start_frame + num_frames}) run past its {info.frames} frames"
-                )
+                # a reference shorter than the clip conditions the frames it
+                # has (upstream's frame_cap is a cap); keep it on the grid
+                frames = frames[: (frames.shape[0] - 1) // 8 * 8 + 1]
             if temporal_scale > 1:
                 frames = frames[[0, *range(1, frames.shape[0], temporal_scale)]]
             # EXR references are reflect-padded (ResizeMode.REFLECT_PAD upstream)

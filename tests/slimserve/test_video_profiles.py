@@ -38,6 +38,8 @@ FAST_IDS = (
     "ltx25-ic-lora-fast",
     "ltx25-a2vid-fast",
     "ltx25-dubit-fast",
+    "ltx25-alpha-fast",
+    "ltx25-hdr-ic-lora-fast",
 )
 GIB = 1 << 30
 

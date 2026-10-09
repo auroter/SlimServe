@@ -339,6 +339,15 @@ exact profiles stay the reference the fast ones are measured against. At
 | dev | 1513 s | **911 s** | 20 steps; first-block step cache 0.10; conv decoder (all four guidance passes kept) |
 | DFR | 681 s | **421 s** | 2-step stage 2; 2x2-tiled stage-2 attention; conv decoder |
 
+The editing and guided profiles carry the same levers (`-fast` records,
+ledger sections 31-35, 43): keyframes, one-stage and a2vid take dev's (20
+steps, step cache, conv decoder); ic-lora and dubit take distilled's
+(2-step stage 2, conv decoder); retake adds 2x2-tiled attention (745 s ->
+363 s at 1536x1024x121); alpha (406 s -> 191 s at 768x512x65) and
+hdr-ic-lora (161 s -> 123 s) take the step cache and the conv decoder on
+their single stage. `ltx25-t2a` has none: its 22 s is text encoding and
+model load around an 8 s audio stage.
+
 `ltx25-hq` (Lightricks' HQ preset, res_2s) takes 1902 s at the same size: half
 the steps of dev but two model evaluations per step and the distilled LoRA
 in both stages.
@@ -476,8 +485,10 @@ remains is evidence, not code:
 
 - The I2V first-frame path is wired but its end-to-end output has not been
   compared against upstream on this machine.
-- The IC-LoRA, Dub-It, Alpha-Gen and HDR IC-LoRA flows ran their mechanics
-  with a stand-in adapter; their real adapters are gated Lightricks repos
-  (accept the terms on Hugging Face, then `slimserve <profile> -y`).
+- Dub-It ran its mechanics with a stand-in adapter: Lightricks has not
+  published a Dub-It IC-LoRA for 2.5. Alpha-Gen, Colorization (through
+  `ltx25-ic-lora`) and SDR-To-HDR are checked end to end with their real,
+  gated adapters (ledger section 43; accept the terms on Hugging Face, then
+  download the adapter files and pass them with `--lora`).
 - M3+/M5 variants: native bf16 and the M5 int8 path are unverified on
   hardware and are separate profile records when they exist.

@@ -4424,6 +4424,37 @@
         }
       }
     },
+    "ltx25-alpha-fast": {
+      "title": "LTX-2.5 alpha-gen, fast tier, on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "The alpha-gen pipeline with the fast tier: the first-block step cache at 0.10 and the conv decoder on the one video-only 30-step stage. Same engine, adapter and inputs as ltx25-alpha. Measured in perf/ltx25_metal_campaign.md section 43.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-dev",
+          "engine": {
+            "pipeline": "alpha",
+            "width": 768,
+            "height": 512,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 6144,
+            "decoder": "conv",
+            "fast": {
+              "step_cache": 0.1
+            },
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The envelope is the one-stage profile's (768x512x121): the reference doubles the token count (a same-size reference), so a forward here carries twice the dev stage-1 load. One generation at a time; up to 16 requests queue.",
+            "The transformer runs with no audio modality as upstream (audio=None: the audio half and both cross-attentions are skipped). The reference is decoded by frame index through ffmpeg as PyAV does, resized to the output size over the adapter's reference_downscale_factor and encoded untiled; the schedule is the 4096-anchor one; the clip length is given or the duration head's from the video connector's tokens. Ledger section 39."
+          ]
+        }
+      }
+    },
     "ltx25-hdr-ic-lora": {
       "title": "LTX-2.5 SDR-to-HDR (HDR IC-LoRA) on Apple Silicon",
       "source": "ltx25",
@@ -4442,6 +4473,38 @@
             "fps": 24.0,
             "max_video_tokens": 24576,
             "decoder": "diffusion",
+            "served_model_name": "LTX-2.5"
+          },
+          "notes": [
+            "Validated on an M1 Ultra (64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2 and 0.32.2) only; the memory gate is that machine's size. M3+ native bf16 and the M5 int8 path are unverified and will be their own records.",
+            "Metal memory is wired. The engine caps MLX at RAM - 40 GiB active plus a 16 GiB cache, plans the VAE decode against what the resident models leave, and the server refuses clips above max_video_tokens (1536x1024x121). One generation at a time; up to 16 requests queue.",
+            "The frame is reflect-padded up to multiples of 32 and cropped back after the decode; a display mp4 goes through the sRGB EOTF into ACEScct before the resize (as upstream), EXR folders are resized linear then compressed; the conditioning encode tiles above 512x768 (frames 80/24, 768/64 px). Every DFR seam inside the clip gets a generated slot and a 1-frame SDR guide at 0.95 (keyframes false: plain IC-LoRA); high_quality generates 2N - 1 frames and keeps every other one; the conditioning fps is 30 above 30. The 8 distilled sigmas, plain Euler, the video half of the transformer only. Upstream runs it FP8-cast on CUDA; here the fp16-operand policy. Ledger section 41.",
+            "The envelope counts the reference: a 1536x1024x121 source is 24,576 target plus 24,576 reference tokens, above this record's 24,576, so 1536x1024 sources are limited to 57 frames (or 1024x768 to 121)."
+          ]
+        }
+      }
+    },
+    "ltx25-hdr-ic-lora-fast": {
+      "title": "LTX-2.5 SDR-to-HDR (HDR IC-LoRA), fast tier, on Apple Silicon",
+      "source": "ltx25",
+      "gpus": 1,
+      "summary": "The SDR-to-HDR pipeline with the fast tier: the first-block step cache at 0.10 and the conv decoder (it ignores the seam keyframes) on the one video-only 8-step stage. Same engine, adapter, scene embeddings and inputs as ltx25-hdr-ic-lora. Measured in perf/ltx25_metal_campaign.md section 43.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "bf16-distilled",
+          "engine": {
+            "pipeline": "hdr_ic_lora",
+            "width": 1536,
+            "height": 1024,
+            "num_frames": 121,
+            "fps": 24.0,
+            "max_video_tokens": 24576,
+            "decoder": "conv",
+            "fast": {
+              "step_cache": 0.1
+            },
             "served_model_name": "LTX-2.5"
           },
           "notes": [
